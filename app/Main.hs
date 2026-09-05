@@ -71,7 +71,7 @@ cmdP = hsubparser
       "v22" -> Just (Just H.V22)
       _ -> Nothing
     audioP =
-          flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "NODE")))
+          flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "ID" <> help "PipeWire node id (pw-cli ls Node) for capture and playback")) <*> switch (long "pw-monitor" <> help "capture the playback sink's monitor instead of a source (hear and receive your own tones)"))
       <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")
       <|> flag' AudioStdio (long "audio-stdio" <> help "raw s16le mono audio on stdin/stdout")
     dataP =

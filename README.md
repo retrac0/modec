@@ -109,10 +109,20 @@ cabal run modec -- modem --hayes --audio-pipewire --listen 2323
 scripts/smoke-hayes.sh
 ```
 
-With `--audio-pipewire` the default PipeWire source and sink are used;
-if the default source is a monitor (no capture device) pw-cat reports
-"no target node available", so name the node with `--pw-target` (find it
-with `pw-cli ls Node`). Telnet clients see the negotiation immediately;
+With `--audio-pipewire` the default PipeWire source and sink are used.
+pw-cat takes a numeric node id as target, so pick one with `pw-cli ls
+Node` and pass `--pw-target 52`; if there is no capture device (the default
+source is a monitor) pw-cat reports "no target node available", and
+`--pw-monitor` captures the playback sink's monitor instead, which lets the
+modem hear its own tones. To play with it live from a terminal:
+
+```
+cabal run modec -- modem --hayes --audio-pipewire --pw-monitor --data-stdio
+ATE0          # the terminal already echoes what you type
+ATA           # hear the V.8bis CRe and the 2100 Hz answer tone from the speakers
+ATH
+ATDT5551234   # hear DTMF, then the modem waits for an answer tone
+``` Telnet clients see the negotiation immediately;
 bytes flow once the log on stderr says `CONNECT`. `NO CARRIER` or a failed handshake ends the
 process.
 

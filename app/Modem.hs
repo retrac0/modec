@@ -36,7 +36,7 @@ import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 
 data AudioIO
-  = AudioPipewire (Maybe String)     -- ^ optional pw-cat target node
+  = AudioPipewire (Maybe String) Bool  -- ^ optional pw-cat target node (numeric id), capture the sink monitor
   | AudioFiles FilePath FilePath     -- ^ raw s16le mono: input, output (files or FIFOs)
   | AudioStdio                       -- ^ raw s16le mono on stdin/stdout
 
@@ -252,10 +252,12 @@ withAudio aio rate role body = case aio of
     hClose hi
     hClose ho
     return r
-  AudioPipewire target -> do
+  AudioPipewire target monitor -> do
     let common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "20ms"]
                  ++ maybe [] (\t -> ["--target", t]) target
-        rec = (proc "pw-cat" (["--record"] ++ common ++ ["-"])) { std_out = CreatePipe, std_err = Inherit }
+        -- pw-cat wants a numeric node id as target; stream.capture.sink records a sink's monitor
+        recExtra = if monitor then ["-P", "{ stream.capture.sink = true }"] else []
+        rec = (proc "pw-cat" (["--record"] ++ recExtra ++ common ++ ["-"])) { std_out = CreatePipe, std_err = Inherit }
         play = (proc "pw-cat" (["--playback"] ++ common ++ ["-"])) { std_in = CreatePipe, std_err = Inherit }
     bracket (createProcess rec) cleanup $ \r ->
       bracket (createProcess play) cleanup $ \pl -> case (r, pl) of
