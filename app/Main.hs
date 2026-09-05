@@ -59,6 +59,7 @@ cmdP = hsubparser
       <*> option (maybeReader stdReader) (long "standard" <> value Nothing <> help "auto (default) | bell103 | v21 | v22")
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "max-1200" <> help "V.22 only: do not negotiate 2400 bit/s")
+      <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> audioP
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))

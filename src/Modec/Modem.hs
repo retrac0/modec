@@ -32,6 +32,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
+import Modec.Hdlc
 
 data ModemConfig = ModemConfig
   { mcRate      :: Double
@@ -72,10 +73,11 @@ data TxState = TxState
   , txQueue   :: [Word8]
   , txFir     :: Maybe (String, VS.Vector Double, Signal)   -- ^ spec name, reversed kernel, history
   , txV22     :: V22TxState
+  , txPhase2  :: !Double            -- ^ second tone phase (dual tones)
   }
 
 txInit :: TxState
-txInit = TxState 0 0 True [] [] Nothing v22TxInit
+txInit = TxState 0 0 True [] [] Nothing v22TxInit 0
 
 -- | Generate @n@ samples for a transmit command, consuming queued bytes
 -- only in data modes.
@@ -88,6 +90,12 @@ txBlock fs amp fr guard cmd n st = case cmd of
     in (st { txPhase = wrap (txPhase st + w * fromIntegral n), txFir = Nothing }, sig)
   TxMark spec -> fsk spec False
   TxData spec -> fsk spec True
+  TxBits spec bits -> fsk spec False `withQueuedBits` bits
+  TxDual f1 f2 g ->
+    let w1 = 2 * pi * f1 / fs
+        w2 = 2 * pi * f2 / fs
+        sig = VS.generate n (\i -> 0.5 * amp * g * (sin (txPhase st + w1 * fromIntegral i) + sin (txPhase2 st + w2 * fromIntegral i)))
+    in (st { txPhase = wrap (txPhase st + w1 * fromIntegral n), txPhase2 = wrap (txPhase2 st + w2 * fromIntegral n), txFir = Nothing }, sig)
   TxV22 ch rate mode ->
     let (bytes, st1) = case mode of
           TxScrambledData -> (txQueue st, st { txQueue = [] })
@@ -97,7 +105,13 @@ txBlock fs amp fr guard cmd n st = case cmd of
   where
     twoPi = 2 * pi
     wrap p = p - twoPi * fromIntegral (floor (p / twoPi) :: Int)
-    fsk spec allowData =
+    -- queue raw bits before generating (used once per TxBits command)
+    withQueuedBits f bits = let _ = f in fskWith spec' False bits
+      where spec' = case cmd of { TxBits s _ -> s; _ -> error "withQueuedBits" }
+    fskWith spec allowData bits = fskFrom (st { txBits = txBits st ++ bits }) spec allowData
+    fsk spec allowData = fskFrom st spec allowData
+    fskFrom st0 spec allowData =
+      let st = st0 in
       let spb = fs / fskBaud spec
           step (!ph, !pos, !cur, bits, queue) =
             let (pos', cur', bits', queue')
@@ -141,6 +155,8 @@ data ModemState = ModemState
   , msTx      :: TxState
   , msTxCmd   :: TxCmd
   , msV22Rx   :: Maybe (V22Channel, V22RxState)   -- ^ receiver on the remote's V.22 channel
+  , msRole    :: Role        -- ^ effective role the V.22 receiver channel follows
+  , msHdlc    :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], HdlcRx)
   , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
   , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
@@ -159,7 +175,7 @@ modemInit cfg
     fs = mcRate cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) R1200 0 0 0 HsBusy
+             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing R1200 0 0 0 HsBusy
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -204,6 +220,14 @@ modemStep cfg st0 rxBlock newBytes =
       (st, VS.replicate n 0, [], [])
     Handshaking ->
       let (bank', frames) = stepStage (msBank st) rxBlock
+          -- synchronous V.21 receiver for V.8bis messages, when the handshake asks for one
+          (hdlc', hdlcFrames) = case msHdlc st of
+            Nothing -> (Nothing, [])
+            Just (spec, disc, sync, hrx) ->
+              let (disc', d) = stepStage disc rxBlock
+                  (sync', bits) = stepStage sync d
+                  (hrx', fsOut) = hdlcRxBits hrx bits
+              in (Just (spec, disc', sync', hrx'), fsOut)
           -- V.22 receiver on the remote channel, reported to the handshake
           (v22', report, zeros') = case msV22Rx st of
             Nothing -> (Nothing, Nothing, 0)
@@ -211,11 +235,21 @@ modemStep cfg st0 rxBlock newBytes =
               let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
                   z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
               in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
-          (hsState', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep hs h fr report in (h', acc ++ [o])) (msHs st, []) frames
-          (cmd, status, rxRate) = if null outs then (msTxCmd st, HsBusy, msRxRate st) else let o = last outs in (hoTx o, hoStatus o, hoRxRate o)
+          (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr report (if i == 0 then hdlcFrames else []) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
+          (cmd, status, rxRate, role', hdlcWant) =
+            if null outs then (msTxCmd st, HsBusy, msRxRate st, msRole st, fmap (\(s, _, _, _) -> s) (msHdlc st))
+            else let o = last outs in (hoTx o, hoStatus o, hoRxRate o, hoRole o, hoHdlc o)
           -- switch the receiver's decision rate when the handshake says so
-          v22'' = if rxRate /= msRxRate st then fmap (\(c, r) -> (c, v22RxSetRate rxRate r)) v22' else v22'
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRxRate = rxRate, msZeros = zeros' }
+          v22a = if rxRate /= msRxRate st then fmap (\(c, r) -> (c, v22RxSetRate rxRate r)) v22' else v22'
+          -- a V.8bis mode select reverses the roles: listen on the other channel
+          v22'' = if role' /= msRole st
+                    then Just (case role' of { Originate -> HighChannel; Answer -> LowChannel }, v22RxInit fs)
+                    else v22a
+          hdlc'' = case (hdlcWant, hdlc') of
+            (Nothing, _) -> Nothing
+            (Just spec, Just cur@(s, _, _, _)) | fskName s == fskName spec -> Just cur
+            (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), hdlcRxInit)
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msHdlc = hdlc'', msRxRate = rxRate, msZeros = zeros' }
       in case status of
            HsConnected s link ->
              let mode = case link of

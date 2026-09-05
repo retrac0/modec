@@ -37,7 +37,7 @@ Reading spandsp does not taint a from-scratch reimplementation in a practical se
 
 ## 2. V.8bis
 
-- No open-source V.8bis implementation was found. spandsp implements V.8 only (`v8.c`, 1417 lines). linmodem implements V.8 only. Search results tie V.8bis to V.34 products, all closed.
+- No open-source V.8bis implementation was found (this project now has one: CRe/ESr/CL/MS over V.21 HDLC; MR, ESi, CLR, NAK handling and the V.8 start-ups are not implemented). spandsp implements V.8 only (`v8.c`, 1417 lines). linmodem implements V.8 only. Search results tie V.8bis to V.34 products, all closed.
 - Spec: ITU-T V.8bis (11/2000), in force; earlier editions 08/96 and 09/98. ITU-T V-series recommendations are free downloads from itu.int (V.8, V.8bis, V.21, V.22, V.22bis, V.25 all fetched fine during this survey as PDF links).
 - Protocol summary: initiating station signals (CRe, MRe, ESi) are dual tones 1375 + 2002 Hz for 400 ms followed by 100 ms of a single tone (400 Hz for CRe, 650 Hz for MRe); responding signals (CRd, MRd, ESr) use 1529 + 2225 Hz. Tolerances 250 ppm frequency, 2 % duration. Capabilities and mode-select messages are then sent at 300 bps on V.21 channels with HDLC-style framing. V.8bis is optional and is designed so a station that does not answer the CRe falls through to classic V.25 answer tone / V.8 / legacy handshakes. For Bell 103 and V.22 peers, expect to need the legacy handshake regardless.
 - Patent note (not legal advice): V.8bis dates from 1996, so any patents covering it would have expired around 2016–2020. V.34 patents were the reason spandsp never did V.34, and those are also expired now.
@@ -127,7 +127,7 @@ Keep the DSP core free of IO so the same code runs against WAV fixtures in the t
 
 Suggested order: tone detector and Bell 103 answer-channel decoder against minimodem output → Bell 103 modulator and full-duplex loop → telnet bridge → V.22 (4-DPSK, no amplitude bits) against spandsp test output → V.22bis 16-QAM and S1 handling → V.8bis capabilities exchange on top of the V.21 channel code.
 
-Progress (2026-09-05): FSK modem, channel simulator, tone detection, Bell 103 / V.21 / V.22 / V.22bis handshakes, live modem with PipeWire/telnet I/O, and the V.22/V.22bis data pump (validated against spandsp at 1200 and 2400 bit/s) are done (see README). Next: V.8bis, SIP/RTP, Hayes AT layer.
+Progress (2026-09-05): FSK modem, channel simulator, tone detection, Bell 103 / V.21 / V.22 / V.22bis handshakes, live modem with PipeWire/telnet I/O, and the V.22/V.22bis data pump (validated against spandsp at 1200 and 2400 bit/s) are done (see README). V.8bis (CRe/CL/MS transaction with V.25 start-up and role reversal) is in as well. Next: SIP/RTP, Hayes AT layer.
 
 V.22bis constellation (Figure 2/V.22bis, confirmed from the rendered PDF page and identical to spandsp's table): first quadrant 00 = (1,1), 01 = (3,1), 10 = (1,3), 11 = (3,3); the other quadrants are that pattern rotated by 90° per quadrant. The 1200 bit/s (V.22-compatible) points are the 01 points, i.e. (3,1) rotated. Quadrant changes per Table 1: 00 = +90°, 01 = 0°, 11 = +270°, 10 = +180°.
 

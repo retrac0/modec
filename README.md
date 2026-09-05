@@ -52,6 +52,14 @@ real modem to a sound card.
   the live modem. Automode probes V.22 first, then V.21, then Bell 103,
   accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
   with a V.22-only peer. `--max-1200` disables 2400 on our side.
+- V.8bis capabilities exchange (`Modec.V8bis`, `Modec.Hdlc`): after the
+  billing delay the answerer sends CRe (dual tone 1375 + 2002 Hz, then
+  400 Hz), a V.8bis caller replies with ESr and a CL message over V.21
+  (HDLC frames with the ISO 3309 FCS, synchronous 300 bit/s), the answerer
+  selects the best common mode with MS, and the V.25 start-up follows with
+  the roles reversed as §9.9.3 requires (the MS receiver becomes the
+  answering modem). Peers without V.8bis get the classic start-up after
+  3 s. `--no-v8bis` skips it.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
@@ -62,8 +70,9 @@ Known 2400 bit/s limits: re-acquisition after jitter-buffer slips is slow
 (each slip costs tens of bytes) and heavy sinusoidal jitter breaks the
 coherent path.
 
-Not yet: V.8bis, SIP/RTP, Hayes AT command layer, native PipeWire node
-(pw-cat child processes are used instead), V.22bis guard tone by default.
+Not yet: SIP/RTP, Hayes AT command layer, native PipeWire node (pw-cat
+child processes are used instead), V.22bis guard tone by default, V.8bis
+MR/ESi-initiated transactions and the V.8 start-up variants.
 
 ## Usage
 

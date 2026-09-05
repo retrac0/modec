@@ -50,6 +50,7 @@ data ModemOpts = ModemOpts
   , moStandard :: Maybe Standard
   , moNoHandshake :: Bool
   , moMax1200  :: Bool
+  , moNoV8bis  :: Bool
   , moAudio    :: AudioIO
   , moData     :: DataIO
   , moAmp      :: Double
@@ -65,7 +66,7 @@ runModem o = do
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       cfg0 = defaultModemConfig fs (moRole o) (moStandard o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcAllow2400 = not (moMax1200 o) } }
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcAllow2400 = not (moMax1200 o), hcV8bis = not (moNoV8bis o) } }
   when (moNoHandshake o && moStandard o == Nothing) $ do
     logMsg "--no-handshake needs --standard bell103 or v21"
     exitFailure
