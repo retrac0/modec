@@ -13,6 +13,8 @@ import Modec.DSP
 import Modec.FSK
 import Modec.Metrics
 import Modec.Standards
+import Modec.Async
+import Modec.V22
 
 data Opts = Opts
   { oRate    :: Double
@@ -26,7 +28,7 @@ optsP :: Parser Opts
 optsP = Opts
   <$> option auto (long "rate" <> value 8000 <> showDefault)
   <*> option auto (long "bytes" <> value 400 <> showDefault <> help "payload length")
-  <*> strOption (long "channel" <> value "answer" <> showDefault <> help "answer | originate | v21")
+  <*> strOption (long "channel" <> value "answer" <> showDefault <> help "answer | originate | v21 | v22low | v22high")
   <*> option auto (long "timing-gain" <> value 0.5 <> showDefault)
   <*> strOption (long "window" <> value "rect" <> showDefault <> help "hann | rect")
 
@@ -37,14 +39,27 @@ main :: IO ()
 main = do
   o <- execParser (info (optsP <**> helper) (fullDesc <> progDesc "modec impairment sweep"))
   let fs = oRate o
+      isV22 = oChannel o == "v22low" || oChannel o == "v22high"
+      v22ch = if oChannel o == "v22low" then LowChannel else HighChannel
+      v22other = if v22ch == LowChannel then HighChannel else LowChannel
       (spec, other) = case oChannel o of
         "originate" -> (bell103Originate, bell103Answer)
         "v21"       -> (v21Channel2, v21Channel1)
         _           -> (bell103Answer, bell103Originate)
       params = defaultDemodParams { dpTimingGain = oGain o, dpWindow = if oWindow o == "hann" then Hann else Rect }
       payload = payloadBytes 1 (oBytes o)
-      clean = encodeBytes fs spec framing8N1 0.5 0.2 0.2 payload
-      adjacent = encodeBytes fs other framing8N1 0.5 0.05 0.2 (payloadBytes 2 (oBytes o))
+      framed bs = replicate 120 True ++ frameBits framing8N1 bs ++ replicate 120 True
+      clean = if isV22 then v22Modulate fs v22ch 0.5 (framed payload)
+                       else encodeBytes fs spec framing8N1 0.5 0.2 0.2 payload
+      adjacent = if isV22 then v22Modulate fs v22other 0.5 (framed (payloadBytes 2 (oBytes o)))
+                          else encodeBytes fs other framing8N1 0.5 0.05 0.2 (payloadBytes 2 (oBytes o))
+      decode sig = if isV22
+                     then let bits = v22Demodulate fs v22ch sig
+                              -- skip the start-up bits before the descrambler has synchronised
+                              (_, bytes) = asyncRxBits (asyncRxInit framing8N1) (drop 60 bits)
+                          in bytes
+                     else demodulate fs spec framing8N1 params sig
+      name = if isV22 then "V.22 " ++ show v22ch else fskName spec
       bp = Just (300, 3400)
       base = idealChannel { chBandpass = bp }
       conditions :: [(String, Signal -> Signal)]
@@ -74,10 +89,10 @@ main = do
         , ("VoIP: SNR 35, slips, dropouts p=0.005, rate 0.1 %"
           , applyChannel fs base { chSnrDb = Just 35, chJitter = Slips 0.5 8, chDropout = Just (0.02, 0.005), chRateOffset = 0.001 })
         ]
-  printf "%s at %.0f Hz, %d bytes, timing gain %.2f, window %s\n" (fskName spec) fs (oBytes o) (oGain o) (oWindow o)
-  forM_ conditions $ \(name, f) -> do
+  printf "%s at %.0f Hz, %d bytes, timing gain %.2f, window %s\n" name fs (oBytes o) (oGain o) (oWindow o)
+  forM_ conditions $ \(cname, f) -> do
     let sig = f clean
-        got = demodulate fs spec framing8N1 params sig
+        got = decode sig
         d = editDistance payload got
-    printf "  %-62s %5d errors  (%5.1f %%)  rms %.3f\n" name d (100 * fromIntegral d / fromIntegral (oBytes o) :: Double) (rms sig)
+    printf "  %-62s %5d errors  (%5.1f %%)  rms %.3f\n" cname d (100 * fromIntegral d / fromIntegral (oBytes o) :: Double) (rms sig)
     VS.length sig `seq` return ()
