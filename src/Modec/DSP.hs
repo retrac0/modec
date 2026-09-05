@@ -30,6 +30,7 @@ module Modec.DSP
   , fir
   , firCentered
   , firStream
+  , delayDistortionKernel
     -- * Interpolation and time warping
   , sampleAt
   , resampleBy
@@ -191,6 +192,29 @@ firCentered h x = VS.slice m n (fir h (x VS.++ VS.replicate m 0))
   where
     m = VS.length h `div` 2
     n = VS.length x
+
+-- | All-pass FIR whose group delay rises parabolically from the band
+-- centre to @edgeMs@ milliseconds extra at the band edges (300 and
+-- 3400 Hz), the classic telephone-line delay distortion that a modem
+-- equaliser has to undo.  Designed by frequency sampling: the phase is
+-- the integral of the group delay, the impulse response the inverse
+-- transform, windowed to @taps@ coefficients (made odd).
+delayDistortionKernel :: Double -> Double -> Int -> VS.Vector Double
+delayDistortionKernel fs edgeMs taps0 = VS.zipWith (*) (blackman taps) raw
+  where
+    taps = oddTaps taps0
+    m = taps `div` 2
+    nf = 2048 :: Int
+    fc = 1850
+    halfBand = 1550
+    k = edgeMs / 1000 / (halfBand * halfBand)          -- seconds per Hz^2
+    -- phase(f) = 2 pi * integral of tau(f) df, tau(f) = k (f - fc)^2 (extra delay only)
+    phase f = 2 * pi * k * ((f - fc) ^ (3 :: Int)) / 3
+    raw = VS.generate taps $ \i ->
+      let n = fromIntegral (i - m)
+          -- real part of the inverse DFT of exp(-j phase(f)) over positive frequencies, doubled
+          s = sum [ cos (2 * pi * f * n / fs - phase f) | j <- [0 .. nf - 1], let f = fromIntegral j * fs / 2 / fromIntegral nf ]
+      in s / fromIntegral nf
 
 -- | Band-limited interpolation at fractional index @t@ (Lanczos, a = 6).
 -- Samples outside the vector read as zero.

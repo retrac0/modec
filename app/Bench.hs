@@ -76,6 +76,8 @@ main = do
         , ("dropouts 20 ms p=0.01", applyChannel fs base { chDropout = Just (0.02, 0.01) })
         , ("dropouts 20 ms p=0.05", applyChannel fs base { chDropout = Just (0.02, 0.05) })
         , ("echo 5 ms -12 dB", applyChannel fs base { chEcho = Just (0.005, fromDb (-12)) })
+        , ("delay distortion 1 ms at band edges", applyChannel fs base { chDelayDist = 1 })
+        , ("delay distortion 3 ms at band edges", applyChannel fs base { chDelayDist = 3 })
         , ("adjacent channel +10 dB", applyChannel fs base . mixAt 10 adjacent)
         , ("adjacent channel +20 dB", applyChannel fs base . mixAt 20 adjacent)
         , ("adjacent channel +30 dB", applyChannel fs base . mixAt 30 adjacent)

@@ -31,6 +31,7 @@ data Channel = Channel
   , chDcOffset     :: !Double
   , chEcho         :: !(Maybe (Double, Double))  -- ^ (delay seconds, linear gain)
   , chBandpass     :: !(Maybe (Double, Double))  -- ^ (low Hz, high Hz)
+  , chDelayDist    :: !Double                 -- ^ extra group delay at the band edges, ms (0 = none)
   , chFreqOffsetHz :: !Double                 -- ^ FDM carrier frequency offset
   , chRateOffset   :: !Double                 -- ^ clock offset as a fraction; +0.01 = far clock 1 % fast
   , chJitter       :: !Jitter
@@ -42,7 +43,7 @@ data Channel = Channel
 
 idealChannel :: Channel
 idealChannel = Channel
-  { chSeed = 1, chGain = 1, chDcOffset = 0, chEcho = Nothing, chBandpass = Nothing
+  { chSeed = 1, chGain = 1, chDcOffset = 0, chEcho = Nothing, chBandpass = Nothing, chDelayDist = 0
   , chFreqOffsetHz = 0, chRateOffset = 0, chJitter = NoJitter, chDropout = Nothing
   , chClip = Nothing, chHum = Nothing, chSnrDb = Nothing }
 
@@ -57,7 +58,7 @@ mixAt levelDb other x = VS.zipWith (+) x (VS.map (* g) (VS.take (VS.length x) (o
 
 applyChannel :: Double -> Channel -> Signal -> Signal
 applyChannel fs ch =
-    noise . hum . clip . dropout . rate . jitter . freqOff . bandpass . echo . gainDc
+    noise . hum . clip . dropout . rate . jitter . freqOff . delayDist . bandpass . echo . gainDc
   where
     seed k = chSeed ch * 7919 + k
 
@@ -72,6 +73,10 @@ applyChannel fs ch =
     bandpass x = case chBandpass ch of
       Nothing -> x
       Just (f1, f2) -> firCentered (firBandpass fs f1 f2 (2 * round (fs / 40) + 1)) x
+
+    delayDist x
+      | chDelayDist ch == 0 = x
+      | otherwise = firCentered (delayDistortionKernel fs (chDelayDist ch) (2 * round (fs * 0.02) + 1)) x
 
     freqOff x
       | chFreqOffsetHz ch == 0 = x

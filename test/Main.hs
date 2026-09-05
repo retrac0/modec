@@ -133,6 +133,7 @@ channelTests = testGroup "channel impairments (must be error free)"
   , cond "adjacent channel +20 dB" base (mixAt 20 adjacent)
   , cond "level -40 dBFS" base { chGain = fromDb (-40) / 0.5 } id
   , cond "hum 60 Hz" base { chHum = Just (60, 0.3) } id
+  , cond "delay distortion 3 ms at band edges" base { chDelayDist = 3 } id
   , cond "realistic acoustic coupling" base { chSnrDb = Just 25, chRateOffset = 0.005, chFreqOffsetHz = 3, chJitter = SineJitter 2 1 } (mixAt 20 adjacent)
   ]
   where
@@ -339,7 +340,8 @@ v22Tests = testGroup "V.22 data pump" $
                  , ("clock offset +0.5 %", applyChannel 8000 idealChannel { chRateOffset = 0.005 })
                  , ("clock offset -0.5 %", applyChannel 8000 idealChannel { chRateOffset = -0.005 })
                  , ("sine jitter 3 samples at 2 Hz", applyChannel 8000 idealChannel { chJitter = SineJitter 3 2 })
-                 , ("echo 5 ms -12 dB", applyChannel 8000 idealChannel { chEcho = Just (0.005, fromDb (-12)) }) ]
+                 , ("echo 5 ms -12 dB", applyChannel 8000 idealChannel { chEcho = Just (0.005, fromDb (-12)) })
+                 , ("delay distortion 2 ms at band edges", applyChannel 8000 idealChannel { chDelayDist = 2 }) ]
   ] ++
   [ testCase "async bytes over V.22 with start/stop framing" $ do
       let payload = map (fromIntegral . fromEnum) "V.22 at 1200 bit/s: the quick brown fox\r\n" ++ [0, 255, 128]
