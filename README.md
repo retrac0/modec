@@ -6,8 +6,9 @@ streams. Targets, in order: Bell 103, V.21, V.22, V.22bis, V.8bis link
 establishment.
 
 See [SURVEY.md](SURVEY.md) for the survey of existing work and the design
-plan, and [docs/line-interface.md](docs/line-interface.md) for hooking a
-real modem to a sound card.
+plan, [docs/line-interface.md](docs/line-interface.md) for hooking a real
+modem to a sound card, and [docs/sip-options.md](docs/sip-options.md) for
+the VoIP/SIP plan.
 
 ## Status
 
