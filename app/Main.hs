@@ -61,6 +61,8 @@ cmdP = hsubparser
       <*> switch (long "max-1200" <> help "V.22 only: do not negotiate 2400 bit/s")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
+      <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
+      <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")
       <*> audioP
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))
@@ -73,6 +75,7 @@ cmdP = hsubparser
     audioP =
           flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "ID" <> help "PipeWire node id (pw-cli ls Node) for capture and playback")) <*> switch (long "pw-monitor" <> help "capture the playback sink's monitor instead of a source (hear and receive your own tones)"))
       <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")
+      <|> AudioSipLoop <$> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> help "PipeWire loopback pair for a softphone (nodes PREFIX-to-sip / PREFIX-line and sip-to-PREFIX / PREFIX-sip-line)")
       <|> flag' AudioStdio (long "audio-stdio" <> help "raw s16le mono audio on stdin/stdout")
     dataP =
           DataListen <$> option auto (long "listen" <> metavar "PORT" <> help "telnet server")

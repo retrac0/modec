@@ -28,6 +28,7 @@ library
                       Modec.V8bis
                       Modec.Hayes
                       Modec.Dtmf
+                      Modec.Baresip
     build-depends:    base ^>=4.18,
                       bytestring,
                       vector

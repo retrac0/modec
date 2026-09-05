@@ -1,0 +1,47 @@
+# baresip configuration for use with modec (`modec modem --sip`).
+# Copy this directory to ~/.baresip (or run `baresip -f docs/baresip`),
+# edit `accounts`, then start baresip before modec.
+#
+# Audio goes through two PipeWire loopbacks that modec creates:
+#   modec-to-sip  (Audio/Sink)   <- modec plays here   -> modec-line (Audio/Source, baresip captures)
+#   sip-to-modec  (Audio/Sink)   <- baresip plays here -> sip-line   (Audio/Source, modec captures)
+# The node names below must match modec's --sip-audio prefix (default "modec").
+
+poll_method             epoll
+
+# Core
+sip_listen              0.0.0.0:5060
+sip_cafile              /etc/ssl/certs/ca-certificates.crt
+
+# Audio: G.711 only, 8 kHz, no voice processing
+audio_player            pipewire,sip-to-modec
+audio_source            pipewire,modec-line
+audio_alert             pipewire,sip-to-modec
+ausrc_srate             8000
+auplay_srate            8000
+ausrc_channels          1
+auplay_channels         1
+audio_txmode            poll
+audio_level             no
+audio_jitter_buffer_type fixed
+audio_jitter_buffer_ms  100-200
+audio_jitter_buffer_size 50
+audio_silence_suppression no
+
+# Modules
+module_path             /usr/lib/baresip/modules
+module                  g711.so
+module                  pipewire.so
+module                  stun.so
+module                  turn.so
+module                  ice.so
+module                  account.so
+module                  contact.so
+module                  menu.so
+module_app              ctrl_tcp.so
+module_app              stdio.so
+
+# Control
+ctrl_tcp_listen         127.0.0.1:4444
+
+# Do NOT load: webrtc_aec, augain, auconv, opus (keep the SDP to PCMU/PCMA)

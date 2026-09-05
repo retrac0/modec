@@ -27,6 +27,7 @@ import Modec.Hdlc
 import Modec.V8bis
 import Modec.Hayes
 import Modec.Dtmf
+import Modec.Baresip
 import Data.Bits (testBit, xor)
 import Modec.Stream
 import Modec.FSK
@@ -497,7 +498,49 @@ hayesTests = testGroup "Hayes AT interpreter"
       assertEqual "length" (round (8000 * (3 * 0.16 + 1)) :: Int) (VS.length (dtmfDialSignal 8000 0.3 "1,23"))
   ]
 
+baresipTests :: TestTree
+baresipTests = testGroup "baresip control protocol and SIP line"
+  [ testCase "netstrings" $ do
+      assertEqual "encode" "5:hello," (BC.unpack (netstringEncode (BC.pack "hello")))
+      let (msgs, rest) = netstringDecode (BC.pack "2:ab,3:cde,7:incompl")
+      assertEqual "decoded" ["ab", "cde"] (map BC.unpack msgs)
+      assertEqual "rest" "7:incompl" (BC.unpack rest)
+  , testCase "JSON parse and encode" $ do
+      let ev = BC.pack "{\"event\":true,\"class\":\"call\",\"type\":\"CALL_CLOSED\",\"param\":\"Connection reset by peer\",\"peeruri\":\"sip:bob@biloxi.com\",\"n\":-1.5}"
+      assertEqual "event" (Just (BsEvent "call" "CALL_CLOSED" "Connection reset by peer" [("peeruri", "sip:bob@biloxi.com")])) (decodeBsMessage ev)
+      assertEqual "response" (Just (BsResponse True "" "t1")) (decodeBsMessage (BC.pack "{\"response\":true,\"ok\":true,\"data\":\"\",\"token\":\"t1\"}"))
+      assertEqual "command" "53:{\"command\":\"dial\",\"params\":\"sip:1@x.org\",\"token\":\"a\"}," (BC.unpack (commandJson "dial" "sip:1@x.org" "a"))
+      assertEqual "roundtrip" (Just (JObj [("a", JStr "x\"y"), ("b", JArr [JNum 1, JBool False, JNull])])) (jsonParse (jsonEncode (JObj [("a", JStr "x\"y"), ("b", JArr [JNum 1, JBool False, JNull])])))
+  , testCase "SIP line: dial, established, closed" $ do
+      let l0 = sipLineInit "sip.example.org"
+          (l1, a1) = sipLineHayes l0 (ActDial "T555-1234")
+      assertEqual "dial" [SipCommand "dial" "sip:5551234@sip.example.org"] a1
+      let (l2, a2) = sipLineEvent 1 l1 (BsEvent "call" "CALL_ESTABLISHED" "" [])
+      assertEqual "start as caller" [SipStartModem Originate] a2
+      assertEqual "in call" (Just Originate) (sipLineInCall l2)
+      let (l3, a3) = sipLineEvent 2 l2 (BsEvent "call" "CALL_CLOSED" "Connection reset by peer" [])
+      assertEqual "closed" [SipStopModem, SipToDte EvNoCarrier] a3
+      assertEqual "idle" Nothing (sipLineInCall l3)
+  , testCase "SIP line: incoming, ring repeats, answer, hang up" $ do
+      let l0 = sipLineInit "sip.example.org"
+          (l1, a1) = sipLineEvent 0 l0 (BsEvent "call" "CALL_INCOMING" "" [("peeruri", "sip:bbs@example.org")])
+      assertEqual "ring" [SipToDte EvRing] a1
+      assertEqual "no ring yet" [] (snd (sipLineTick 1 l1))
+      assertEqual "ring again" [SipToDte EvRing] (snd (sipLineTick 2.1 l1))
+      let (l2, a2) = sipLineHayes l1 ActAnswer
+      assertEqual "accept" [SipCommand "accept" ""] a2
+      let (l3, a3) = sipLineEvent 3 l2 (BsEvent "call" "CALL_ESTABLISHED" "" [])
+      assertEqual "start as answerer" [SipStartModem Answer] a3
+      let (_, a4) = sipLineHayes l3 ActHangup
+      assertEqual "hangup" [SipStopModem, SipCommand "hangup" ""] a4
+  , testCase "SIP line: full URI and no answer" $ do
+      let (l1, a1) = sipLineHayes (sipLineInit "d") (ActDial "sip:bbs@example.org")
+      assertEqual "uri passes" [SipCommand "dial" "sip:bbs@example.org"] a1
+      let (_, a2) = sipLineEvent 5 l1 (BsEvent "call" "CALL_CLOSED" "Busy" [])
+      assertEqual "no answer" [SipToDte EvNoAnswer] a2
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests])

@@ -29,6 +29,7 @@ import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 
 import Modec.DSP (Signal, rms)
 import Modec.Handshake
+import Modec.Baresip
 import Modec.Dtmf
 import Modec.Hayes
 import Modec.Modem
@@ -37,6 +38,7 @@ import Modec.Telnet
 
 data AudioIO
   = AudioPipewire (Maybe String) Bool  -- ^ optional pw-cat target node (numeric id), capture the sink monitor
+  | AudioSipLoop String              -- ^ PipeWire loopback pair for a softphone; the prefix names the nodes
   | AudioFiles FilePath FilePath     -- ^ raw s16le mono: input, output (files or FIFOs)
   | AudioStdio                       -- ^ raw s16le mono on stdin/stdout
 
@@ -54,6 +56,8 @@ data ModemOpts = ModemOpts
   , moMax1200  :: Bool
   , moNoV8bis  :: Bool
   , moHayes    :: Bool
+  , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
+  , moSipDomain :: String
   , moAudio    :: AudioIO
   , moData     :: DataIO
   , moAmp      :: Double
@@ -73,6 +77,11 @@ runModem o = do
   when (moNoHandshake o && moStandard o == Nothing) $ do
     logMsg "--no-handshake needs --standard bell103 or v21"
     exitFailure
+  -- connect to the softphone control port before the audio and the DTE,
+  -- so that control is up whatever order the peers start in
+  sip <- case moSip o of
+    Nothing -> return Nothing
+    Just addr -> Just <$> sipConnect addr
   withAudio (moAudio o) (moRate o) (moRole o) $ \ain aout ->
     withData (moData o) $ \recvBytes sendBytes -> do
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
@@ -93,7 +102,7 @@ runModem o = do
             EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
             EvDropped -> logMsg "NO CARRIER"
             EvFailed why -> logMsg ("connection failed: " ++ why)
-      if not (moHayes o)
+      if not (moHayes o) && sip == Nothing
         then do
           -- plain mode: one call in the configured role, then exit
           stRef <- newIORef (modemInit cfg)
@@ -119,7 +128,10 @@ runModem o = do
           hayesRef <- newIORef hayesInit
           lineRef <- newIORef LineIdle
           energyRef <- newIORef (0 :: Int)
-          logMsg "Hayes command mode (ATD to dial, ATA to answer, ATH to hang up)"
+          sipLineRef <- newIORef (sipLineInit (moSipDomain o))
+          logMsg (case sip of
+                    Nothing -> "Hayes command mode (ATD to dial, ATA to answer, ATH to hang up)"
+                    Just _ -> "Hayes command mode over SIP (baresip at " ++ maybe "" id (moSip o) ++ ")")
           let tNow = do
                 k <- readIORef blockRef
                 return (fromIntegral (k * blockN) / fs :: Double)
@@ -146,7 +158,25 @@ runModem o = do
                     writeIORef hayesRef hs2
                     unless (B.null back) $ sendBytes back
                     unless (B.null tickOut) $ sendBytes tickOut
-                    forM_ acts $ \a -> do
+                    -- SIP: Hayes actions and baresip events go through the line controller
+                    sipActs <- case sip of
+                      Nothing -> return []
+                      Just cl -> do
+                        evs <- sipDrain cl
+                        sl0 <- readIORef sipLineRef
+                        let (sl1, as1) = foldl (\(s, acc) a -> let (s', xs) = sipLineHayes s a in (s', acc ++ xs)) (sl0, []) acts
+                            (sl2, as2) = foldl (\(s, acc) e -> let (s', xs) = sipLineEvent t s e in (s', acc ++ xs)) (sl1, []) evs
+                            (sl3, as3) = sipLineTick t sl2
+                        writeIORef sipLineRef sl3
+                        return (as1 ++ as2 ++ as3)
+                    forM_ sipActs $ \sa -> case sa of
+                      SipCommand c params -> maybe (return ()) (\cl -> sipSend cl c params) sip
+                      SipStartModem role -> do
+                        logMsg ("SIP call up, modem role " ++ show role)
+                        writeIORef lineRef (LineCall (modemInit (cfgFor role)) (cfgFor role))
+                      SipStopModem -> writeIORef lineRef LineIdle
+                      SipToDte ev -> modemEvent ev
+                    forM_ (if sip == Nothing then acts else []) $ \a -> do
                       line <- readIORef lineRef
                       case a of
                         ActDial s -> do
@@ -164,8 +194,8 @@ runModem o = do
                         online = hayesOnline hs2
                     case line of
                       LineIdle -> do
-                        -- a calling signal (any sustained energy) while idle rings the DTE
-                        let loud = rms rxBlock > 0.01
+                        -- a calling signal (any sustained energy) while idle rings the DTE (not in SIP mode: baresip rings)
+                        let loud = sip == Nothing && rms rxBlock > 0.01
                         n <- readIORef energyRef
                         let n' = if loud then n + 1 else 0
                         writeIORef energyRef n'
@@ -203,6 +233,49 @@ runModem o = do
     isFinal (EvFailed _) = True
     isFinal _ = False
     toUpperC ch = if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch
+
+-- | Connection to baresip's ctrl_tcp module: a reader thread decodes
+-- netstring-framed JSON into a queue; commands go out with tokens.
+data SipClient = SipClient Socket (IORef [BsMessage]) (IORef Int)
+
+instance Eq SipClient where
+  _ == _ = True
+
+sipConnect :: String -> IO SipClient
+sipConnect addr = withSocketsDo $ do
+  let (host, portS) = break (== ':') addr
+      port = if null portS then "4444" else drop 1 portS
+  ai <- head <$> getAddrInfo (Just defaultHints { addrSocketType = Stream }) (Just (if null host then "127.0.0.1" else host)) (Just port)
+  sock <- openSocket ai
+  connect sock (addrAddress ai)
+  queue <- newIORef []
+  tok <- newIORef 0
+  let reader buf = do
+        r <- try (NB.recv sock 4096) :: IO (Either SomeException B.ByteString)
+        case r of
+          Right bs | not (B.null bs) -> do
+            let (msgs, rest) = netstringDecode (buf <> bs)
+            forM_ msgs $ \m -> case decodeBsMessage m of
+              Just (BsResponse okk dat _) -> unless okk (logMsg ("baresip: " ++ dat))
+              Just ev@(BsEvent _ typ param _) -> do
+                logMsg ("baresip event " ++ typ ++ (if null param then "" else " " ++ param))
+                atomicModifyIORef' queue (\q -> (q ++ [ev], ()))
+              _ -> return ()
+            reader rest
+          _ -> logMsg "baresip control connection closed"
+  _ <- forkIO (reader B.empty)
+  logMsg ("connected to baresip control at " ++ addr)
+  return (SipClient sock queue tok)
+
+sipSend :: SipClient -> String -> String -> IO ()
+sipSend (SipClient sock _ tok) cmd params = do
+  n <- atomicModifyIORef' tok (\k -> (k + 1, k))
+  logMsg ("baresip <- " ++ cmd ++ (if null params then "" else " " ++ params))
+  r <- try (NB.sendAll sock (commandJson cmd params ("m" ++ show n))) :: IO (Either SomeException ())
+  either (\e -> logMsg ("baresip send failed: " ++ show e)) return r
+
+sipDrain :: SipClient -> IO [BsMessage]
+sipDrain (SipClient _ queue _) = atomicModifyIORef' queue (\q -> ([], q))
 
 -- | The line in Hayes mode: idle, dialling (DTMF audio left to play), or
 -- a call in progress with its modem state and configuration.
@@ -252,8 +325,34 @@ withAudio aio rate role body = case aio of
     hClose hi
     hClose ho
     return r
+  AudioSipLoop prefix -> do
+    -- two loopbacks: modec plays into <prefix>-to-sip whose other side is the
+    -- Audio/Source <prefix>-line (the softphone captures it); the softphone
+    -- plays into sip-to-<prefix> whose other side is <prefix>-sip-line
+    -- (modec captures it).  Node classes are exactly what baresip accepts.
+    let lb name sink src = proc "pw-loopback"
+          [ "-n", name
+          , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" }"
+          , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" }" ]
+        toSip = prefix ++ "-to-sip"; lineSrc = prefix ++ "-line"
+        fromSip = "sip-to-" ++ prefix; sipSrc = prefix ++ "-sip-line"
+        common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
+        rec = (proc "pw-cat" (["--record", "--target", sipSrc, "-P", "{ node.name = " ++ prefix ++ "-rx }"] ++ common ++ ["-"])) { std_out = CreatePipe, std_err = Inherit }
+        play = (proc "pw-cat" (["--playback", "--target", toSip, "-P", "{ node.name = " ++ prefix ++ "-tx }"] ++ common ++ ["-"])) { std_in = CreatePipe, std_err = Inherit }
+    bracket (createProcess (lb (prefix ++ "-lb1") toSip lineSrc)) cleanup $ \_ ->
+      bracket (createProcess (lb (prefix ++ "-lb2") fromSip sipSrc)) cleanup $ \_ -> do
+        threadDelay 800000   -- let the loopback nodes appear before targeting them
+        bracket (createProcess rec) cleanup $ \r ->
+          bracket (createProcess play) cleanup $ \pl -> case (r, pl) of
+            ((_, Just hin, _, _), (Just hout, _, _, _)) -> do
+              hSetBinaryMode hin True
+              hSetBinaryMode hout True
+              hSetBuffering hout NoBuffering
+              logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
+              body hin hout
+            _ -> logMsg "could not start pw-cat" >> exitFailure
   AudioPipewire target monitor -> do
-    let common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "20ms"]
+    let common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
                  ++ maybe [] (\t -> ["--target", t]) target
         -- pw-cat wants a numeric node id as target; stream.capture.sink records a sink's monitor
         recExtra = if monitor then ["-P", "{ stream.capture.sink = true }"] else []

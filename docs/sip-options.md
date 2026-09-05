@@ -112,6 +112,16 @@ it produces the reference recordings we want. It does not connect modec
 to VoIP by itself; modec would still need option 1 or 3, or the sound-card
 line interface in `line-interface.md` plugged into the ATA's second port.
 
+## Implementation (done)
+
+`modec modem --sip HOST:PORT --audio-sip-loop PREFIX` implements option 1:
+see the README and `docs/baresip/` for the configuration. Audio is
+wired with two `pw-loopback` instances (PREFIX-to-sip / PREFIX-line and
+sip-to-PREFIX / PREFIX-sip-line), which give baresip nodes of exactly the
+classes its PipeWire module accepts. pw-cat pins its streams to those
+nodes by name (`--target`), which works for nodes that have ports; bare
+`module-null-sink` nodes with a Source class do not.
+
 ## Recommendation
 
 1. Option 1 now: add a `--sip` mode to `modec modem` that drives baresip

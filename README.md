@@ -69,6 +69,15 @@ the VoIP/SIP plan.
   result codes OK, CONNECT 300/1200/2400, RING, NO CARRIER, ERROR.
   `scripts/smoke-hayes.sh` drives two instances through a full
   dial/answer/data/escape/hang-up cycle over telnet.
+- SIP calls through baresip (`Modec.Baresip`, `--sip HOST:PORT`): modec
+  drives baresip's `ctrl_tcp` module (netstring-framed JSON) and maps
+  Hayes commands to it: ATD dials `sip:NUMBER@--sip-domain` (or a full
+  URI), ATA accepts, ATH hangs up, an incoming call rings the DTE, and the
+  modem starts in the right role when baresip reports the call established.
+  Audio reaches the softphone through a PipeWire loopback pair created by
+  `--audio-sip-loop` (see `docs/baresip/` for the baresip configuration).
+  `scripts/smoke-sip.sh` runs the whole control path against a fake
+  baresip pair.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
@@ -107,6 +116,11 @@ scripts/smoke-loopback.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
 cabal run modec -- modem --hayes --audio-pipewire --listen 2323
 scripts/smoke-hayes.sh
+
+# SIP: install baresip, copy docs/baresip to ~/.baresip and edit accounts, run baresip, then
+cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example --audio-sip-loop modec --listen 2323
+# and from a terminal program: ATDT<number> dials the BBS, ATA answers an incoming SIP call
+scripts/smoke-sip.sh
 ```
 
 With `--audio-pipewire` the default PipeWire source and sink are used.

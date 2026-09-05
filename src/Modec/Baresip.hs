@@ -1,0 +1,219 @@
+-- | baresip control protocol (the @ctrl_tcp@ module) and a line controller
+-- that maps Hayes actions and baresip call events to modem actions.
+--
+-- Wire format: netstrings (@<length>:<payload>,@) carrying flat JSON
+-- objects.  Commands are @{"command":"dial","params":"sip:...","token":
+-- "..."}@; responses @{"response":true,"ok":true,"data":"...","token":
+-- "..."}@; events @{"event":true,"class":"call","type":"CALL_ESTABLISHED",
+-- "param":"...","direction":"incoming","peeruri":"...","id":"..."}@.
+-- Only strings, booleans and numbers occur, so a small parser suffices.
+module Modec.Baresip
+  ( netstringEncode
+  , netstringDecode
+  , Json (..)
+  , jsonParse
+  , jsonEncode
+  , BsMessage (..)
+  , decodeBsMessage
+  , commandJson
+  , SipLine
+  , sipLineInit
+  , SipAction (..)
+  , sipLineHayes
+  , sipLineEvent
+  , sipLineTick
+  , sipLineInCall
+  ) where
+
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as BC
+import Data.Char (isDigit)
+import Data.List (isPrefixOf)
+
+import Modec.Handshake (Role (..))
+import Modec.Hayes (HayesAction (..), HayesEvent (..))
+
+-- | Netstring framing.
+netstringEncode :: B.ByteString -> B.ByteString
+netstringEncode p = BC.pack (show (B.length p)) <> BC.pack ":" <> p <> BC.pack ","
+
+-- | Decode as many complete netstrings as the buffer holds; returns the
+-- payloads and the unconsumed remainder.
+netstringDecode :: B.ByteString -> ([B.ByteString], B.ByteString)
+netstringDecode = go []
+  where
+    go acc buf =
+      let (lenS, rest) = BC.span isDigit buf
+      in if B.null lenS || B.null rest || BC.head rest /= ':'
+           then (reverse acc, buf)
+           else
+             let n = read (BC.unpack lenS) :: Int
+                 body = B.drop 1 rest
+             in if B.length body >= n + 1 && BC.index body n == ','
+                  then go (B.take n body : acc) (B.drop (n + 1) body)
+                  else (reverse acc, buf)
+
+-- | A flat JSON value.
+data Json = JStr String | JBool Bool | JNum Double | JNull | JObj [(String, Json)] | JArr [Json]
+  deriving (Eq, Show)
+
+-- | Parse a JSON document (objects, arrays, strings with escapes, numbers,
+-- booleans, null).  Returns 'Nothing' on malformed input.
+jsonParse :: B.ByteString -> Maybe Json
+jsonParse bs = case value (skipWs (BC.unpack bs)) of
+  Just (v, rest) | all (`elem` " \t\r\n") rest -> Just v
+  _ -> Nothing
+  where
+    skipWs = dropWhile (`elem` " \t\r\n")
+    value s = case s of
+      ('{' : r) -> object (skipWs r) []
+      ('[' : r) -> array (skipWs r) []
+      ('"' : r) -> fmap (\(str, r') -> (JStr str, r')) (string r "")
+      ('t' : 'r' : 'u' : 'e' : r) -> Just (JBool True, r)
+      ('f' : 'a' : 'l' : 's' : 'e' : r) -> Just (JBool False, r)
+      ('n' : 'u' : 'l' : 'l' : r) -> Just (JNull, r)
+      _ -> number s
+    object s acc = case s of
+      ('}' : r) -> Just (JObj (reverse acc), r)
+      ('"' : r) -> do
+        (k, r1) <- string r ""
+        case skipWs r1 of
+          (':' : r2) -> do
+            (v, r3) <- value (skipWs r2)
+            case skipWs r3 of
+              (',' : r4) -> object (skipWs r4) ((k, v) : acc)
+              ('}' : r4) -> Just (JObj (reverse ((k, v) : acc)), r4)
+              _ -> Nothing
+          _ -> Nothing
+      _ -> Nothing
+    array s acc = case s of
+      (']' : r) -> Just (JArr (reverse acc), r)
+      _ -> do
+        (v, r1) <- value s
+        case skipWs r1 of
+          (',' : r2) -> array (skipWs r2) (v : acc)
+          (']' : r2) -> Just (JArr (reverse (v : acc)), r2)
+          _ -> Nothing
+    string s acc = case s of
+      ('"' : r) -> Just (reverse acc, r)
+      ('\\' : c : r) -> case c of
+        'n' -> string r ('\n' : acc)
+        'r' -> string r ('\r' : acc)
+        't' -> string r ('\t' : acc)
+        'u' -> let (h, r') = splitAt 4 r in string r' (toEnum (read ("0x" ++ h)) : acc)
+        _ -> string r (c : acc)
+      (c : r) -> string r (c : acc)
+      [] -> Nothing
+    number s =
+      let (numS, r) = span (`elem` "-+.eE0123456789") s
+      in if null numS then Nothing else case reads (fixup numS) of
+           [(d, "")] -> Just (JNum d, r)
+           _ -> Nothing
+    fixup n = let n1 = if "-." `isPrefixOf` n then "-0" ++ drop 1 n else if "." `isPrefixOf` n then '0' : n else n
+              in if last n1 == '.' then n1 ++ "0" else n1
+
+jsonEncode :: Json -> B.ByteString
+jsonEncode v = BC.pack (enc v)
+  where
+    enc j = case j of
+      JStr s -> '"' : concatMap esc s ++ "\""
+      JBool b -> if b then "true" else "false"
+      JNum d -> if d == fromIntegral (round d :: Int) then show (round d :: Int) else show d
+      JNull -> "null"
+      JObj kvs -> "{" ++ commas [ enc (JStr k) ++ ":" ++ enc x | (k, x) <- kvs ] ++ "}"
+      JArr xs -> "[" ++ commas (map enc xs) ++ "]"
+    commas = foldr (\a b -> if null b then a else a ++ "," ++ b) ""
+    esc c = case c of
+      '"' -> "\\\""
+      '\\' -> "\\\\"
+      '\n' -> "\\n"
+      '\r' -> "\\r"
+      '\t' -> "\\t"
+      _ -> [c]
+
+-- | Messages from baresip.
+data BsMessage
+  = BsResponse Bool String String            -- ^ ok, data, token
+  | BsEvent String String String [(String, String)]   -- ^ class, type, param, other string fields
+  | BsUnknown Json
+  deriving (Eq, Show)
+
+decodeBsMessage :: B.ByteString -> Maybe BsMessage
+decodeBsMessage bs = do
+  j <- jsonParse bs
+  case j of
+    JObj kvs ->
+      let str k = case lookup k kvs of { Just (JStr s) -> s; _ -> "" }
+          isTrue k = lookup k kvs == Just (JBool True) || lookup k kvs == Just (JStr "true")
+      in Just $ if isTrue "response"
+                  then BsResponse (isTrue "ok") (str "data") (str "token")
+                  else if isTrue "event"
+                    then BsEvent (str "class") (str "type") (str "param") [ (k, s) | (k, JStr s) <- kvs, k `notElem` ["class", "type", "param"] ]
+                    else BsUnknown j
+    _ -> Just (BsUnknown j)
+
+-- | A command frame.
+commandJson :: String -> String -> String -> B.ByteString
+commandJson cmd params token =
+  netstringEncode (jsonEncode (JObj ([("command", JStr cmd)] ++ [ ("params", JStr params) | not (null params) ] ++ [("token", JStr token)])))
+
+-- | Line controller state.
+data SipLine = SipLine
+  { slDomain   :: String
+  , slDialing  :: Bool            -- ^ we placed the call
+  , slIncoming :: Bool            -- ^ an unanswered incoming call is ringing
+  , slInCall   :: Maybe Role      -- ^ established call and the modem role we take
+  , slLastRing :: Double
+  }
+
+sipLineInit :: String -> SipLine
+sipLineInit domain = SipLine domain False False Nothing (-10)
+
+-- | What the modem should do.
+data SipAction
+  = SipCommand String String       -- ^ command and params for baresip
+  | SipStartModem Role             -- ^ media is up: run the modem in this role
+  | SipStopModem
+  | SipToDte HayesEvent            -- ^ tell the DTE
+  deriving (Eq, Show)
+
+-- | Number to a SIP URI: full URIs pass through, digits get the domain;
+-- Hayes dial modifiers (T, P, W, commas) are dropped.
+dialUri :: String -> String -> String
+dialUri domain s
+  | "sip:" `isPrefixOf` s || "sips:" `isPrefixOf` s = s
+  | '@' `elem` s = "sip:" ++ s
+  | otherwise = "sip:" ++ filter (\c -> isDigit c || c `elem` "*#+") s ++ "@" ++ domain
+
+-- | Hayes actions in SIP mode.
+sipLineHayes :: SipLine -> HayesAction -> (SipLine, [SipAction])
+sipLineHayes st a = case a of
+  ActDial s -> (st { slDialing = True }, [SipCommand "dial" (dialUri (slDomain st) s)])
+  ActAnswer
+    | slIncoming st -> (st { slIncoming = False }, [SipCommand "accept" ""])
+    | otherwise -> (st, [SipToDte EvNoCarrier])
+  ActHangup -> (st { slDialing = False, slIncoming = False, slInCall = Nothing }
+               , [SipStopModem, SipCommand "hangup" ""])
+  ActOnline -> (st, [])
+
+-- | baresip call events.
+sipLineEvent :: Double -> SipLine -> BsMessage -> (SipLine, [SipAction])
+sipLineEvent t st msg = case msg of
+  BsEvent "call" "CALL_INCOMING" _ _ -> (st { slIncoming = True, slLastRing = t }, [SipToDte EvRing])
+  BsEvent "call" "CALL_ESTABLISHED" _ _ ->
+    let role = if slDialing st then Originate else Answer
+    in (st { slInCall = Just role, slIncoming = False }, [SipStartModem role])
+  BsEvent "call" "CALL_CLOSED" _ _ ->
+    let wasCall = slInCall st /= Nothing
+        dte = if wasCall then [SipToDte EvNoCarrier] else if slDialing st then [SipToDte EvNoAnswer] else []
+    in (st { slDialing = False, slIncoming = False, slInCall = Nothing }, [SipStopModem | wasCall] ++ dte)
+  _ -> (st, [])
+
+-- | Repeat RING every two seconds while an incoming call waits.
+sipLineTick :: Double -> SipLine -> (SipLine, [SipAction])
+sipLineTick t st
+  | slIncoming st && t - slLastRing st >= 2 = (st { slLastRing = t }, [SipToDte EvRing])
+  | otherwise = (st, [])
+
+sipLineInCall :: SipLine -> Maybe Role
+sipLineInCall = slInCall
