@@ -39,11 +39,12 @@ data ToneBankConfig = ToneBankConfig
   , tbHopSec    :: Double     -- ^ time between frames
   } deriving (Show)
 
--- | All FSK tones of the supported standards plus the answer tones and
--- the V.25 calling tone.  40 ms windows resolve 2025/2100/2225 Hz.
+-- | All FSK tones of the supported standards, the answer tones, the V.25
+-- calling tone and the V.8bis signal tones.  40 ms windows resolve
+-- 2025/2100/2225 Hz.
 defaultToneBank :: ToneBankConfig
 defaultToneBank = ToneBankConfig
-  { tbFreqs = [980, 1070, 1180, 1270, 1300, 1650, 1850, 2025, 2100, 2225]
+  { tbFreqs = [980, 1070, 1180, 1270, 1300, 1650, 1850, 2025, 2100, 2225, 400, 650, 1150, 1375, 1529, 1900, 2002]
   , tbWindowSec = 0.04
   , tbHopSec = 0.02
   }

@@ -24,6 +24,8 @@ library
                       Modec.Telnet
                       Modec.Async
                       Modec.V22
+                      Modec.Hdlc
+                      Modec.V8bis
     build-depends:    base ^>=4.18,
                       bytestring,
                       vector

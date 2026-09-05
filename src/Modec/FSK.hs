@@ -30,6 +30,7 @@ module Modec.FSK
   , Discriminated (..)
   , fskDiscriminator
   , fskDeframer
+  , fskSyncBits
   , fskReceiver
   , demodulate
   , flushSilence
@@ -272,6 +273,48 @@ fskDeframer fs spec (Framing nData _nStop) params = Stage (DfState 0 0 0 0.5 (-0
                           if mark || not p
                             then (DfState (gn + 1) d markRun' hi' lo' lastFall' afterChar, Just (fromIntegral acc0))
                             else next afterChar
+
+-- | Synchronous bit recovery over discriminator output: a bit clock at
+-- the nominal rate, nudged towards every zero crossing of the sliced
+-- decision variable (HDLC flags guarantee frequent transitions), with
+-- each bit decided by the sign of the variable integrated over the
+-- middle half of the bit.  Emits nothing while no carrier is present.
+-- Global index of the next sample, previous sliced value, mark level,
+-- space level, next decision position, integration sum.
+fskSyncBits :: Double -> FskSpec -> DemodParams -> Stage Discriminated [Bool]
+fskSyncBits fs spec params = Stage (0 :: Int, 0 :: Double, 0.5 :: Double, -0.5 :: Double, spb, 0 :: Double) step
+  where
+    spb = fs / fskBaud spec
+    alpha = 1 / (2 * spb)
+    gain = dpTimingGain params
+    halfWin = 0.25 * spb
+    step st0 (Discriminated _ _ dec pres) = go st0 0 []
+      where
+        n = VS.length dec
+        go st i acc
+          | i >= n = (st, reverse acc)
+          | otherwise =
+              let (st', out) = sample st (VS.unsafeIndex dec i) (VS.unsafeIndex pres i > 0)
+              in go st' (i + 1) (maybe acc (: acc) out)
+    sample (gn, prevD, hi, lo, nxt, sumD) draw p =
+      let thr = 0.5 * (hi + lo)
+          d = draw - thr
+          (hi', lo') | not p = (hi, lo)
+                     | draw > thr = (hi + alpha * (draw - hi), lo)
+                     | otherwise = (hi, lo + alpha * (draw - lo))
+          tNow = fromIntegral gn :: Double
+          -- a zero crossing marks a bit boundary; pull the clock towards it
+          nxt1 = if (prevD >= 0) /= (d >= 0) && prevD /= d && p
+                   then let c = fromIntegral (gn - 1) + prevD / (prevD - d)
+                            boundary = nxt - 0.5 * spb
+                            err = c - boundary
+                            err' = err - spb * fromIntegral (round (err / spb) :: Int)   -- nearest boundary
+                        in nxt + gain * err'
+                   else nxt
+          sumD' = if tNow >= nxt1 - halfWin - 0.5 then sumD + d else sumD
+      in if tNow + 0.5 < nxt1 + halfWin
+           then ((gn + 1, d, hi', lo', nxt1, sumD'), Nothing)
+           else ((gn + 1, d, hi', lo', nxt1 + spb, 0), if p then Just (sumD' >= 0) else Nothing)
 
 -- | Complete receiver: samples in, bytes out, one list per chunk.
 fskReceiver :: Double -> FskSpec -> Framing -> DemodParams -> Stage Signal [Word8]

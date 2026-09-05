@@ -23,6 +23,9 @@ import Modec.Modem
 import Modec.Telnet
 import Modec.Async
 import Modec.V22
+import Modec.Hdlc
+import Modec.V8bis
+import Data.Bits (testBit, xor)
 import Modec.Stream
 import Modec.FSK
 import Modec.Standards
@@ -387,7 +390,52 @@ v22Tests = testGroup "V.22 data pump" $
   where
     bits = [ odd ((i * 7919 + 13) `div` 3 + i `div` 7) | i <- [1 .. 3000 :: Int] ]
 
+hdlcTests :: TestTree
+hdlcTests = testGroup "HDLC and V.8bis messages"
+  [ testCase "FCS residual after a good frame" $ do
+      let info = [0x22, 0x80, 0x80, 0x80, 0x81, 0x09, 0x00, 0xCE] :: [Word8]
+          bits = concatMap (\o -> [ testBit o i | i <- [0 .. 7] ]) info
+          f = fcs16 bits
+          fcsBits = [ testBit f i | i <- [15, 14 .. 0] ]
+      -- fcs16 complements the register, so a good frame leaves the complemented residual
+      assertEqual "residual" (fcsResidual `xor` 0xFFFF) (fcs16 (bits ++ fcsBits))
+  , testCase "CRC-16/X-25 check value" $ do
+      -- octets of "123456789" fed bit 1 first give the well-known X.25 FCS 0x906E
+      -- when the transmitted bits are read back as two octets, low octet first, bit 1 first
+      let bits = concatMap (\o -> [ testBit o i | i <- [0 .. 7] ]) (map (fromIntegral . fromEnum) "123456789" :: [Word8])
+          f = fcs16 bits
+          fcsBits = [ testBit f i | i <- [15, 14 .. 0] ]
+          lowFirst = bitsToWord (take 8 fcsBits) + 256 * bitsToWord (drop 8 fcsBits)
+      assertEqual "0x906E" (0x906E :: Int) lowFirst
+  , testCase "frame round trip with stuffing" $ do
+      let info = [0x22, 0xFF, 0xFF, 0x7E, 0x80, 0x81, 0x09, 0x00, 0xCE, 0x00] :: [Word8]
+          line = replicate 30 True ++ hdlcFrameBits 3 2 info ++ replicate 20 True ++ hdlcFrameBits 2 1 [0x24] ++ replicate 10 True
+          (_, frames) = hdlcRxBits hdlcRxInit line
+      assertEqual "frames" [info, [0x24]] frames
+  , testCase "corrupted frame is dropped" $ do
+      let line = hdlcFrameBits 2 1 [1, 2, 3, 4]
+          bad = take 20 line ++ [not (line !! 20)] ++ drop 21 line
+          (_, frames) = hdlcRxBits hdlcRxInit (replicate 8 True ++ bad ++ replicate 8 True)
+      assertEqual "frames" [] frames
+  , testCase "V.8bis CL, MS and ACK encode/decode" $ do
+      assertEqual "CL" (CL [ModeV21, ModeV22, ModeV22bis]) (decodeMessage (encodeMessage (CL [ModeV21, ModeV22, ModeV22bis])))
+      assertEqual "MS" (MS ModeV22bis) (decodeMessage (encodeMessage (MS ModeV22bis)))
+      assertEqual "ACK(1)" (Ack 1) (decodeMessage (encodeMessage (Ack 1)))
+      assertEqual "NAK(3)" (Nak 3) (decodeMessage (encodeMessage (Nak 3)))
+      assertEqual "CL octets" [0x22, 0x80, 0x80, 0x80, 0x81, 0x09, 0x00, 0xCE] (encodeMessage (CL [ModeV21, ModeV22, ModeV22bis]))
+  , testCase "V.8bis message over V.21 through the line" $ do
+      let fs = 8000
+          info = encodeMessage (CL [ModeV22bis, ModeV22])
+          bits = replicate 30 True ++ hdlcFrameBits 3 2 info ++ replicate 30 True
+          sig = applyChannel fs (telephoneChannel 20) (txFilter fs v21Channel2 (VS.map (* 0.5) (modulateBits fs v21Channel2 bits)))
+          rxBits = concatStage (fskDiscriminator fs v21Channel2 defaultDemodParams >>> fskSyncBits fs v21Channel2 defaultDemodParams) [sig, flushSilence fs v21Channel2]
+          (_, frames) = hdlcRxBits hdlcRxInit rxBits
+      assertEqual "frames" [info] frames
+  ]
+  where
+    bitsToWord bs = sum [ if b then 2 ^ i else 0 | (i, b) <- zip [0 .. 7 :: Int] bs ] :: Int
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests])
