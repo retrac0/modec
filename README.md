@@ -26,9 +26,9 @@ real modem to a sound card.
   dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
 - Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
   dominant-tone runs, offline FSK standard/channel identification.
-- Call establishment (`Modec.Handshake`): V.25 answer sequence, Bell 103
-  and V.21 originate/answer state machines with automode on both ends,
-  verified by a duplex simulation in the test suite.
+- Call establishment (`Modec.Handshake`): V.25 answer sequence, Bell 103,
+  V.21 and V.22 originate/answer state machines with automode on both
+  ends, verified by duplex simulations in the test suite.
 - Live modem (`Modec.Modem`, `modec modem`): audio in and out through
   PipeWire (`pw-cat`) or raw 8 kHz s16le pipes, data through a telnet
   server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
@@ -41,17 +41,19 @@ real modem to a sound card.
   SNR, ±7 Hz carrier offset, ±1 % clock offset and jitter. Validated
   against spandsp's V.22bis test program at 1200 bit/s: its handshake
   signals are recognised in order and its BERT data decodes with zero
-  PRBS-11 recurrence failures. Not yet wired into the handshake and the
-  live modem.
+  PRBS-11 recurrence failures. Wired into call establishment (V.22 §6.3
+  timing: unscrambled ones, 456 ms, scrambled ones, 270/765 ms) and the
+  live modem; the answerer probes V.22 first in automode, then V.21, then
+  Bell 103, and accepts a Bell 103 caller at any point.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
 channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
 the characters they hit. Clock offsets beyond ±3 % fail.
 
-Not yet: V.22 call establishment and data mode in the live modem, V.22bis
-(16-QAM, needs carrier recovery and an equaliser), V.8bis, SIP/RTP, Hayes AT
-command layer, native PipeWire node (pw-cat child processes are used instead).
+Not yet: V.22bis (16-QAM, needs carrier recovery and an equaliser), V.8bis,
+SIP/RTP, Hayes AT command layer, native PipeWire node (pw-cat child processes
+are used instead).
 
 ## Usage
 

@@ -56,7 +56,7 @@ cmdP = hsubparser
       <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
       <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
-      <*> option (maybeReader stdReader) (long "standard" <> value Nothing <> help "auto (default) | bell103 | v21")
+      <*> option (maybeReader stdReader) (long "standard" <> value Nothing <> help "auto (default) | bell103 | v21 | v22")
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> audioP
       <*> dataP
@@ -65,6 +65,7 @@ cmdP = hsubparser
       "auto" -> Just Nothing
       "bell103" -> Just (Just H.Bell103)
       "v21" -> Just (Just H.V21)
+      "v22" -> Just (Just H.V22)
       _ -> Nothing
     audioP =
           flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "NODE")))

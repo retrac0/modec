@@ -1,9 +1,9 @@
 {-# LANGUAGE BangPatterns #-}
 -- | The complete modem as a pure, block-driven state machine: call
 -- establishment (see "Modec.Handshake") followed by full-duplex data
--- transfer over the negotiated FSK standard.  The executable feeds it
--- audio blocks and bytes; the tests connect two of them through the
--- channel simulator.
+-- transfer over the negotiated standard (Bell 103, V.21 or V.22).  The
+-- executable feeds it audio blocks and bytes; the tests connect two of
+-- them through the channel simulator.
 module Modec.Modem
   ( ModemConfig (..)
   , defaultModemConfig
@@ -22,12 +22,14 @@ module Modec.Modem
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 
+import Modec.Async
 import Modec.Detect
 import Modec.DSP
 import Modec.FSK
 import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
+import Modec.V22
 
 data ModemConfig = ModemConfig
   { mcRate      :: Double
@@ -37,6 +39,7 @@ data ModemConfig = ModemConfig
   , mcFraming   :: Framing
   , mcTxAmp     :: Double
   , mcSettle    :: Double        -- ^ seconds of idle mark after CONNECT before data flows
+  , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
   } deriving (Show)
 
 defaultModemConfig :: Double -> Role -> Maybe Standard -> ModemConfig
@@ -47,17 +50,18 @@ defaultModemConfig fs role std = ModemConfig
   , mcDemod = defaultDemodParams
   , mcFraming = framing8N1
   , mcTxAmp = 0.5
-  , mcSettle = 0.3
+  , mcSettle = 0.6
+  , mcGuardTone = False
   }
 
 data ModemEvent
-  = EvConnected Standard FskSpec FskSpec   -- ^ standard, our tx spec, our rx spec
+  = EvConnected Standard Link
   | EvDropped
   | EvFailed String
   deriving (Eq, Show)
 
--- | Streaming transmitter: phase-continuous tones and FSK with a byte
--- queue, band limited per channel.
+-- | Streaming transmitter: phase-continuous tones, FSK with a byte
+-- queue (band limited per channel), and the V.22 modulator.
 data TxState = TxState
   { txPhase   :: !Double
   , txBitPos  :: !Double
@@ -65,15 +69,16 @@ data TxState = TxState
   , txBits    :: [Bool]
   , txQueue   :: [Word8]
   , txFir     :: Maybe (String, VS.Vector Double, Signal)   -- ^ spec name, reversed kernel, history
+  , txV22     :: V22TxState
   }
 
 txInit :: TxState
-txInit = TxState 0 0 True [] [] Nothing
+txInit = TxState 0 0 True [] [] Nothing v22TxInit
 
 -- | Generate @n@ samples for a transmit command, consuming queued bytes
--- only in data mode.
-txBlock :: Double -> Double -> Framing -> TxCmd -> Int -> TxState -> (TxState, Signal)
-txBlock fs amp fr cmd n st = case cmd of
+-- only in data modes.
+txBlock :: Double -> Double -> Framing -> Bool -> TxCmd -> Int -> TxState -> (TxState, Signal)
+txBlock fs amp fr guard cmd n st = case cmd of
   TxSilence -> (st { txFir = Nothing }, VS.replicate n 0)
   TxTone f ->
     let w = 2 * pi * f / fs
@@ -81,6 +86,12 @@ txBlock fs amp fr cmd n st = case cmd of
     in (st { txPhase = wrap (txPhase st + w * fromIntegral n), txFir = Nothing }, sig)
   TxMark spec -> fsk spec False
   TxData spec -> fsk spec True
+  TxV22 ch mode ->
+    let (bytes, st1) = case mode of
+          TxScrambledData -> (txQueue st, st { txQueue = [] })
+          _ -> ([], st)
+        (v', sig) = v22TxBlock fs ch fr amp guard mode bytes n (txV22 st1)
+    in (st1 { txV22 = v', txFir = Nothing }, sig)
   where
     twoPi = 2 * pi
     wrap p = p - twoPi * fromIntegral (floor (p / twoPi) :: Int)
@@ -102,7 +113,8 @@ txBlock fs amp fr cmd n st = case cmd of
             Just (name, h, hs) | name == fskName spec -> (h, hs)
             _ -> let h = VS.reverse (txFilterKernel fs spec) in (h, VS.replicate (VS.length h - 1) 0)
           (out, hist') = firStream hrev hist raw
-      in (TxState ph1 pos1 cur1 bits1 queue1 (Just (fskName spec, hrev, hist')), out)
+      in (st { txPhase = ph1, txBitPos = pos1, txCurBit = cur1, txBits = bits1, txQueue = queue1
+             , txFir = Just (fskName spec, hrev, hist') }, out)
 
 -- | Like 'VS.unfoldrN' but also returns the final state.
 unfoldExactN :: Int -> (s -> Maybe (Double, s)) -> s -> (Signal, s)
@@ -116,7 +128,8 @@ unfoldExactN n f s0 = go 0 s0 []
 
 data Mode
   = Handshaking
-  | Data Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
+  | DataFsk Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
+  | DataV22 V22Channel V22Channel AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
   | Finished
 
 data ModemState = ModemState
@@ -125,6 +138,8 @@ data ModemState = ModemState
   , msHs      :: HsState
   , msTx      :: TxState
   , msTxCmd   :: TxCmd
+  , msV22Rx   :: Maybe (V22Channel, V22RxState)   -- ^ receiver on the remote's V.22 channel
+  , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
   , msSettled :: !Double     -- ^ seconds spent in data mode so far
   , msStatus  :: HsStatus
@@ -133,27 +148,35 @@ data ModemState = ModemState
 modemInit :: ModemConfig -> ModemState
 modemInit cfg
   | mcNoHandshake cfg, Just s <- hcStandard hs =
-      let (tx, rx) = specsFor (hcRole hs) s
-      in base { msMode = dataMode s tx rx, msTxCmd = TxData tx, msStatus = HsConnected s tx rx }
+      let link = linkFor (hcRole hs) s
+      in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link }
   | otherwise = base
   where
     hs = mcHandshake cfg
     fs = mcRate cfg
-    base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence 0 0 HsBusy
-    dataMode s tx rx = Data s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
+    listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
+    base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
+             (Just (listenCh, v22RxInit fs)) 0 0 0 HsBusy
+    dataMode s link = case link of
+      FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
+      V22Link tx rx -> DataV22 tx rx (asyncRxInit (mcFraming cfg)) False
 
-specsFor :: Role -> Standard -> (FskSpec, FskSpec)
-specsFor Originate Bell103 = (bell103Originate, bell103Answer)
-specsFor Answer Bell103 = (bell103Answer, bell103Originate)
-specsFor Originate V21 = (v21Channel1, v21Channel2)
-specsFor Answer V21 = (v21Channel2, v21Channel1)
+dataCmd :: Link -> TxCmd
+dataCmd (FskLink tx _) = TxData tx
+dataCmd (V22Link tx _) = TxV22 tx TxScrambledData
+
+-- | Idle-mark command for a link (used while settling after CONNECT).
+markCmd :: Link -> TxCmd
+markCmd (FskLink tx _) = TxMark tx
+markCmd (V22Link tx _) = TxV22 tx TxScrambledOnes
 
 modemStatus :: ModemState -> HsStatus
 modemStatus = msStatus
 
 modemConnected :: ModemState -> Bool
 modemConnected st = case msMode st of
-  Data {} -> True
+  DataFsk {} -> True
+  DataV22 {} -> True
   _ -> False
 
 -- | Process one block of received audio and newly queued bytes.  Returns
@@ -163,40 +186,65 @@ modemStep cfg st0 rxBlock newBytes =
   let st = st0 { msTx = (msTx st0) { txQueue = txQueue (msTx st0) ++ newBytes } }
       fs = mcRate cfg
       n = VS.length rxBlock
-      blockSec = fromIntegral n / fs
       hs = mcHandshake cfg
+      transmit cmd s = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n (msTx s)
   in case msMode st of
     Finished ->
       (st, VS.replicate n 0, [], [])
     Handshaking ->
       let (bank', frames) = stepStage (msBank st) rxBlock
-          (hsState', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep hs h fr in (h', acc ++ [o])) (msHs st, []) frames
+          -- V.22 receiver on the remote channel, reported to the handshake
+          (v22', report, zeros') = case msV22Rx st of
+            Nothing -> (Nothing, Nothing, 0)
+            Just (ch, rxSt) ->
+              let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
+                  z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
+              in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z), z)
+          (hsState', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep hs h fr report in (h', acc ++ [o])) (msHs st, []) frames
           (cmd, status) = if null outs then (msTxCmd st, HsBusy) else last outs
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd }
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22', msZeros = zeros' }
       in case status of
-           HsConnected s tx rx ->
-             let disc = fskDiscriminator fs rx (mcDemod cfg)
-                 framer = fskDeframer fs rx (mcFraming cfg) (mcDemod cfg)
-                 st2 = st1 { msMode = Data s tx rx disc framer, msTxCmd = TxData tx, msStatus = status, msSettled = 0 }
-                 (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (TxMark tx) n (msTx st2)
-             in (st2 { msTx = txSt }, audio, [], [EvConnected s tx rx])
+           HsConnected s link ->
+             let mode = case link of
+                   FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
+                   V22Link tx rx -> DataV22 tx rx (asyncRxInit (mcFraming cfg)) False
+                 st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0 }
+                 (txSt, audio) = transmit (markCmd link) st2
+             in (st2 { msTx = txSt }, audio, [], [EvConnected s link])
            HsFailed why ->
              (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], [EvFailed why])
            HsDropped ->
              (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], [EvDropped])
            HsBusy ->
-             let (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) cmd n (msTx st1)
+             let (txSt, audio) = transmit cmd st1
              in (st1 { msTx = txSt }, audio, [], [])
-    Data s tx rx disc framer ->
+    DataFsk s tx rx disc framer ->
       let (disc', d) = stepStage disc rxBlock
           (framer', bytes) = stepStage framer d
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
-          lost = if presence < 0.5 then msLost st + blockSec else 0
+      in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) bytes
+    DataV22 tx rx framer armed ->
+      let (rxSt', o) = case msV22Rx st of
+            Just (_, r) -> v22RxBlock fs rx rxBlock r
+            Nothing -> v22RxBlock fs rx rxBlock (v22RxInit fs)
+          -- frame nothing until the receiver has locked and seen idle mark,
+          -- otherwise the start-up bits produce junk characters
+          armed' = armed || roOnesRun o >= 16
+          (framer', bytes) = if armed then asyncRxBits framer (roBits o) else (framer, [])
+          st1 = st { msV22Rx = Just (rx, rxSt') }
+      in finishData st1 (DataV22 tx rx framer' armed') (V22Link tx rx) (roEnergy o > 1e-5) bytes
+  where
+    -- common tail of the data modes: carrier watchdog, settle time, transmit
+    finishData st mode link present bytes =
+      let fs = mcRate cfg
+          n = VS.length rxBlock
+          blockSec = fromIntegral n / fs
+          hs = mcHandshake cfg
+          lost = if present then 0 else msLost st + blockSec
           settled = msSettled st + blockSec
-          -- idle mark for a moment after CONNECT so both receivers can settle
-          cmd = if settled < mcSettle cfg then TxMark tx else TxData tx
-          (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) cmd n (msTx st)
-          st1 = st { msMode = Data s tx rx disc' framer', msTx = txSt, msLost = lost, msSettled = settled }
+          cmd = if settled < mcSettle cfg then markCmd link else dataCmd link
+          (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n (msTx st)
+          st1 = st { msMode = mode, msTx = txSt, msLost = lost, msSettled = settled }
       in if lost > hcDrop hs
            then (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }, VS.replicate n 0, bytes, [EvDropped])
            else (st1, audio, bytes, [])

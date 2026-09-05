@@ -179,6 +179,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
             TxTone x -> x
             TxMark sp -> fskMark sp
             TxData sp -> fskMark sp
+            TxV22 ch _ -> if ch == HighChannel then 2250 else 1050   -- unscrambled ones, as a tone
           w = 2 * pi * f / fs
           sig = VS.generate blk (\i -> if f == 0 then 0 else 0.5 * sin (sdPhase s + w * fromIntegral i))
           ph = sdPhase s + w * fromIntegral blk
@@ -187,7 +188,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
       case sdBank s of
        Stage bst bstep ->
         let (bst', frames) = bstep bst audio
-            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr in (h', acc ++ [o])) (sdHs s, []) frames
+            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing in (h', acc ++ [o])) (sdHs s, []) frames
             s' = s { sdBank = Stage bst' bstep, sdHs = hs' }
         in case outs of
              [] -> s'
@@ -204,7 +205,8 @@ runLength p tr = case dropWhile (not . p . snd) tr of
 
 handshakeTests :: TestTree
 handshakeTests = testGroup "handshake simulation"
-  [ call "auto / auto -> V.21" Nothing Nothing V21
+  -- without a V.22 receiver the caller takes the answerer's V.22 probe (2250 Hz) for a Bell answer tone
+  [ call "auto / auto (tones only) -> Bell 103" Nothing Nothing Bell103
   , call "originate V.21 / answer auto" (Just V21) Nothing V21
   , call "originate Bell 103 / answer auto" (Just Bell103) Nothing Bell103
   , call "originate auto / answer Bell 103" Nothing (Just Bell103) Bell103
@@ -227,12 +229,8 @@ handshakeTests = testGroup "handshake simulation"
   where
     call name so sa expect = testCase name $ do
       let (o, a) = simulateCall (defaultHsConfig Originate) { hcStandard = so } (defaultHsConfig Answer) { hcStandard = sa } 30 20
-      assertEqual "originate" (HsConnected expect (txSpecOf Originate expect) (txSpecOf Answer expect)) (sdStatus o)
-      assertEqual "answer" (HsConnected expect (txSpecOf Answer expect) (txSpecOf Originate expect)) (sdStatus a)
-    txSpecOf Originate Bell103 = bell103Originate
-    txSpecOf Answer Bell103 = bell103Answer
-    txSpecOf Originate V21 = v21Channel1
-    txSpecOf Answer V21 = v21Channel2
+      assertEqual "originate" (HsConnected expect (linkFor Originate expect)) (sdStatus o)
+      assertEqual "answer" (HsConnected expect (linkFor Answer expect)) (sdStatus a)
 
 detectTests :: TestTree
 detectTests = testGroup "detection" $
@@ -277,12 +275,27 @@ modemDuplex cfgO cfgA snr textO textA maxT = go 0 (modemInit cfgO) (modemInit cf
 
 modemTests :: TestTree
 modemTests = testGroup "full modem duplex"
-  [ testCase "automode call, text both ways at 30 dB" $ do
+  [ testCase "automode call -> V.22, text both ways at 30 dB" $ do
       let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate Nothing) (defaultModemConfig 8000 Answer Nothing) 30 textO textA 14
-      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V21 _ _ : _) -> True; _ -> False)
-      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V21 _ _ : _) -> True; _ -> False)
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 _ : _) -> True; _ -> False)
+      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V22 _ : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
+  , testCase "originate fixed V.21, answer automode -> V.21" $ do
+      let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate (Just V21)) (defaultModemConfig 8000 Answer Nothing) 30 textO textA 16
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V21 _ : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "V.22 fixed both sides, 20 dB" $ do
+      let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate (Just V22)) (defaultModemConfig 8000 Answer (Just V22)) 20 textO textA 14
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 _ : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "V.22 no handshake, 15 dB" $ do
+      let cfg r = (defaultModemConfig 8000 r (Just V22)) { mcNoHandshake = True }
+          (rxO, rxA, _, _) = modemDuplex (cfg Originate) (cfg Answer) 15 textO textA 6
+      assertEqual "answer to originate" textA rxO
+      assertEqual "originate to answer" textO rxA
   , testCase "Bell 103 fixed, no handshake, 20 dB" $ do
       let cfg r = (defaultModemConfig 8000 r (Just Bell103)) { mcNoHandshake = True }
           (rxO, rxA, _, _) = modemDuplex (cfg Originate) (cfg Answer) 20 textO textA 6

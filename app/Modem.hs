@@ -29,7 +29,6 @@ import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 import Modec.DSP (Signal)
 import Modec.Handshake
 import Modec.Modem
-import Modec.Standards
 import Modec.Telnet
 
 data AudioIO
@@ -86,7 +85,7 @@ runModem o = do
                 hFlush aout
                 unless (null rxBytes) $ sendBytes (B.pack rxBytes)
                 forM_ events $ \ev -> case ev of
-                  EvConnected s tx rx -> logMsg ("CONNECT " ++ show s ++ " tx " ++ fskName tx ++ " rx " ++ fskName rx)
+                  EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
                   EvDropped -> logMsg "NO CARRIER"
                   EvFailed why -> logMsg ("connection failed: " ++ why)
                 let finished = any isFinal events
