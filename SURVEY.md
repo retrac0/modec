@@ -127,9 +127,11 @@ Keep the DSP core free of IO so the same code runs against WAV fixtures in the t
 
 Suggested order: tone detector and Bell 103 answer-channel decoder against minimodem output → Bell 103 modulator and full-duplex loop → telnet bridge → V.22 (4-DPSK, no amplitude bits) against spandsp test output → V.22bis 16-QAM and S1 handling → V.8bis capabilities exchange on top of the V.21 channel code.
 
-Progress (2026-09-05): FSK modem, channel simulator, tone detection, Bell 103 / V.21 handshakes, live modem with PipeWire/telnet I/O, and the V.22 data pump (validated against spandsp) are done (see README). Next: V.22 handshake in the modem, then V.22bis.
+Progress (2026-09-05): FSK modem, channel simulator, tone detection, Bell 103 / V.21 / V.22 / V.22bis handshakes, live modem with PipeWire/telnet I/O, and the V.22/V.22bis data pump (validated against spandsp at 1200 and 2400 bit/s) are done (see README). Next: V.8bis, SIP/RTP, Hayes AT layer.
 
-spandsp oracle recipe: clone github.com/freeswitch/spandsp, `autoreconf -fi && ./configure && make`, then `make -C spandsp-sim LIBS=-lfftw3` and `make -C tests v22bis_tests LIBS="-lfftw3 -lsndfile"`; run `tests/v22bis_tests -l -b 1200` (it runs until killed; kill it after a minute) and split `tests/v22bis.wav` with `sox --ignore-length v22bis.wav -c 1 out.wav remix 1 trim 0 40` (channel 1 = calling modem, low channel; remix 2 = answering modem). Its data source is the ITU O.152 2047-bit PRBS (x^11 + x^9 + 1).
+V.22bis constellation (Figure 2/V.22bis, confirmed from the rendered PDF page and identical to spandsp's table): first quadrant 00 = (1,1), 01 = (3,1), 10 = (1,3), 11 = (3,3); the other quadrants are that pattern rotated by 90° per quadrant. The 1200 bit/s (V.22-compatible) points are the 01 points, i.e. (3,1) rotated. Quadrant changes per Table 1: 00 = +90°, 01 = 0°, 11 = +270°, 10 = +180°.
+
+spandsp oracle recipe: clone github.com/freeswitch/spandsp, `autoreconf -fi && ./configure && make`, then `make -C spandsp-sim LIBS=-lfftw3` and `make -C tests v22bis_tests LIBS="-lfftw3 -lsndfile"`; run `tests/v22bis_tests -l -b 1200` or `-b 2400` (it runs until killed; kill it after a minute, and never with `pkill -f` on a pattern that matches your own shell) and split `tests/v22bis.wav` with `sox --ignore-length v22bis.wav -c 1 out.wav remix 1 trim 0 40` (channel 1 = calling modem, low channel; remix 2 = answering modem). Its data source is the ITU O.152 2047-bit PRBS (x^11 + x^9 + 1).
 
 ## 7. Documents to fetch
 

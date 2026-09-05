@@ -13,6 +13,8 @@ module Modec.Modem
   , modemStep
   , modemStatus
   , modemConnected
+  , modemTxCmd
+  , modemV22Rx
     -- * Transmitter
   , TxState
   , txInit
@@ -86,11 +88,11 @@ txBlock fs amp fr guard cmd n st = case cmd of
     in (st { txPhase = wrap (txPhase st + w * fromIntegral n), txFir = Nothing }, sig)
   TxMark spec -> fsk spec False
   TxData spec -> fsk spec True
-  TxV22 ch mode ->
+  TxV22 ch rate mode ->
     let (bytes, st1) = case mode of
           TxScrambledData -> (txQueue st, st { txQueue = [] })
           _ -> ([], st)
-        (v', sig) = v22TxBlock fs ch fr amp guard mode bytes n (txV22 st1)
+        (v', sig) = v22TxBlock fs ch fr amp guard rate mode bytes n (txV22 st1)
     in (st1 { txV22 = v', txFir = Nothing }, sig)
   where
     twoPi = 2 * pi
@@ -129,7 +131,7 @@ unfoldExactN n f s0 = go 0 s0 []
 data Mode
   = Handshaking
   | DataFsk Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
-  | DataV22 V22Channel V22Channel AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
+  | DataV22 V22Channel V22Channel Rate AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
   | Finished
 
 data ModemState = ModemState
@@ -139,6 +141,7 @@ data ModemState = ModemState
   , msTx      :: TxState
   , msTxCmd   :: TxCmd
   , msV22Rx   :: Maybe (V22Channel, V22RxState)   -- ^ receiver on the remote's V.22 channel
+  , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
   , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
   , msSettled :: !Double     -- ^ seconds spent in data mode so far
@@ -156,22 +159,30 @@ modemInit cfg
     fs = mcRate cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) 0 0 0 HsBusy
+             (Just (listenCh, v22RxInit fs)) R1200 0 0 0 HsBusy
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
-      V22Link tx rx -> DataV22 tx rx (asyncRxInit (mcFraming cfg)) False
+      V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
 
 dataCmd :: Link -> TxCmd
 dataCmd (FskLink tx _) = TxData tx
-dataCmd (V22Link tx _) = TxV22 tx TxScrambledData
+dataCmd (V22Link tx _ r) = TxV22 tx r TxScrambledData
 
 -- | Idle-mark command for a link (used while settling after CONNECT).
 markCmd :: Link -> TxCmd
 markCmd (FskLink tx _) = TxMark tx
-markCmd (V22Link tx _) = TxV22 tx TxScrambledOnes
+markCmd (V22Link tx _ r) = TxV22 tx r TxScrambledOnes
 
 modemStatus :: ModemState -> HsStatus
 modemStatus = msStatus
+
+-- | Current transmit command (for tracing).
+modemTxCmd :: ModemState -> TxCmd
+modemTxCmd = msTxCmd
+
+-- | The V.22 receiver state and its decision rate (for tracing).
+modemV22Rx :: ModemState -> (Maybe (V22Channel, V22RxState), Rate)
+modemV22Rx st = (msV22Rx st, msRxRate st)
 
 modemConnected :: ModemState -> Bool
 modemConnected st = case msMode st of
@@ -199,15 +210,17 @@ modemStep cfg st0 rxBlock newBytes =
             Just (ch, rxSt) ->
               let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
                   z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
-              in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z), z)
+              in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
           (hsState', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep hs h fr report in (h', acc ++ [o])) (msHs st, []) frames
-          (cmd, status) = if null outs then (msTxCmd st, HsBusy) else last outs
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22', msZeros = zeros' }
+          (cmd, status, rxRate) = if null outs then (msTxCmd st, HsBusy, msRxRate st) else let o = last outs in (hoTx o, hoStatus o, hoRxRate o)
+          -- switch the receiver's decision rate when the handshake says so
+          v22'' = if rxRate /= msRxRate st then fmap (\(c, r) -> (c, v22RxSetRate rxRate r)) v22' else v22'
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRxRate = rxRate, msZeros = zeros' }
       in case status of
            HsConnected s link ->
              let mode = case link of
                    FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
-                   V22Link tx rx -> DataV22 tx rx (asyncRxInit (mcFraming cfg)) False
+                   V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
                  st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0 }
                  (txSt, audio) = transmit (markCmd link) st2
              in (st2 { msTx = txSt }, audio, [], [EvConnected s link])
@@ -223,16 +236,16 @@ modemStep cfg st0 rxBlock newBytes =
           (framer', bytes) = stepStage framer d
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
       in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) bytes
-    DataV22 tx rx framer armed ->
+    DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
-            Just (_, r) -> v22RxBlock fs rx rxBlock r
-            Nothing -> v22RxBlock fs rx rxBlock (v22RxInit fs)
+            Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)
+            Nothing -> v22RxBlock fs rx rxBlock (v22RxSetRate rate (v22RxInit fs))
           -- frame nothing until the receiver has locked and seen idle mark,
           -- otherwise the start-up bits produce junk characters
           armed' = armed || roOnesRun o >= 16
           (framer', bytes) = if armed then asyncRxBits framer (roBits o) else (framer, [])
-          st1 = st { msV22Rx = Just (rx, rxSt') }
-      in finishData st1 (DataV22 tx rx framer' armed') (V22Link tx rx) (roEnergy o > 1e-5) bytes
+          st1 = st { msV22Rx = Just (rx, rxSt'), msRxRate = rate }
+      in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) bytes
   where
     -- common tail of the data modes: carrier watchdog, settle time, transmit
     finishData st mode link present bytes =

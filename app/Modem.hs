@@ -21,6 +21,7 @@ import Data.IORef
 import qualified Data.Vector.Storable as VS
 import Network.Socket
 import qualified Network.Socket.ByteString as NB
+import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.IO
 import System.Process
@@ -29,6 +30,7 @@ import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 import Modec.DSP (Signal)
 import Modec.Handshake
 import Modec.Modem
+import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 
 data AudioIO
@@ -47,6 +49,7 @@ data ModemOpts = ModemOpts
   , moRole     :: Role
   , moStandard :: Maybe Standard
   , moNoHandshake :: Bool
+  , moMax1200  :: Bool
   , moAudio    :: AudioIO
   , moData     :: DataIO
   , moAmp      :: Double
@@ -61,13 +64,16 @@ runModem o = do
   hSetBinaryMode stdout True
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
-      cfg = (defaultModemConfig fs (moRole o) (moStandard o)) { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o }
+      cfg0 = defaultModemConfig fs (moRole o) (moStandard o)
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcAllow2400 = not (moMax1200 o) } }
   when (moNoHandshake o && moStandard o == Nothing) $ do
     logMsg "--no-handshake needs --standard bell103 or v21"
     exitFailure
   withAudio (moAudio o) (moRate o) (moRole o) $ \ain aout ->
     withData (moData o) $ \recvBytes sendBytes -> do
       stRef <- newIORef (modemInit cfg)
+      trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
+      blockRef <- newIORef (0 :: Int)
       -- output leads input by one block: two modems joined by pipes would
       -- otherwise each wait for the other's first block
       B.hPut aout (encodeS16 (VS.replicate blockN 0))
@@ -81,6 +87,11 @@ runModem o = do
                 st <- readIORef stRef
                 let (st', audio, rxBytes, events) = modemStep cfg st (decodeS16 raw) (B.unpack pending)
                 writeIORef stRef st'
+                when trace $ do
+                  k <- readIORef blockRef
+                  writeIORef blockRef (k + 1)
+                  when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
+                    logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
                 B.hPut aout (encodeS16 audio)
                 hFlush aout
                 unless (null rxBytes) $ sendBytes (B.pack rxBytes)
@@ -94,6 +105,11 @@ runModem o = do
           isFinal (EvFailed _) = True
           isFinal _ = False
       loop
+
+v22Info :: ModemState -> String
+v22Info st = case modemV22Rx st of
+  (Just (ch, r), rate) -> "v22rx " ++ show ch ++ " " ++ show rate ++ " evm " ++ show (rxEvmEstimate r) ++ " ones2400 " ++ show (rxOnes2400Run r) ++ " sps " ++ show (rxSpsEstimate r)
+  _ -> ""
 
 decodeS16 :: B.ByteString -> Signal
 decodeS16 bs = VS.generate (B.length bs `div` 2) $ \i ->

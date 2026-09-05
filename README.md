@@ -34,26 +34,36 @@ real modem to a sound card.
   server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
   escaped) or stdio. Automode on both ends. `scripts/smoke-loopback.sh`
   cross-connects two instances through FIFOs and pushes text both ways.
-- V.22 data pump (`Modec.V22`): 1200 bit/s, 600 Bd differential 4-PSK on
-  1200/2400 Hz, RRC 75 % shaping, 1 + x^-14 + x^-17 scrambler, Gardner
-  timing recovery, handshake signal detectors (unscrambled ones, S1,
-  scrambled ones). Error free through the channel simulator down to 8 dB
-  SNR, ±7 Hz carrier offset, ±1 % clock offset and jitter. Validated
-  against spandsp's V.22bis test program at 1200 bit/s: its handshake
-  signals are recognised in order and its BERT data decodes with zero
-  PRBS-11 recurrence failures. Wired into call establishment (V.22 §6.3
-  timing: unscrambled ones, 456 ms, scrambled ones, 270/765 ms) and the
-  live modem; the answerer probes V.22 first in automode, then V.21, then
-  Bell 103, and accepts a Bell 103 caller at any point.
+- V.22 / V.22bis data pump (`Modec.V22`): 600 Bd on 1200/2400 Hz, RRC
+  75 % shaping, 1 + x^-14 + x^-17 scrambler, Gardner timing recovery.
+  1200 bit/s uses differential 4-PSK decisions; 2400 bit/s adds a coherent
+  path: AGC, decision-directed carrier phase/frequency loop (frequency
+  fed forward from the differential detector during training), a 15-tap
+  T/2 LMS equaliser, and 16-way decisions on the Figure 2/V.22bis
+  constellation in a quadrant-rotated frame. Handshake signal detectors
+  for unscrambled ones, S1 and scrambled ones at either rate. Error free
+  through the simulator: 1200 bit/s down to 8 dB SNR, 2400 bit/s down to
+  12 dB, ±7 Hz carrier offset, ±0.5 % clock offset, 3 ms delay distortion,
+  echo, +30 dB adjacent channel. Validated against spandsp's V.22bis test
+  program at both rates: handshake signals recognised in order, BERT data
+  decodes with zero PRBS-11 recurrence failures.
+- V.22/V.22bis call establishment (§6.3, including the S1 exchange, the
+  600/450 ms rate switch and the 32-ones completion) in the handshake and
+  the live modem. Automode probes V.22 first, then V.21, then Bell 103,
+  accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
+  with a V.22-only peer. `--max-1200` disables 2400 on our side.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
 channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
 the characters they hit. Clock offsets beyond ±3 % fail.
 
-Not yet: V.22bis (16-QAM, needs carrier recovery and an equaliser), V.8bis,
-SIP/RTP, Hayes AT command layer, native PipeWire node (pw-cat child processes
-are used instead).
+Known 2400 bit/s limits: re-acquisition after jitter-buffer slips is slow
+(each slip costs tens of bytes) and heavy sinusoidal jitter breaks the
+coherent path.
+
+Not yet: V.8bis, SIP/RTP, Hayes AT command layer, native PipeWire node
+(pw-cat child processes are used instead), V.22bis guard tone by default.
 
 ## Usage
 
@@ -65,7 +75,7 @@ cabal run modec -- decode --originate --v21 file.wav
 printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
 cabal run modec -- probe recording.wav                            # tone energies
 cabal run modec -- detect recording.wav                           # which standard, tone runs
-cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep
+cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep (also v21, v22low/high, v22bislow/high)
 
 # live modem: answer calls arriving on the default PipeWire source, serve telnet on 2323
 cabal run modec -- modem --answer --audio-pipewire --listen 2323

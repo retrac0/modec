@@ -3,6 +3,7 @@ module Main (main) where
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
+import Control.Monad (forM_)
 import Data.List (isSuffixOf, sort)
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
@@ -180,7 +181,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
             TxTone x -> x
             TxMark sp -> fskMark sp
             TxData sp -> fskMark sp
-            TxV22 ch _ -> if ch == HighChannel then 2250 else 1050   -- unscrambled ones, as a tone
+            TxV22 ch _ _ -> if ch == HighChannel then 2250 else 1050   -- unscrambled ones, as a tone
           w = 2 * pi * f / fs
           sig = VS.generate blk (\i -> if f == 0 then 0 else 0.5 * sin (sdPhase s + w * fromIntegral i))
           ph = sdPhase s + w * fromIntegral blk
@@ -189,7 +190,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
       case sdBank s of
        Stage bst bstep ->
         let (bst', frames) = bstep bst audio
-            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing in (h', acc ++ [o])) (sdHs s, []) frames
+            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing in (h', acc ++ [(hoTx o, hoStatus o)])) (sdHs s, []) frames
             s' = s { sdBank = Stage bst' bstep, sdHs = hs' }
         in case outs of
              [] -> s'
@@ -276,10 +277,16 @@ modemDuplex cfgO cfgA snr textO textA maxT = go 0 (modemInit cfgO) (modemInit cf
 
 modemTests :: TestTree
 modemTests = testGroup "full modem duplex"
-  [ testCase "automode call -> V.22, text both ways at 30 dB" $ do
-      let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate Nothing) (defaultModemConfig 8000 Answer Nothing) 30 textO textA 14
-      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 _ : _) -> True; _ -> False)
-      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V22 _ : _) -> True; _ -> False)
+  [ testCase "automode call -> V.22bis at 2400 bit/s, text both ways at 30 dB" $ do
+      let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate Nothing) (defaultModemConfig 8000 Answer Nothing) 30 textO textA 16
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 (V22Link _ _ R2400) : _) -> True; _ -> False)
+      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V22 (V22Link _ _ R2400) : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "V.22-only caller (no S1) -> 1200 bit/s" $ do
+      let noS1 = (defaultModemConfig 8000 Originate (Just V22)) { mcHandshake = ((defaultHsConfig Originate) { hcStandard = Just V22, hcAllow2400 = False }) }
+          (rxO, rxA, evO, _) = modemDuplex noS1 (defaultModemConfig 8000 Answer Nothing) 30 textO textA 14
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 (V22Link _ _ R1200) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
   , testCase "originate fixed V.21, answer automode -> V.21" $ do
@@ -287,9 +294,9 @@ modemTests = testGroup "full modem duplex"
       assertBool ("originate events " ++ show evO) (case evO of (EvConnected V21 _ : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
-  , testCase "V.22 fixed both sides, 20 dB" $ do
-      let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate (Just V22)) (defaultModemConfig 8000 Answer (Just V22)) 20 textO textA 14
-      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 _ : _) -> True; _ -> False)
+  , testCase "V.22 fixed both sides, 20 dB -> 2400 bit/s" $ do
+      let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate (Just V22)) (defaultModemConfig 8000 Answer (Just V22)) 20 textO textA 16
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22 (V22Link _ _ R2400) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
   , testCase "V.22 no handshake, 15 dB" $ do
@@ -350,10 +357,28 @@ v22Tests = testGroup "V.22 data pump" $
           -- start-up bits (filter delays, descrambler sync) may yield a stray character first
           (_, bytes) = asyncRxBits (asyncRxInit framing8N1) got
       assertBool ("payload is a suffix of " ++ show bytes) (payload `isSuffixOf` bytes)
+  , testCase "2400 bit/s after 1200 bit/s training: clean, 15 dB, 3 ms delay distortion, +7 Hz" $ do
+      let fs = 8000
+          fr = framing8N1
+          (stPre, pre) = v22TxBlock fs HighChannel fr 0.5 False R1200 TxScrambledOnes [] 4800 v22TxInit
+          dataBlocks st bs
+            | null bs && null (txBitsOf st) = [snd (v22TxBlock fs HighChannel fr 0.5 False R2400 TxScrambledOnes [] 400 st)]
+            | otherwise = let (st', sig) = v22TxBlock fs HighChannel fr 0.5 False R2400 TxScrambledData [] 160 (withBits st (take 2000 bs)) in sig : dataBlocks st' (drop 2000 bs)
+          clean = pre VS.++ VS.concat (dataBlocks stPre bits)
+          decode sig =
+            let chunks v | VS.null v = [] | otherwise = VS.take 160 v : chunks (VS.drop 160 v)
+                run _ _ [] = []
+                run i st (c : cs) = let st1 = if i == (30 :: Int) then v22RxSetRate R2400 st else st
+                                        (st', o) = v22RxBlock fs HighChannel c st1 in o : run (i + 1) st' cs
+            in concatMap roBits (drop 30 (run 0 (v22RxInit fs) (chunks sig)))
+          errs sig = minimum [ length (filter id (zipWith (/=) (drop 400 bits) (drop (400 + o) (decode sig)))) | o <- [0 .. 300] ]
+      forM_ [ ("clean", id), ("SNR 15", applyChannel fs (telephoneChannel 15))
+            , ("delay 3 ms", applyChannel fs idealChannel { chDelayDist = 3 }), ("freq +7", applyChannel fs idealChannel { chFreqOffsetHz = 7 }) ] $ \(name, f) ->
+        assertEqual (name ++ " bit errors") 0 (errs (f clean))
   , testCase "unscrambled ones and S1 are recognised" $ do
-      let (_, u11) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxU11 [] 4000 v22TxInit
-          (_, s1) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxS1 [] 4000 v22TxInit
-          (_, ones) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxScrambledOnes [] 4000 v22TxInit
+      let (_, u11) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxU11 [] 4000 v22TxInit
+          (_, s1) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxS1 [] 4000 v22TxInit
+          (_, ones) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxScrambledOnes [] 4000 v22TxInit
           lastOut sig = last (v22RxRun 8000 (v22RxInit 8000) HighChannel sig)
       assertBool "U11 run" (roU11Run (lastOut u11) > 100)
       assertBool "S1 run" (roS1Run (lastOut s1) > 100)
