@@ -17,7 +17,9 @@ real modem to a sound card.
   against minimodem 0.24.
 - Receiver: band-pass prefilter, O(n) prefix-sum tone correlators,
   adaptive slicer, UART-style framer with sub-sample start-edge location,
-  one timing correction per bit boundary and integrate-and-dump decisions.
+  one timing correction per bit boundary, integrate-and-dump decisions and
+  a start-bit depth check over the middle 60 % of the bit (rejects the
+  switch-on transients of a strong adjacent channel).
   Error free in the bench down to 6 dB SNR, ±3 % clock offset, ±30 Hz
   carrier offset, jitter, slips and +20 dB adjacent channel.
 - Transmitter: continuous-phase FSK with transmit band limiting.

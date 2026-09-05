@@ -71,12 +71,13 @@ data DemodParams = DemodParams
   , dpPrefilter  :: !Bool         -- ^ band-pass around the channel's tones before correlating
   , dpSlicer     :: !Bool         -- ^ adaptive threshold between the mark and space levels
   , dpIntegrate  :: !Double       -- ^ half-width of the decision integration window, in bits (0 = one sample)
+  , dpStartDepth :: !Double       -- ^ a start bit must average this far below the slicer threshold (0..1)
   } deriving (Show)
 
 defaultDemodParams :: DemodParams
 defaultDemodParams = DemodParams
   { dpSquelch = 3e-3, dpTimingGain = 0.5, dpWindow = Rect, dpPrefilter = True
-  , dpSlicer = True, dpIntegrate = 0.15 }
+  , dpSlicer = True, dpIntegrate = 0.15, dpStartDepth = 0.25 }
 
 -- | Discriminator output for one chunk, one entry per input sample.
 data Discriminated = Discriminated
@@ -259,13 +260,22 @@ fskDeframer fs spec (Framing nData _nStop) params = Stage (DfState 0 0 0 0.5 (-0
                       err = c - boundary
                   in if abs err < 0.35 * spb then (nxt + gain * err, True) else (nxt, corrected)
                 _ -> (nxt, corrected)
-              sumD' = if tNow >= nxt' - halfWin - 0.5 then sumD + d else sumD
-          in if tNow + 0.5 < nxt' + halfWin
+              -- the start bit is checked over the middle 60 % of the bit so that a
+              -- transient shorter than half a bit cannot pass for it; data and stop
+              -- bits use the configured (narrower) window
+              win = if bit == 0 then 0.3 * spb else halfWin
+              sumD' = if tNow >= nxt' - win - 0.5 then sumD + d else sumD
+          in if tNow + 0.5 < nxt' + win
                then next (Char nxt' bit acc0 corrected' sumD')
                else
                  let mark = sumD' >= 0
+                     -- samples integrated: from nxt - win - 0.5 to nxt + win
+                     nInt = max 1 (2 * win + 1)
+                     -- a real start bit is a clear space; a shallow dip (a transient
+                     -- of another channel leaking through) is not
+                     shallow = sumD' > negate (dpStartDepth params) * nInt
                  in if bit == 0
-                      then (if mark || not p then next Hunt else next (Char (nxt' + spb) 1 0 False 0))
+                      then (if mark || not p || shallow then next Hunt else next (Char (nxt' + spb) 1 0 False 0))
                       else if bit <= nData
                         then (if not p then next Hunt   -- carrier lost mid-character
                               else next (Char (nxt' + spb) (bit + 1) (if mark then setBit acc0 (bit - 1) else acc0) False 0))
