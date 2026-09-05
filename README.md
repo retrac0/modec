@@ -65,8 +65,11 @@ cabal run modec -- modem --answer --audio-pipewire --pw-target alsa_input.usb-..
 scripts/smoke-loopback.sh
 ```
 
-Telnet clients see the negotiation immediately; bytes flow once the log
-on stderr says `CONNECT`. `NO CARRIER` or a failed handshake ends the
+With `--audio-pipewire` the default PipeWire source and sink are used;
+if the default source is a monitor (no capture device) pw-cat reports
+"no target node available", so name the node with `--pw-target` (find it
+with `pw-cli ls Node`). Telnet clients see the negotiation immediately;
+bytes flow once the log on stderr says `CONNECT`. `NO CARRIER` or a failed handshake ends the
 process.
 
 ## Test fixtures
