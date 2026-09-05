@@ -20,6 +20,8 @@ import Modec.DSP
 import Modec.Metrics
 import Modec.Modem
 import Modec.Telnet
+import Modec.Async
+import Modec.V22
 import Modec.Stream
 import Modec.FSK
 import Modec.Standards
@@ -307,7 +309,45 @@ telnetTests = testGroup "telnet codec"
       assertEqual "encoded" (B.pack [1, 255, 255, 2]) (telnetEncode (B.pack [1, 255, 2]))
   ]
 
+-- | V.22 data pump: bits through the channel, ignoring the start-up
+-- bits before the descrambler has synchronised.
+v22Tests :: TestTree
+v22Tests = testGroup "V.22 data pump" $
+  [ testCase (show ch ++ ": " ++ name) $ do
+      let sig = f (v22Modulate 8000 ch 0.5 bits)
+          got = v22Demodulate 8000 ch sig
+          errs = minimum [ length (filter id (zipWith (/=) (drop 40 bits) (drop (40 + o) got))) | o <- [0 .. 200] ]
+      assertEqual "bit errors after sync" 0 errs
+  | ch <- [LowChannel, HighChannel]
+  , (name, f) <- [ ("clean", id)
+                 , ("telephone band, SNR 12 dB", applyChannel 8000 (telephoneChannel 12))
+                 , ("frequency offset +7 Hz", applyChannel 8000 idealChannel { chFreqOffsetHz = 7 })
+                 , ("frequency offset -7 Hz", applyChannel 8000 idealChannel { chFreqOffsetHz = -7 })
+                 , ("clock offset +0.5 %", applyChannel 8000 idealChannel { chRateOffset = 0.005 })
+                 , ("clock offset -0.5 %", applyChannel 8000 idealChannel { chRateOffset = -0.005 })
+                 , ("sine jitter 3 samples at 2 Hz", applyChannel 8000 idealChannel { chJitter = SineJitter 3 2 })
+                 , ("echo 5 ms -12 dB", applyChannel 8000 idealChannel { chEcho = Just (0.005, fromDb (-12)) }) ]
+  ] ++
+  [ testCase "async bytes over V.22 with start/stop framing" $ do
+      let payload = map (fromIntegral . fromEnum) "V.22 at 1200 bit/s: the quick brown fox\r\n" ++ [0, 255, 128]
+          framed = replicate 40 True ++ frameBits framing8N1 payload ++ replicate 40 True
+          got = v22Demodulate 8000 HighChannel (applyChannel 8000 (telephoneChannel 20) (v22Modulate 8000 HighChannel 0.5 framed))
+          -- start-up bits (filter delays, descrambler sync) may yield a stray character first
+          (_, bytes) = asyncRxBits (asyncRxInit framing8N1) got
+      assertBool ("payload is a suffix of " ++ show bytes) (payload `isSuffixOf` bytes)
+  , testCase "unscrambled ones and S1 are recognised" $ do
+      let (_, u11) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxU11 [] 4000 v22TxInit
+          (_, s1) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxS1 [] 4000 v22TxInit
+          (_, ones) = v22TxBlock 8000 HighChannel framing8N1 0.5 False TxScrambledOnes [] 4000 v22TxInit
+          lastOut sig = last (v22RxRun 8000 (v22RxInit 8000) HighChannel sig)
+      assertBool "U11 run" (roU11Run (lastOut u11) > 100)
+      assertBool "S1 run" (roS1Run (lastOut s1) > 100)
+      assertBool "scrambled ones run" (roOnesRun (lastOut ones) > 200)
+  ]
+  where
+    bits = [ odd ((i * 7919 + 13) `div` 3 + i `div` 7) | i <- [1 .. 3000 :: Int] ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests])

@@ -34,14 +34,24 @@ real modem to a sound card.
   server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
   escaped) or stdio. Automode on both ends. `scripts/smoke-loopback.sh`
   cross-connects two instances through FIFOs and pushes text both ways.
+- V.22 data pump (`Modec.V22`): 1200 bit/s, 600 Bd differential 4-PSK on
+  1200/2400 Hz, RRC 75 % shaping, 1 + x^-14 + x^-17 scrambler, Gardner
+  timing recovery, handshake signal detectors (unscrambled ones, S1,
+  scrambled ones). Error free through the channel simulator down to 8 dB
+  SNR, ±7 Hz carrier offset, ±1 % clock offset and jitter. Validated
+  against spandsp's V.22bis test program at 1200 bit/s: its handshake
+  signals are recognised in order and its BERT data decodes with zero
+  PRBS-11 recurrence failures. Not yet wired into the handshake and the
+  live modem.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
 channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
 the characters they hit. Clock offsets beyond ±3 % fail.
 
-Not yet: V.22 / V.22bis, V.8bis, SIP/RTP, Hayes AT command layer, native
-PipeWire node (pw-cat child processes are used instead).
+Not yet: V.22 call establishment and data mode in the live modem, V.22bis
+(16-QAM, needs carrier recovery and an equaliser), V.8bis, SIP/RTP, Hayes AT
+command layer, native PipeWire node (pw-cat child processes are used instead).
 
 ## Usage
 

@@ -22,6 +22,8 @@ library
                       Modec.Handshake
                       Modec.Modem
                       Modec.Telnet
+                      Modec.Async
+                      Modec.V22
     build-depends:    base ^>=4.18,
                       bytestring,
                       vector

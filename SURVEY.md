@@ -127,7 +127,9 @@ Keep the DSP core free of IO so the same code runs against WAV fixtures in the t
 
 Suggested order: tone detector and Bell 103 answer-channel decoder against minimodem output → Bell 103 modulator and full-duplex loop → telnet bridge → V.22 (4-DPSK, no amplitude bits) against spandsp test output → V.22bis 16-QAM and S1 handling → V.8bis capabilities exchange on top of the V.21 channel code.
 
-Progress (2026-09-05): FSK modem, channel simulator, tone detection and the Bell 103 / V.21 handshakes are done (see README). Next: V.22 data pump, then PipeWire and telnet I/O.
+Progress (2026-09-05): FSK modem, channel simulator, tone detection, Bell 103 / V.21 handshakes, live modem with PipeWire/telnet I/O, and the V.22 data pump (validated against spandsp) are done (see README). Next: V.22 handshake in the modem, then V.22bis.
+
+spandsp oracle recipe: clone github.com/freeswitch/spandsp, `autoreconf -fi && ./configure && make`, then `make -C spandsp-sim LIBS=-lfftw3` and `make -C tests v22bis_tests LIBS="-lfftw3 -lsndfile"`; run `tests/v22bis_tests -l -b 1200` (it runs until killed; kill it after a minute) and split `tests/v22bis.wav` with `sox --ignore-length v22bis.wav -c 1 out.wav remix 1 trim 0 40` (channel 1 = calling modem, low channel; remix 2 = answering modem). Its data source is the ITU O.152 2047-bit PRBS (x^11 + x^9 + 1).
 
 ## 7. Documents to fetch
 
