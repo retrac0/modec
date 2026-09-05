@@ -1,0 +1,50 @@
+cabal-version:      3.0
+name:               modec
+version:            0.1.0.0
+synopsis:           Software audio modem (Bell 103, V.21, V.22, V.22bis) in Haskell
+license:            NONE
+build-type:         Simple
+extra-doc-files:    SURVEY.md
+
+common warnings
+    ghc-options: -Wall -O2
+
+library
+    import:           warnings
+    exposed-modules:  Modec.DSP
+                      Modec.Wav
+                      Modec.FSK
+                      Modec.Standards
+    build-depends:    base ^>=4.18,
+                      bytestring,
+                      vector
+    hs-source-dirs:   src
+    default-language: Haskell2010
+
+executable modec
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:    base ^>=4.18,
+                      modec,
+                      bytestring,
+                      vector,
+                      optparse-applicative
+    hs-source-dirs:   app
+    default-language: Haskell2010
+
+test-suite modec-test
+    import:           warnings
+    default-language: Haskell2010
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:    base ^>=4.18,
+                      modec,
+                      bytestring,
+                      vector,
+                      directory,
+                      filepath,
+                      tasty,
+                      tasty-hunit,
+                      tasty-quickcheck,
+                      QuickCheck
