@@ -27,10 +27,12 @@ import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 
-import Modec.DSP (Signal)
+import Modec.DSP (Signal, rms)
 import Modec.Handshake
+import Modec.Dtmf
+import Modec.Hayes
 import Modec.Modem
-import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
+import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 
 data AudioIO
@@ -51,6 +53,7 @@ data ModemOpts = ModemOpts
   , moNoHandshake :: Bool
   , moMax1200  :: Bool
   , moNoV8bis  :: Bool
+  , moHayes    :: Bool
   , moAudio    :: AudioIO
   , moData     :: DataIO
   , moAmp      :: Double
@@ -72,40 +75,141 @@ runModem o = do
     exitFailure
   withAudio (moAudio o) (moRate o) (moRole o) $ \ain aout ->
     withData (moData o) $ \recvBytes sendBytes -> do
-      stRef <- newIORef (modemInit cfg)
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
       blockRef <- newIORef (0 :: Int)
       -- output leads input by one block: two modems joined by pipes would
       -- otherwise each wait for the other's first block
       B.hPut aout (encodeS16 (VS.replicate blockN 0))
       hFlush aout
-      let loop = do
-            raw <- B.hGet ain (2 * blockN)
-            if B.length raw < 2 * blockN
-              then logMsg "audio input ended"
-              else do
-                pending <- recvBytes
-                st <- readIORef stRef
-                let (st', audio, rxBytes, events) = modemStep cfg st (decodeS16 raw) (B.unpack pending)
-                writeIORef stRef st'
-                when trace $ do
-                  k <- readIORef blockRef
-                  writeIORef blockRef (k + 1)
-                  when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
-                    logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
-                B.hPut aout (encodeS16 audio)
-                hFlush aout
-                unless (null rxBytes) $ sendBytes (B.pack rxBytes)
-                forM_ events $ \ev -> case ev of
-                  EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
-                  EvDropped -> logMsg "NO CARRIER"
-                  EvFailed why -> logMsg ("connection failed: " ++ why)
-                let finished = any isFinal events
-                unless finished loop
-          isFinal EvDropped = True
-          isFinal (EvFailed _) = True
-          isFinal _ = False
-      loop
+      let cfgFor role = let c0 = defaultModemConfig fs role (moStandard o)
+                        in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
+                              , mcHandshake = (mcHandshake c0) { hcAllow2400 = not (moMax1200 o), hcV8bis = not (moNoV8bis o) } }
+          traceStep st st' = when trace $ do
+            k <- readIORef blockRef
+            writeIORef blockRef (k + 1)
+            when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
+              logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
+          report ev = case ev of
+            EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
+            EvDropped -> logMsg "NO CARRIER"
+            EvFailed why -> logMsg ("connection failed: " ++ why)
+      if not (moHayes o)
+        then do
+          -- plain mode: one call in the configured role, then exit
+          stRef <- newIORef (modemInit cfg)
+          let loop = do
+                raw <- B.hGet ain (2 * blockN)
+                if B.length raw < 2 * blockN
+                  then logMsg "audio input ended"
+                  else do
+                    pending <- recvBytes
+                    st <- readIORef stRef
+                    let (st', audio, rxBytes, events) = modemStep cfg st (decodeS16 raw) (B.unpack pending)
+                    writeIORef stRef st'
+                    traceStep st st'
+                    unless trace $ modifyIORef' blockRef (+ 1)
+                    B.hPut aout (encodeS16 audio)
+                    hFlush aout
+                    unless (null rxBytes) $ sendBytes (B.pack rxBytes)
+                    mapM_ report events
+                    unless (any isFinal events) loop
+          loop
+        else do
+          -- Hayes mode: an AT command interpreter controls calls on the line
+          hayesRef <- newIORef hayesInit
+          lineRef <- newIORef LineIdle
+          energyRef <- newIORef (0 :: Int)
+          logMsg "Hayes command mode (ATD to dial, ATA to answer, ATH to hang up)"
+          let tNow = do
+                k <- readIORef blockRef
+                return (fromIntegral (k * blockN) / fs :: Double)
+              rateOf link = case link of
+                FskLink {} -> 300
+                V22Link _ _ R1200 -> 1200
+                V22Link _ _ R2400 -> 2400 :: Int
+              modemEvent ev = do
+                hs <- readIORef hayesRef
+                let (hs', out) = hayesEvent hs ev
+                writeIORef hayesRef hs'
+                unless (B.null out) $ sendBytes out
+              loop = do
+                raw <- B.hGet ain (2 * blockN)
+                if B.length raw < 2 * blockN
+                  then logMsg "audio input ended"
+                  else do
+                    t <- tNow
+                    modifyIORef' blockRef (+ 0)
+                    pending <- recvBytes
+                    hs0 <- readIORef hayesRef
+                    let (hs1, back, fwd, acts) = hayesInput t hs0 pending
+                        (hs2, tickOut) = hayesTick t hs1
+                    writeIORef hayesRef hs2
+                    unless (B.null back) $ sendBytes back
+                    unless (B.null tickOut) $ sendBytes tickOut
+                    forM_ acts $ \a -> do
+                      line <- readIORef lineRef
+                      case a of
+                        ActDial s -> do
+                          logMsg ("dialling " ++ s)
+                          writeIORef lineRef (LineDialing (dtmfDialSignal fs (0.5 * moAmp o) (map toUpperC s)))
+                        ActAnswer -> do
+                          logMsg "answering"
+                          writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
+                        ActHangup -> case line of
+                          LineIdle -> return ()
+                          _ -> logMsg "on hook" >> writeIORef lineRef LineIdle
+                        ActOnline -> return ()
+                    line <- readIORef lineRef
+                    let rxBlock = decodeS16 raw
+                        online = hayesOnline hs2
+                    case line of
+                      LineIdle -> do
+                        -- a calling signal (any sustained energy) while idle rings the DTE
+                        let loud = rms rxBlock > 0.01
+                        n <- readIORef energyRef
+                        let n' = if loud then n + 1 else 0
+                        writeIORef energyRef n'
+                        when (n' == 25) $ do
+                          modemEvent EvRing
+                          hs <- readIORef hayesRef
+                          when (hayesAutoAnswer hs) $ do
+                            logMsg "auto-answer"
+                            writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
+                        when (n' > 25) $ writeIORef energyRef 0
+                        B.hPut aout (encodeS16 (VS.replicate blockN 0))
+                      LineDialing sig -> do
+                        let (now, rest) = VS.splitAt blockN sig
+                            block = now VS.++ VS.replicate (blockN - VS.length now) 0
+                        B.hPut aout (encodeS16 block)
+                        writeIORef lineRef (if VS.null rest then LineCall (modemInit (cfgFor Originate)) (cfgFor Originate) else LineDialing rest)
+                      LineCall st c -> do
+                        let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack fwd else [])
+                        traceStep st st'
+                        B.hPut aout (encodeS16 audio)
+                        when (online && not (null rxBytes)) $ sendBytes (B.pack rxBytes)
+                        writeIORef lineRef (LineCall st' c)
+                        forM_ events $ \ev -> do
+                          report ev
+                          case ev of
+                            EvConnected _ link -> modemEvent (EvConnect (rateOf link))
+                            EvDropped -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
+                            EvFailed _ -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
+                    hFlush aout
+                    modifyIORef' blockRef (+ 1)
+                    loop
+          loop
+  where
+    isFinal EvDropped = True
+    isFinal (EvFailed _) = True
+    isFinal _ = False
+    toUpperC ch = if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch
+
+-- | The line in Hayes mode: idle, dialling (DTMF audio left to play), or
+-- a call in progress with its modem state and configuration.
+data Line
+  = LineIdle
+  | LineDialing Signal
+  | LineCall ModemState ModemConfig
 
 v22Info :: ModemState -> String
 v22Info st = case modemV22Rx st of

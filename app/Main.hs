@@ -60,6 +60,7 @@ cmdP = hsubparser
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "max-1200" <> help "V.22 only: do not negotiate 2400 bit/s")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
+      <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
       <*> audioP
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))

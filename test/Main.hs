@@ -4,7 +4,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Control.Monad (forM_)
-import Data.List (isSuffixOf, sort)
+import Data.List (isInfixOf, isSuffixOf, sort)
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 import System.Directory (listDirectory)
@@ -25,6 +25,8 @@ import Modec.Async
 import Modec.V22
 import Modec.Hdlc
 import Modec.V8bis
+import Modec.Hayes
+import Modec.Dtmf
 import Data.Bits (testBit, xor)
 import Modec.Stream
 import Modec.FSK
@@ -450,7 +452,52 @@ hdlcTests = testGroup "HDLC and V.8bis messages"
   where
     bitsToWord bs = sum [ if b then 2 ^ i else 0 | (i, b) <- zip [0 .. 7 :: Int] bs ] :: Int
 
+hayesTests :: TestTree
+hayesTests = testGroup "Hayes AT interpreter"
+  [ testCase "AT, ATE0, ATI, S0" $ do
+      let (s1, b1, _, a1) = hayesInput 0 hayesInit (BC.pack "AT\r")
+      assertEqual "OK" "AT\r\r\nOK\r\n" (BC.unpack b1)
+      assertEqual "no actions" [] a1
+      let (s2, b2, _, _) = hayesInput 0.1 s1 (BC.pack "ATE0\r")
+      assertBool "OK" ("OK" `isInfixOf` BC.unpack b2)
+      let (s3, b3, _, _) = hayesInput 0.2 s2 (BC.pack "ATS0=2\r")
+      assertBool "OK" ("OK" `isInfixOf` BC.unpack b3)
+      assertBool "auto-answer set" (hayesAutoAnswer s3)
+      let (_, b4, _, _) = hayesInput 0.3 s3 (BC.pack "ATS0?\r")
+      assertBool "002" ("002" `isInfixOf` BC.unpack b4)
+      let (_, b5, _, _) = hayesInput 0.4 s3 (BC.pack "ATY\r")
+      assertBool "ERROR" ("ERROR" `isInfixOf` BC.unpack b5)
+  , testCase "ATDT dials, CONNECT goes online, data passes, +++ escapes, ATH hangs up" $ do
+      let (s1, _, _, a1) = hayesInput 0 hayesInit (BC.pack "atdt 555-1234\r")
+      assertEqual "dial" [ActDial "T555-1234"] a1
+      let (s2, b2) = hayesEvent s1 (EvConnect 2400)
+      assertBool "CONNECT 2400" ("CONNECT 2400" `isInfixOf` BC.unpack b2)
+      assertBool "online" (hayesOnline s2)
+      let (s3, _, fwd3, _) = hayesInput 1 s2 (BC.pack "hello")
+      assertEqual "data forwarded" "hello" (BC.unpack fwd3)
+      -- escape needs a second of silence before and after
+      let (s4, _, fwd4, _) = hayesInput 2.5 s3 (BC.pack "+++")
+      assertEqual "pluses withheld" "" (BC.unpack fwd4)
+      let (s5, b5) = hayesTick 3.6 s4
+      assertBool "OK after escape" ("OK" `isInfixOf` BC.unpack b5)
+      assertBool "command mode" (not (hayesOnline s5))
+      let (s6, _, _, a6) = hayesInput 4 s5 (BC.pack "ATO\r")
+      assertEqual "online again" [ActOnline] a6
+      assertBool "online" (hayesOnline s6)
+      let (s7, _, fwd7, _) = hayesInput 5 s6 (BC.pack "+x")
+      assertEqual "lone plus is data" "+x" (BC.unpack fwd7)
+      let (s8, _, _, _) = hayesInput 7 s7 (BC.pack "+++")
+          (s9, _) = hayesTick 8.1 s8
+          (_, b10, _, a10) = hayesInput 8.2 s9 (BC.pack "ATH\r")
+      assertEqual "hangup" [ActHangup] a10
+      assertBool "OK" ("OK" `isInfixOf` BC.unpack b10)
+  , testCase "DTMF pairs and dial signal length" $ do
+      assertEqual "5" (Just (770, 1336)) (dtmfPair '5')
+      assertEqual "#" (Just (941, 1477)) (dtmfPair '#')
+      assertEqual "length" (round (8000 * (3 * 0.16 + 1)) :: Int) (VS.length (dtmfDialSignal 8000 0.3 "1,23"))
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests])

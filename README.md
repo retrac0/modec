@@ -62,6 +62,12 @@ real modem to a sound card.
   the roles reversed as §9.9.3 requires (the MS receiver becomes the
   answering modem). Peers without V.8bis get the classic start-up after
   3 s. `--no-v8bis` skips it.
+- Hayes AT command mode (`Modec.Hayes`, `--hayes`): ATD (digits dialled as
+  DTMF, then originate), ATA, ATH, ATO, ATZ, AT&F, ATE/V/Q, ATI, ATS0
+  (auto-answer on a sustained calling signal), "+++" with guard times;
+  result codes OK, CONNECT 300/1200/2400, RING, NO CARRIER, ERROR.
+  `scripts/smoke-hayes.sh` drives two instances through a full
+  dial/answer/data/escape/hang-up cycle over telnet.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
@@ -72,7 +78,8 @@ Known 2400 bit/s limits: re-acquisition after jitter-buffer slips is slow
 (each slip costs tens of bytes) and heavy sinusoidal jitter breaks the
 coherent path.
 
-Not yet: SIP/RTP, Hayes AT command layer, native PipeWire node (pw-cat
+Not yet: SIP/RTP, ring detection (a sound card carries no ringing; ATS0
+answers on sustained line energy instead), native PipeWire node (pw-cat
 child processes are used instead), V.22bis guard tone by default, V.8bis
 MR/ESi-initiated transactions and the V.8 start-up variants.
 
@@ -96,6 +103,9 @@ cabal run modec -- modem --originate --audio-pipewire --connect bbs.example.org 
 cabal run modec -- modem --answer --audio-pipewire --pw-target alsa_input.usb-... --standard bell103 --no-handshake --listen 2323
 # loop two instances through FIFOs with no sound card
 scripts/smoke-loopback.sh
+# Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
+cabal run modec -- modem --hayes --audio-pipewire --listen 2323
+scripts/smoke-hayes.sh
 ```
 
 With `--audio-pipewire` the default PipeWire source and sink are used;
