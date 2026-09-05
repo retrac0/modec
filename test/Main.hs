@@ -13,7 +13,12 @@ import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (testProperty)
 
+import Modec.Channel
+import Modec.Detect
+import Modec.Handshake
 import Modec.DSP
+import Modec.Metrics
+import Modec.Stream
 import Modec.FSK
 import Modec.Standards
 import Modec.Wav
@@ -68,20 +73,6 @@ propertyTests = testGroup "self round trips"
   , testProperty "bell103 answer 8 kHz noisy" $ \(Payload bs) (Positive seed) -> roundTrip 8000 bell103Answer 0.2 seed bs
   ]
 
--- | Levenshtein distance over byte strings, O(n*m) with two unboxed rows.
-editDistance :: [Word8] -> [Word8] -> Int
-editDistance as bs = VS.last (foldl step row0 as)
-  where
-    n = length bs
-    bv = VS.fromList bs
-    row0 = VS.generate (n + 1) fromIntegral :: VS.Vector Int
-    step prev a = VS.constructN (n + 1) $ \cur ->
-      let j = VS.length cur
-      in if j == 0 then VS.head prev + 1
-         else minimum [ VS.unsafeIndex prev j + 1
-                      , VS.unsafeIndex cur (j - 1) + 1
-                      , VS.unsafeIndex prev (j - 1) + (if VS.unsafeIndex bv (j - 1) == a then 0 else 1) ]
-
 -- | At Eb/N0 of about 11 dB (sigma 0.35 against amplitude 0.5 at 8 kHz) theory
 -- gives a BER near 5e-4 for orthogonal non-coherent FSK.  Bell 103 tones are
 -- only 200 Hz apart at 300 baud (not orthogonal), and measured BER of the
@@ -113,7 +104,155 @@ wavTests = testGroup "wav"
           assertBool "values" (VS.all (< 1e-4) (VS.zipWith (\a b -> abs (a - b)) x (wavSamples w)))
   ]
 
+-- | The streaming receiver must give the same bytes however the input is chunked.
+chunkTests :: TestTree
+chunkTests = testGroup "chunk invariance"
+  [ testCase ("bell103_ans_8k_noisy.wav in chunks of " ++ show c) $ do
+      w <- readWav (fixtureDir </> "bell103_ans_8k_noisy.wav")
+      let fs = fromIntegral (wavRate w)
+          x = wavSamples w
+          whole = demodulate fs bell103Answer framing8N1 defaultDemodParams x
+          chunks = [ VS.slice i (min c (VS.length x - i)) x | i <- [0, c .. VS.length x - 1] ] ++ [flushSilence fs bell103Answer]
+          streamed = concatStage (fskReceiver fs bell103Answer framing8N1 defaultDemodParams) chunks
+      assertEqual "bytes" whole streamed
+  | c <- [7, 160, 1000, 4096] ]
+
+-- | Conditions the Bell 103 receiver must survive without a single error.
+channelTests :: TestTree
+channelTests = testGroup "channel impairments (must be error free)"
+  [ cond "telephone band, SNR 20 dB" base { chSnrDb = Just 20 } id
+  , cond "rate offset +2 %" base { chRateOffset = 0.02 } id
+  , cond "rate offset -2 %" base { chRateOffset = -0.02 } id
+  , cond "frequency offset +7 Hz" base { chFreqOffsetHz = 7 } id
+  , cond "frequency offset -7 Hz" base { chFreqOffsetHz = -7 } id
+  , cond "sine jitter 3 samples at 2 Hz" base { chJitter = SineJitter 3 2 } id
+  , cond "adjacent channel +20 dB" base (mixAt 20 adjacent)
+  , cond "level -40 dBFS" base { chGain = fromDb (-40) / 0.5 } id
+  , cond "hum 60 Hz" base { chHum = Just (60, 0.3) } id
+  , cond "realistic acoustic coupling" base { chSnrDb = Just 25, chRateOffset = 0.005, chFreqOffsetHz = 3, chJitter = SineJitter 2 1 } (mixAt 20 adjacent)
+  ]
+  where
+    fs = 8000
+    base = idealChannel { chBandpass = Just (300, 3400) }
+    payload = [ fromIntegral ((i * 7919 + 13) `mod` 256) | i <- [1 .. 300 :: Int] ]
+    clean = encodeBytes fs bell103Answer framing8N1 0.5 0.2 0.2 payload
+    adjacent = encodeBytes fs bell103Originate framing8N1 0.5 0.05 0.2 [ fromIntegral (i * 31) | i <- [1 .. 300 :: Int] ]
+    cond name ch pre = testCase name $ do
+      let got = demodulate fs bell103Answer framing8N1 defaultDemodParams (applyChannel fs ch (pre clean))
+      assertEqual "decoded bytes" payload got
+
+-- | Duplex call simulation: two handshake state machines connected by
+-- attenuated, noisy audio in 20 ms blocks.
+data Side = Side { sdPhase :: Double, sdBank :: Stage Signal [ToneFrame], sdHs :: HsState, sdTrace :: [(Double, TxCmd)], sdStatus :: HsStatus, sdTx :: TxCmd }
+
+simulateCall :: HsConfig -> HsConfig -> Double -> Double -> (Side, Side)
+simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
+  where
+    fs = 8000
+    blk = 160 :: Int
+    side cfg = Side 0 (toneBank fs (hcBank cfg)) (initialHandshake cfg) [] HsBusy TxSilence
+    go t o a
+      | t >= maxT = (o, a)
+      | connected (sdStatus o) && connected (sdStatus a) && t > stopAfter = (o, a)
+      | otherwise =
+          let (audioO, o1) = gen o
+              (audioA, a1) = gen a
+              o2 = recv cfgO t o1 (impair 1 t audioA)
+              a2 = recv cfgA t a1 (impair 2 t audioO)
+          in go (t + fromIntegral blk / fs) o2 a2
+      where stopAfter = maybe maxT (+ 1) (connectTime a)
+    connected (HsConnected {}) = True
+    connected _ = False
+    connectTime s = case [ tm | (tm, TxData _) <- sdTrace s ] of
+      [] -> Nothing
+      ts -> Just (minimum ts)
+    -- 20 dB loss and additive noise, deterministic per block
+    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 / fromDb snr * 10) (VS.map (* 0.1) x)
+    gen s =
+      let f = case sdTx s of
+            TxSilence -> 0
+            TxTone x -> x
+            TxMark sp -> fskMark sp
+            TxData sp -> fskMark sp
+          w = 2 * pi * f / fs
+          sig = VS.generate blk (\i -> if f == 0 then 0 else 0.5 * sin (sdPhase s + w * fromIntegral i))
+          ph = sdPhase s + w * fromIntegral blk
+      in (sig, s { sdPhase = ph - 2 * pi * fromIntegral (floor (ph / (2 * pi)) :: Int) })
+    recv cfg t s audio =
+      case sdBank s of
+       Stage bst bstep ->
+        let (bst', frames) = bstep bst audio
+            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr in (h', acc ++ [o])) (sdHs s, []) frames
+            s' = s { sdBank = Stage bst' bstep, sdHs = hs' }
+        in case outs of
+             [] -> s'
+             _ -> let (tx, st) = last outs
+                  in s' { sdTx = tx, sdStatus = if st == HsBusy then sdStatus s else st, sdTrace = sdTrace s ++ [ (t, tx) | tx /= sdTx s ] }
+
+-- | Duration of the first run of a given transmit command in a trace.
+runLength :: (TxCmd -> Bool) -> [(Double, TxCmd)] -> Maybe Double
+runLength p tr = case dropWhile (not . p . snd) tr of
+  ((t0, _) : rest) -> case dropWhile (p . snd) rest of
+    ((t1, _) : _) -> Just (t1 - t0)
+    [] -> Nothing
+  [] -> Nothing
+
+handshakeTests :: TestTree
+handshakeTests = testGroup "handshake simulation"
+  [ call "auto / auto -> V.21" Nothing Nothing V21
+  , call "originate V.21 / answer auto" (Just V21) Nothing V21
+  , call "originate Bell 103 / answer auto" (Just Bell103) Nothing Bell103
+  , call "originate auto / answer Bell 103" Nothing (Just Bell103) Bell103
+  , call "originate auto / answer V.21" Nothing (Just V21) V21
+  , call "Bell 103 / Bell 103" (Just Bell103) (Just Bell103) Bell103
+  , testCase "answerer respects V.25 timing" $ do
+      let (_, a) = simulateCall (defaultHsConfig Originate) (defaultHsConfig Answer) 30 20
+          tr = sdTrace a
+          ansStart = case [ t | (t, TxTone 2100) <- tr ] of { (t : _) -> t; [] -> -1 }
+          ansLen = runLength (== TxTone 2100) tr
+          gapLen = runLength (== TxSilence) (dropWhile ((/= TxTone 2100) . snd) tr)
+      assertBool ("billing delay " ++ show ansStart) (ansStart >= 1.8 && ansStart <= 2.5)
+      assertBool ("ANS duration " ++ show ansLen) (maybe False (\d -> d >= 2.6 && d <= 4.0) ansLen)
+      assertBool ("gap " ++ show gapLen) (maybe False (\d -> d >= 0.055 && d <= 0.095) gapLen)
+  , testCase "no answer -> caller fails after timeout" $ do
+      let cfg = (defaultHsConfig Originate) { hcTimeout = 5 }
+          (o, _) = simulateCall cfg (defaultHsConfig Answer) { hcBilling = 100 } 30 8
+      assertEqual "status" (HsFailed "timeout") (sdStatus o)
+  ]
+  where
+    call name so sa expect = testCase name $ do
+      let (o, a) = simulateCall (defaultHsConfig Originate) { hcStandard = so } (defaultHsConfig Answer) { hcStandard = sa } 30 20
+      assertEqual "originate" (HsConnected expect (txSpecOf Originate expect) (txSpecOf Answer expect)) (sdStatus o)
+      assertEqual "answer" (HsConnected expect (txSpecOf Answer expect) (txSpecOf Originate expect)) (sdStatus a)
+    txSpecOf Originate Bell103 = bell103Originate
+    txSpecOf Answer Bell103 = bell103Answer
+    txSpecOf Originate V21 = v21Channel1
+    txSpecOf Answer V21 = v21Channel2
+
+detectTests :: TestTree
+detectTests = testGroup "detection" $
+  [ testCase ("detectFsk " ++ fskName s) $ do
+      let sig = encodeBytes 8000 s framing8N1 0.3 0.1 0.1 [ fromIntegral (i * 37) | i <- [1 .. 60 :: Int] ]
+      case detectFsk 8000 (applyChannel 8000 (telephoneChannel 25) sig) of
+        ((best, score) : _) -> do
+          assertEqual "standard" (fskName s) (fskName best)
+          assertBool ("score " ++ show score) (score > 0.4)
+        [] -> assertFailure "no candidates"
+  | s <- fskStandards ] ++
+  [ testCase "toneRuns finds a 3 s answer tone" $ do
+      let fs = 8000
+          sig = VS.concat [ VS.replicate 8000 0
+                          , VS.generate 24000 (\i -> 0.3 * sin (2 * pi * 2100 * fromIntegral i / fs))
+                          , VS.replicate 600 0
+                          , encodeBytes fs v21Channel2 framing8N1 0.3 0.5 0.1 [65, 66, 67] ]
+          runs = toneRuns fs sig
+          ans = [ r | r@(ToneRun (Just 2100) _ _) <- runs ]
+      assertBool ("runs " ++ show (take 6 runs)) (case ans of
+        (ToneRun _ t0 t1 : _) -> t0 > 0.9 && t0 < 1.1 && (t1 - t0) > 2.9 && (t1 - t0) < 3.1
+        _ -> False)
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, propertyTests, errorRateTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests])

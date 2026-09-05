@@ -127,6 +127,8 @@ Keep the DSP core free of IO so the same code runs against WAV fixtures in the t
 
 Suggested order: tone detector and Bell 103 answer-channel decoder against minimodem output → Bell 103 modulator and full-duplex loop → telnet bridge → V.22 (4-DPSK, no amplitude bits) against spandsp test output → V.22bis 16-QAM and S1 handling → V.8bis capabilities exchange on top of the V.21 channel code.
 
+Progress (2026-09-05): FSK modem, channel simulator, tone detection and the Bell 103 / V.21 handshakes are done (see README). Next: V.22 data pump, then PipeWire and telnet I/O.
+
 ## 7. Documents to fetch
 
 All free from ITU-T: V.8, V.8bis (11/2000), V.21, V.22 (11/1988), V.22bis (11/1988), V.25 (answer tone), V.14 (async-to-sync for V.22 start/stop bit handling). Bell 103 and 212A have no public standard; use Wikipedia, spandsp's `preset_fsk_specs`, and the V.22 Annex on Bell 212A compatibility.

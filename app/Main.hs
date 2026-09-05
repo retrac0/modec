@@ -7,6 +7,7 @@ import Options.Applicative
 import System.IO
 import Text.Printf (printf)
 
+import Modec.Detect
 import Modec.DSP
 import Modec.FSK
 import Modec.Standards
@@ -19,6 +20,7 @@ data Cmd
   = Decode Std Channel Double FilePath
   | Encode Std Channel Int Double FilePath
   | Probe FilePath
+  | Detect FilePath
 
 channelP :: Parser Channel
 channelP =
@@ -34,6 +36,7 @@ cmdP = hsubparser
   (  command "decode" (info decodeP (progDesc "Demodulate a WAV file to bytes on stdout"))
   <> command "encode" (info encodeP (progDesc "Modulate stdin bytes to a WAV file"))
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
+  <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
   )
   where
     decodeP = Decode <$> stdP <*> channelP
@@ -44,6 +47,7 @@ cmdP = hsubparser
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "amplitude")
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
     probeP = Probe <$> argument str (metavar "FILE.wav")
+    detectP = Detect <$> argument str (metavar "FILE.wav")
 
 specFor :: Std -> Channel -> FskSpec
 specFor Bell103 Originate = bell103Originate
@@ -73,13 +77,22 @@ main = do
             _ -> specFor std ch
       when (ch == Auto) $ hPutStrLn stderr ("auto-selected " ++ fskName spec)
       hSetBinaryMode stdout True
-      B.hPut stdout (B.pack (demodulate fs spec framing8N1 (DemodParams squelch) x))
+      B.hPut stdout (B.pack (demodulate fs spec framing8N1 defaultDemodParams { dpSquelch = squelch } x))
     Encode std ch rate amp out -> do
       hSetBinaryMode stdin True
       bytes <- B.getContents
       let spec = specFor std (if ch == Auto then Originate else ch)
           fs = fromIntegral rate
       writeWav16Mono out rate (encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes))
+    Detect path -> do
+      w <- readWav path
+      let fs = fromIntegral (wavRate w)
+          x = wavSamples w
+      putStrLn "FSK channel scores (fraction of frames dominated by the channel's tones):"
+      forM_ (detectFsk fs x) $ \(s, sc) -> printf "  %-18s %.3f\n" (fskName s) sc
+      putStrLn "Tone runs longer than 100 ms:"
+      forM_ [ r | r <- toneRuns fs x, trEnd r - trStart r >= 0.1 ] $ \r ->
+        printf "  %7.3f - %7.3f s  %s\n" (trStart r) (trEnd r) (maybe "silence / no dominant tone" (\f -> printf "%.0f Hz" f) (trTone r) :: String)
     Probe path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)

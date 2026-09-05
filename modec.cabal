@@ -12,9 +12,14 @@ common warnings
 library
     import:           warnings
     exposed-modules:  Modec.DSP
+                      Modec.Stream
                       Modec.Wav
                       Modec.FSK
                       Modec.Standards
+                      Modec.Channel
+                      Modec.Metrics
+                      Modec.Detect
+                      Modec.Handshake
     build-depends:    base ^>=4.18,
                       bytestring,
                       vector
@@ -27,6 +32,16 @@ executable modec
     build-depends:    base ^>=4.18,
                       modec,
                       bytestring,
+                      vector,
+                      optparse-applicative
+    hs-source-dirs:   app
+    default-language: Haskell2010
+
+executable modec-bench
+    import:           warnings
+    main-is:          Bench.hs
+    build-depends:    base ^>=4.18,
+                      modec,
                       vector,
                       optparse-applicative
     hs-source-dirs:   app

@@ -11,10 +11,31 @@ real modem to a sound card.
 
 ## Status
 
-- Bell 103 and V.21 asynchronous FSK modulator and demodulator, offline
-  (whole-file), any sample rate. Cross-validated both ways against
-  minimodem 0.24.
+- Bell 103 and V.21 asynchronous FSK modulator and demodulator, both
+  channels, any sample rate, streaming (chunk-invariant) with an explicit
+  state machine per stage (`Modec.Stream`). Cross-validated both ways
+  against minimodem 0.24.
+- Receiver: band-pass prefilter, O(n) prefix-sum tone correlators,
+  adaptive slicer, UART-style framer with sub-sample start-edge location,
+  one timing correction per bit boundary and integrate-and-dump decisions.
+  Error free in the bench down to 6 dB SNR, ±3 % clock offset, ±30 Hz
+  carrier offset, jitter, slips and +20 dB adjacent channel.
+- Transmitter: continuous-phase FSK with transmit band limiting.
+- Channel simulator (`Modec.Channel`): telephone band-pass, AWGN by SNR,
+  clock offset, sinusoidal / random-walk / slip jitter, frequency offset,
+  dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
+- Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
+  dominant-tone runs, offline FSK standard/channel identification.
+- Call establishment (`Modec.Handshake`): V.25 answer sequence, Bell 103
+  and V.21 originate/answer state machines with automode on both ends,
+  verified by a duplex simulation in the test suite.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
+
+Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
+channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
+the characters they hit. Clock offsets beyond ±3 % fail.
+
+Not yet: V.22 / V.22bis, V.8bis, PipeWire and telnet I/O, Hayes layer.
 
 ## Usage
 
@@ -25,6 +46,8 @@ cabal run modec -- decode test/fixtures/bell103_ans_8k.wav       # auto channel
 cabal run modec -- decode --originate --v21 file.wav
 printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
 cabal run modec -- probe recording.wav                            # tone energies
+cabal run modec -- detect recording.wav                           # which standard, tone runs
+cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep
 ```
 
 ## Test fixtures
