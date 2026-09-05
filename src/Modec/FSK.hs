@@ -37,6 +37,8 @@ module Modec.FSK
   , frameBits
   , modulateBits
   , txFilter
+  , txFilterKernel
+  , filterTaps
   , encodeBytes
   ) where
 
@@ -316,14 +318,18 @@ modulateBits fs spec bitsL
           ph'' = if ph' >= twoPi then ph' - twoPi else ph'
       in Just (sin ph, (k + 1, ph''))
 
--- | Transmit band limiting: real modems filter their output so that
--- keying splatter does not land in the other direction's channel.
-txFilter :: Double -> FskSpec -> Signal -> Signal
-txFilter fs spec = firCentered (firBandpass fs (max 50 (lo - g)) (min (fs / 2 - 50) (hi + g)) (filterTaps fs))
+-- | Transmit band limiting kernel: real modems filter their output so
+-- that keying splatter does not land in the other direction's channel.
+txFilterKernel :: Double -> FskSpec -> VS.Vector Double
+txFilterKernel fs spec = firBandpass fs (max 50 (lo - g)) (min (fs / 2 - 50) (hi + g)) (filterTaps fs)
   where
     lo = min (fskMark spec) (fskSpace spec)
     hi = max (fskMark spec) (fskSpace spec)
     g = 300
+
+-- | Offline transmit band limiting, delay compensated.
+txFilter :: Double -> FskSpec -> Signal -> Signal
+txFilter fs spec = firCentered (txFilterKernel fs spec)
 
 -- | Frame and modulate bytes, with @pre@ and @post@ seconds of mark
 -- (idle) around the data, at amplitude @amp@, band limited.

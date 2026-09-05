@@ -5,12 +5,17 @@
 module Modec.Stream
   ( Stage (..)
   , runStage
+  , stepStage
   , (>>>)
   , mapStage
   , concatStage
   ) where
 
 data Stage i o = forall s. Stage !s !(s -> i -> (s, o))
+
+-- | Advance a stage by one chunk.
+stepStage :: Stage i o -> i -> (Stage i o, o)
+stepStage (Stage s f) x = let (s', o) = f s x in s' `seq` (Stage s' f, o)
 
 -- | Feed a list of chunks through a stage.
 runStage :: Stage i o -> [i] -> [o]

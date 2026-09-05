@@ -29,6 +29,7 @@ module Modec.DSP
   , firHilbert
   , fir
   , firCentered
+  , firStream
     -- * Interpolation and time warping
   , sampleAt
   , resampleBy
@@ -167,6 +168,21 @@ firHilbert taps0 = VS.zipWith (*) (blackman taps) (VS.generate taps h)
 -- | Causal FIR: @out[i] = sum_k h[k] x[i-k]@.
 fir :: VS.Vector Double -> Signal -> Signal
 fir h = windowDot (VS.reverse h)
+
+-- | Streaming FIR: @hrev@ is the reversed kernel, @hist@ the last
+-- (taps-1) input samples.  Returns the output for the chunk (delayed by
+-- the group delay) and the new history.
+firStream :: VS.Vector Double -> Signal -> Signal -> (Signal, Signal)
+firStream hrev hist chunk = (VS.generate n out, VS.drop n ext)
+  where
+    n = VS.length chunk
+    t = VS.length hrev
+    ext = hist VS.++ chunk
+    out i = go 0 0
+      where
+        go !k !acc
+          | k >= t = acc
+          | otherwise = go (k + 1) (acc + VS.unsafeIndex hrev k * VS.unsafeIndex ext (i + k))
 
 -- | FIR with the group delay of an odd-length symmetric kernel removed,
 -- so the output lines up sample-for-sample with the input.

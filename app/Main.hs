@@ -9,6 +9,8 @@ import Text.Printf (printf)
 
 import Modec.Detect
 import Modec.DSP
+import qualified Modec.Handshake as H
+import Modem
 import Modec.FSK
 import Modec.Standards
 import Modec.Wav
@@ -21,6 +23,7 @@ data Cmd
   | Encode Std Channel Int Double FilePath
   | Probe FilePath
   | Detect FilePath
+  | RunModem ModemOpts
 
 channelP :: Parser Channel
 channelP =
@@ -37,6 +40,7 @@ cmdP = hsubparser
   <> command "encode" (info encodeP (progDesc "Modulate stdin bytes to a WAV file"))
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
+  <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
   )
   where
     decodeP = Decode <$> stdP <*> channelP
@@ -48,6 +52,28 @@ cmdP = hsubparser
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
     probeP = Probe <$> argument str (metavar "FILE.wav")
     detectP = Detect <$> argument str (metavar "FILE.wav")
+    modemP = RunModem <$> (ModemOpts
+      <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
+      <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
+      <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
+      <*> option (maybeReader stdReader) (long "standard" <> value Nothing <> help "auto (default) | bell103 | v21")
+      <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
+      <*> audioP
+      <*> dataP
+      <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))
+    stdReader s = case s of
+      "auto" -> Just Nothing
+      "bell103" -> Just (Just H.Bell103)
+      "v21" -> Just (Just H.V21)
+      _ -> Nothing
+    audioP =
+          flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "NODE")))
+      <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")
+      <|> flag' AudioStdio (long "audio-stdio" <> help "raw s16le mono audio on stdin/stdout")
+    dataP =
+          DataListen <$> option auto (long "listen" <> metavar "PORT" <> help "telnet server")
+      <|> (DataConnect <$> strOption (long "connect" <> metavar "HOST") <*> option auto (long "port" <> metavar "PORT" <> value 23))
+      <|> flag' DataStdio (long "data-stdio" <> help "raw bytes on stdin/stdout")
 
 specFor :: Std -> Channel -> FskSpec
 specFor Bell103 Originate = bell103Originate
@@ -84,6 +110,7 @@ main = do
       let spec = specFor std (if ch == Auto then Originate else ch)
           fs = fromIntegral rate
       writeWav16Mono out rate (encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes))
+    RunModem mo -> runModem mo
     Detect path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)

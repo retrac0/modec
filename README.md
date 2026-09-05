@@ -29,13 +29,19 @@ real modem to a sound card.
 - Call establishment (`Modec.Handshake`): V.25 answer sequence, Bell 103
   and V.21 originate/answer state machines with automode on both ends,
   verified by a duplex simulation in the test suite.
+- Live modem (`Modec.Modem`, `modec modem`): audio in and out through
+  PipeWire (`pw-cat`) or raw 8 kHz s16le pipes, data through a telnet
+  server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
+  escaped) or stdio. Automode on both ends. `scripts/smoke-loopback.sh`
+  cross-connects two instances through FIFOs and pushes text both ways.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
 channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
 the characters they hit. Clock offsets beyond ±3 % fail.
 
-Not yet: V.22 / V.22bis, V.8bis, PipeWire and telnet I/O, Hayes layer.
+Not yet: V.22 / V.22bis, V.8bis, SIP/RTP, Hayes AT command layer, native
+PipeWire node (pw-cat child processes are used instead).
 
 ## Usage
 
@@ -48,7 +54,20 @@ printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
 cabal run modec -- probe recording.wav                            # tone energies
 cabal run modec -- detect recording.wav                           # which standard, tone runs
 cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep
+
+# live modem: answer calls arriving on the default PipeWire source, serve telnet on 2323
+cabal run modec -- modem --answer --audio-pipewire --listen 2323
+# call out: audio through PipeWire, bytes to a telnet host
+cabal run modec -- modem --originate --audio-pipewire --connect bbs.example.org --port 23
+# pick the PipeWire node explicitly, force Bell 103, skip the handshake
+cabal run modec -- modem --answer --audio-pipewire --pw-target alsa_input.usb-... --standard bell103 --no-handshake --listen 2323
+# loop two instances through FIFOs with no sound card
+scripts/smoke-loopback.sh
 ```
+
+Telnet clients see the negotiation immediately; bytes flow once the log
+on stderr says `CONNECT`. `NO CARRIER` or a failed handshake ends the
+process.
 
 ## Test fixtures
 

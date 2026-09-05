@@ -18,6 +18,8 @@ import Modec.Detect
 import Modec.Handshake
 import Modec.DSP
 import Modec.Metrics
+import Modec.Modem
+import Modec.Telnet
 import Modec.Stream
 import Modec.FSK
 import Modec.Standards
@@ -167,7 +169,8 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
       [] -> Nothing
       ts -> Just (minimum ts)
     -- 20 dB loss and additive noise, deterministic per block
-    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 / fromDb snr * 10) (VS.map (* 0.1) x)
+    -- 20 dB loss, then noise for the requested SNR relative to a 0.5 amplitude tone
+    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
     gen s =
       let f = case sdTx s of
             TxSilence -> 0
@@ -252,7 +255,59 @@ detectTests = testGroup "detection" $
         _ -> False)
   ]
 
+-- | Two complete modems talking through attenuated, noisy audio in
+-- 20 ms blocks; text is queued on both sides once connected.
+modemDuplex :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+modemDuplex cfgO cfgA snr textO textA maxT = go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False [] [] [] []
+  where
+    fs = mcRate cfgO
+    blk = 160 :: Int
+    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
+    go t so sa fromA fromO sentO sentA rxO rxA evO evA
+      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA)
+      | otherwise =
+          let queueO = if modemConnected so && not sentO then textO else []
+              queueA = if modemConnected sa && not sentA then textA else []
+              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t fromA) queueO
+              (sa', audioA, bytesA, eA) = modemStep cfgA sa (impair 2 t fromO) queueA
+          in go (t + fromIntegral blk / fs) so' sa' audioA audioO (sentO || not (null queueO)) (sentA || not (null queueA))
+                (reverse bytesO ++ rxO) (reverse bytesA ++ rxA) (reverse eO ++ evO) (reverse eA ++ evA)
+
+modemTests :: TestTree
+modemTests = testGroup "full modem duplex"
+  [ testCase "automode call, text both ways at 30 dB" $ do
+      let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate Nothing) (defaultModemConfig 8000 Answer Nothing) 30 textO textA 14
+      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V21 _ _ : _) -> True; _ -> False)
+      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V21 _ _ : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "Bell 103 fixed, no handshake, 20 dB" $ do
+      let cfg r = (defaultModemConfig 8000 r (Just Bell103)) { mcNoHandshake = True }
+          (rxO, rxA, _, _) = modemDuplex (cfg Originate) (cfg Answer) 20 textO textA 6
+      assertEqual "answer to originate" textA rxO
+      assertEqual "originate to answer" textO rxA
+  ]
+  where
+    textO = map (fromIntegral . fromEnum) "Hello from the caller, 0123456789 !\r\n"
+    textA = map (fromIntegral . fromEnum) "Answerer here; all bytes: \255\0\128 end\r\n"
+
+telnetTests :: TestTree
+telnetTests = testGroup "telnet codec"
+  [ testCase "negotiation and IAC escapes" $ do
+      let (st, _) = telnetHello telnetInit
+          input = B.pack ([104, 105, iac, doOpt, optBinary, iac, iac, iac, doOpt, 24, iac, will, optSga, iac, 250, 24, 1, iac, 240, 33])
+          (_, payload, reply) = telnetDecode st input
+      assertEqual "payload" (B.pack [104, 105, 255, 33]) payload
+      -- BINARY and SGA were already offered in the hello, so only the refusal of TERMINAL-TYPE (24) comes back
+      assertEqual "reply" (B.pack [iac, wont, 24]) reply
+  , testCase "fresh state answers DO/WILL for supported options" $ do
+      let (_, _, reply) = telnetDecode telnetInit (B.pack [iac, doOpt, optBinary, iac, will, optBinary])
+      assertEqual "reply" (B.pack [iac, will, optBinary, iac, doOpt, optBinary]) reply
+  , testCase "encode doubles 0xFF" $
+      assertEqual "encoded" (B.pack [1, 255, 255, 2]) (telnetEncode (B.pack [1, 255, 2]))
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests])
