@@ -646,8 +646,14 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
         | inPhase >= 5 -> enter OListen
       OV22Wait
         | inPhase >= 0.456 -> enter (if allow2400 && hsFamily st /= Bell212A then OV22S1 else OV22Ones)
+      -- 100 ms is what 6.3.1.2 asks for and 150 is what survives a
+      -- trunk: one lost 20 ms packet takes a fifth of the pattern, and
+      -- an answerer that misses it offers 1200 and never mentions 2400
+      -- again.  The answerer detects S1, it does not measure it, so the
+      -- extra is free -- and it comes out of the unscrambled ones that
+      -- follow, because the far end's timers do key off when those end.
       OV22S1
-        | inPhase >= 0.1 -> enter OV22U11
+        | inPhase >= 0.15 -> enter OV22U11
       -- 6.3.1.2: S1 is followed by unscrambled binary 1, and only then by
       -- scrambled ones.  Leaving it out shortens everything after it by
       -- 456 ms, and the far end -- which changes rate on its own clock,
@@ -655,7 +661,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       -- the call while its own transmission stays perfectly readable.
       OV22U11
         | s1Seen -> enter112 OV22Ones1200
-        | inPhase >= 0.456 -> enter OV22Ones
+        | inPhase >= 0.406 -> enter OV22Ones
       OV22Ones
         | s1Seen -> enter112 OV22Ones1200
         | scrambledOnesSeen -> enter OV22Settle
