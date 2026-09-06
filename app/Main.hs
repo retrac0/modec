@@ -148,6 +148,7 @@ cmdP = hsubparser
     -- from one that was typed; a call that negotiates MNP does not.
     dialMnpP =
           flag' Nothing (long "no-mnp" <> help "no error correction: hand over whatever arrives, errors and all")
+      <|> flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A), classes 2 to 4. On by default here; the flag is for saying so")
       <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "offer only up to class N: 2 start-stop framing, 3 synchronous framing, 4 adds adaptive frame sizing")
       <|> pure (Just 4)
     modesReader s = case s of
