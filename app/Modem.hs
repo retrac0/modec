@@ -387,7 +387,20 @@ runModem o = do
                         writeIORef lineRef LineIdle
                         endCall
                         when (moHangupExits o) (writeIORef doneRef True)
-                      SipToDte ev -> modemEvent ev
+                      SipToDte ev -> do
+                        modemEvent ev
+                        -- A dial that closes without ever being
+                        -- established never reached the far end at all,
+                        -- and that is worth telling apart from a far end
+                        -- that did not pick up: the modem heard nothing
+                        -- because there was no call, not because the line
+                        -- was quiet.
+                        when (ev == EvNoAnswer) $ do
+                          writeIORef outcomeRef "no SIP call: the trunk never answered"
+                          say "no SIP call: baresip got no answer to its INVITE"
+                          say "if numbers that used to answer all do this, restart baresip -- a long-lived one can stop getting call responses while its registration still succeeds"
+                          endCall
+                          when (moHangupExits o) (writeIORef doneRef True)
                     forM_ (if sip == Nothing then acts else []) $ \a -> do
                       line <- readIORef lineRef
                       case a of
