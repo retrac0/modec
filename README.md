@@ -14,10 +14,7 @@ with an annotated timeline.
 
 ## Status
 
-- Bell 103 and V.21 asynchronous FSK modulator and demodulator, both
-  channels, any sample rate, streaming (chunk-invariant) with an explicit
-  state machine per stage (`Modec.Stream`). Cross-validated both ways
-  against minimodem 0.24.
+- Bell 103 and V.21 asynchronous FSK modulator and demodulator,
 - Receiver: band-pass prefilter, O(n) prefix-sum tone correlators,
   adaptive slicer, UART-style framer with sub-sample start-edge location,
   one timing correction per bit boundary, integrate-and-dump decisions and
