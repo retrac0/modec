@@ -216,6 +216,8 @@ runModem o = do
             return bs
           writeBlock bs = do
             mapM_ (\w -> wavAppendRaw w bs) recTx
+            mc <- readIORef callRef
+            mapM_ (\c -> callRecWriteTx c bs) mc
             aiWrite ai bs
           closeRecordings = endCall >> mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
