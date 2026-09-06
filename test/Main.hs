@@ -617,6 +617,18 @@ v22Tests = testGroup "V.22 data pump" $
       assertBool "U11 run" (roU11Run (lastOut u11) > 100)
       assertBool "S1 run" (roS1Run (lastOut s1) > 100)
       assertBool "scrambled ones run" (roOnesRun (lastOut ones) > 200)
+  , testCase "unscrambled ones descramble to ones as well" $ do
+      -- Why the handshake cannot decide it is hearing scrambled binary 1
+      -- from a run of descrambled ones alone: a constant input to the
+      -- descrambler is a constant output, so unscrambled binary 1 raises
+      -- that run just as high.  What separates them is the carrier --
+      -- one phase step repeated against a whitened one -- which is what
+      -- the caller checks before it starts its settle timer and gives up
+      -- on 2400 bit/s.
+      let (_, u11) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxU11 [] 8000 v22TxInit
+          out = last (v22RxRun 8000 (v22RxInit 8000) HighChannel u11)
+      assertBool ("descrambled ones run " ++ show (roOnesRun out)) (roOnesRun out > 324)
+      assertBool ("constant-step run " ++ show (roU11Run out)) (roU11Run out > 12)
   ]
   where
     bits = [ odd ((i * 7919 + 13) `div` 3 + i `div` 7) | i <- [1 .. 3000 :: Int] ]

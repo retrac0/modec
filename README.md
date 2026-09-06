@@ -69,7 +69,7 @@ with an annotated timeline.
   program at both rates: handshake signals recognised in order, BERT data
   decodes with zero PRBS-11 recurrence failures.
 - V.22/V.22bis call establishment (§6.3, including the S1 exchange, the
-  600/450 ms rate switch and the 32-ones completion) in the handshake and
+  270 ms rate switch and the 32-ones completion) in the handshake and
   the live modem. Automode probes V.22 first, then V.21, then Bell 103,
   accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
   with a V.22-only peer. `--mode v22` disables 2400 on our side.

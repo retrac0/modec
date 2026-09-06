@@ -320,10 +320,14 @@ fskRx role s = case linkFor role s of
 
 -- 1200 bit/s: 155 ms of unscrambled ones = 93 symbols; 270 ms = 324 bits;
 -- S1 lasts 100 ms = 60 symbols, half of it is enough to recognise it
-u11Symbols, scrambledBits, s1Symbols :: Int
+u11Symbols, scrambledBits, s1Symbols, u11Guard :: Int
 u11Symbols = 93
 scrambledBits = 324
 s1Symbols = 30
+-- | A constant phase step held this long says the carrier is unmodulated
+-- -- the answerer's unscrambled ones -- whatever the descrambler makes
+-- of it.  Scrambled ones never hold one step for long.
+u11Guard = 12
 
 -- | Advance the state machine by one tone frame and the latest V.22
 -- receiver report (if a V.22 receiver is running).
@@ -463,8 +467,17 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     u11Seen = case v22 of
       Just r -> vrU11Run r >= u11Symbols && vrAngleErr r < 8
       Nothing -> False
+    -- Unscrambled binary 1 descrambles to ones as surely as scrambled
+    -- binary 1 does -- a constant input to the descrambler is a constant
+    -- output -- so a run of descrambled ones on its own does not say
+    -- which of the two the far end is sending.  The carrier does: the
+    -- answerer's unscrambled ones are one phase step repeated, while
+    -- scrambled ones are whitened.  Without this the calling modem
+    -- starts its 765 ms settle while the answerer is still in its
+    -- unscrambled ones, and has already declared 1200 bit/s by the time
+    -- the answerer's S1 arrives to agree on 2400.
     scrambledOnesSeen = case v22 of
-      Just r -> vrOnesRun r >= scrambledBits
+      Just r -> vrOnesRun r >= scrambledBits && vrU11Run r < u11Guard
       Nothing -> False
     scrambledAnySeen = case v22 of
       Just r -> vrOnesRun r >= scrambledBits || vrZerosRun r >= scrambledBits
@@ -639,11 +652,18 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       OV22Settle
         | s1Seen -> enter112 OV22Ones1200
         | inPhase >= 0.765 -> enter (Connected (hsFamily st) R1200)
+      -- 270 ms of scrambled ones at 1200 once the S1s have agreed 2400
+      -- (6.3.1.3), then both ends change rate.  Holding longer than the
+      -- far end does means arriving after its 200 ms of ones at the new
+      -- rate has already been and gone.
       OV22Ones1200
-        | since112 >= 0.6 -> enter OV22Ones2400
+        | since112 >= 0.27 -> enter OV22Ones2400
       OV22Ones2400
         | inPhase >= 0.2 && ones2400Seen -> enter (Connected V22bis R2400)
-        | inPhase >= 6 -> enter Done
+        -- the S1 exchange settled the rate; if the far end's ones at the
+        -- new rate were missed, joining its data is better than sitting
+        -- here until the call times out
+        | inPhase >= 0.9 -> enter (Connected V22bis R2400)
       Connected s _
         | not (remoteAlive s) -> enter Done
       _ -> st'

@@ -61,20 +61,43 @@ there is no doubt at all: the bytes were supposed to be a date and a
 time, and they were not. The bug is reproducible on demand, on a service
 that never changes, without needing anyone's BBS.
 
-Correction, 6 September 2026. "The framer arms before the far end has
-begun sending" does not survive the recording. Taking the call apart
-symbol by symbol -- modec's own receiver dumping its phase decisions,
-descrambled by hand -- ACTS is transmitting: entropy in the descrambled
-bit stream sits at 50 % from 13 to 15 s, and after that the line is idle
-mark with a short burst of data every second, which is exactly the shape
-of a time code sent once a second. The far end was talking and we did
-not understand it. Whatever is wrong is downstream of the symbol
-decisions, and it is not an arming problem, so the fix is not the one
-this section assumed.
+Found and fixed, 6 September 2026:
 
-Two things it is not. The V.22 receive path is sound in general: modec
-calls spandsp's V.22bis modem over a pair of FIFOs and text passes
-intact both ways at 1200 bit/s (SURVEY.md has the oracle recipe). And
+    61289 26-09-06 20:43:16 50 0 +.0 045.0 UTC(NIST) *
+    61289 26-09-06 20:43:17 50 0 +.0 045.0 UTC(NIST) *
+
+CONNECT 2400, and the documented format arriving once a second. The
+oracle did its job twice over -- first by proving there was a bug at
+all, then by proving it was gone.
+
+It was never a framing problem. ACTS answers as a V.22bis modem and
+wants 2400 bit/s, and the call above failed in the rate negotiation, in
+two places:
+
+  * The caller decided it was hearing scrambled binary 1 from a run of
+    descrambled ones. Unscrambled binary 1 gives the same run -- a
+    constant into the descrambler is a constant out -- so the caller
+    started its 765 ms settle while the answerer was still sending
+    unscrambled ones, and had declared 1200 bit/s a fifth of a second
+    before the answerer's S1 arrived to agree on 2400. Telling the two
+    apart needs the carrier, not the descrambler: unscrambled ones are
+    one phase step repeated, scrambled ones are whitened.
+
+  * Having agreed 2400, the caller then held 1200 for 600 ms before
+    changing rate. The answerer changes after 270 ms and sends its
+    200 ms of scrambled ones at the new rate, so by the time we arrived
+    the thing we were waiting for had been and gone, and we waited for
+    it until the call timed out.
+
+What the recording showed once those were understood: ACTS went to
+2400 for three seconds, got nothing back from a caller stuck at 1200,
+dropped to 1200 and spent the rest of the call asking for a rate change
+-- S1 for 100 ms, every 2.1 seconds, thirteen times, until it hung up.
+Every one of those requests was an invitation we did not answer.
+
+Two things it was not. The V.22 receive path is sound: modec calls
+spandsp's V.22bis modem over a pair of FIFOs and text passes intact
+both ways, at 1200 and at 2400 (SURVEY.md has the oracle recipe). And
 the scrambler is not per-direction: V.22 uses 1 + x^-14 + x^-17 in both
 directions, which the same spandsp reference confirms.
 
