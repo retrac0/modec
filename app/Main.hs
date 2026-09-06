@@ -124,7 +124,7 @@ cmdP = hsubparser
       <*> switch (long "v8" <> help "V.8: exchange CM/JM capability menus before the modem start-up")
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
-      <*> mnpP
+      <*> dialMnpP
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
                        <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this")
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
@@ -141,6 +141,15 @@ cmdP = hsubparser
           flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A), classes 2 to 4")
       <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, but offering only up to class N")
       <|> pure Nothing
+    -- Dialling asks for error correction the way a modem with its
+    -- factory settings does.  An unprotected call over a VoIP trunk
+    -- delivers the odd corrupt character in the direction it transmits,
+    -- and there is nothing downstream that can tell a corrupt character
+    -- from one that was typed; a call that negotiates MNP does not.
+    dialMnpP =
+          flag' Nothing (long "no-mnp" <> help "no error correction: hand over whatever arrives, errors and all")
+      <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "offer only up to class N: 2 start-stop framing, 3 synchronous framing, 4 adds adaptive frame sizing")
+      <|> pure (Just 4)
     modesReader s = case s of
       "auto" -> Just H.allStandards
       "all" -> Just H.allStandards

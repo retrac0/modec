@@ -169,6 +169,22 @@ answering modem**, whose banner and prompts decoded perfectly.
 
 Four things had to be fixed to get there, all of them worth knowing:
 
+**`modec dial` asks for MNP error correction by default**, the way a
+modem with its factory settings does, and `--no-mnp` turns it off. An
+unprotected 2400 bit/s call over this trunk delivers the odd corrupt
+character in the direction it transmits -- measured at four in a
+two-minute call, against none in the calls that negotiated MNP class 4
+over the same trunk the same evening. Nothing downstream can tell a
+corrupt character from one that was typed, which is why it is worth the
+framing.
+
+Two notes for reading a recording back afterwards. A call that ran with
+MNP has to be replayed with MNP: the frames are start-stop characters
+like any other, and a replay without it prints them as pages of
+garbage. And a BBS sending CP437 line art puts plenty of bytes above
+0x7E on the line -- count those as noise and every ANSI screen looks
+like a broken link.
+
 **Junk characters echoed back by the far end -- `þ` (0xFE) at 300 bit/s,
 random bytes at 2400 -- while what it sends reads perfectly** are holes
 in our transmitted audio, not line noise. Each hole is a moment of

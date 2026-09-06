@@ -23,6 +23,7 @@ library
                       Modec.Modem
                       Modec.Telnet
                       Modec.Async
+                      Modec.Baudot
                       Modec.V22
                       Modec.Hdlc
                       Modec.MnpFrame
@@ -47,7 +48,7 @@ executable modec
     other-modules:    Modem
                       CallLog
                       Dial
-    ghc-options:      -threaded
+    ghc-options:      -threaded -rtsopts
     build-depends:    base ^>=4.18,
                       modec,
                       bytestring,
