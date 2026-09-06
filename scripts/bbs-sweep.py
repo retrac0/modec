@@ -33,22 +33,22 @@ TOTAL_CAP = ANSWER_CAP + RING_CAP + 10        # backstop on the whole call
 # has codepoints only for ITU modes, so a Bell-only configuration cannot
 # use it and falls back to the classic ladder on its own.
 CONFIGS = {
-    "2400":        ["--modes", "v22bis"],
-    "300":         ["--modes", "v21,bell103"],
+    "2400":        ["--mode", "v22bis"],
+    "300":         ["--mode", "v21,bell103"],
     "v8":          ["--v8"],
     "v8all":       ["--v8-offer-all"],
-    "v22bis":      ["--modes", "v22bis"],
-    "v22bis-v8":   ["--modes", "v22bis", "--v8"],
-    "v22":         ["--modes", "v22"],
-    "bell212a":    ["--modes", "bell212a"],
-    "v21":         ["--modes", "v21"],
-    "v21-v8":      ["--modes", "v21", "--v8"],
+    "v22bis":      ["--mode", "v22bis"],
+    "v22bis-v8":   ["--mode", "v22bis", "--v8"],
+    "v22":         ["--mode", "v22"],
+    "bell212a":    ["--mode", "bell212a"],
+    "v21":         ["--mode", "v21"],
+    "v21-v8":      ["--mode", "v21", "--v8"],
     # V.23 duplex: we send 75 bit/s and receive 1200, so a banner arrives
     # in a quarter of the time a V.21 one does and anything typed back
     # crawls.  Boards that offer viewdata answer this.
-    "v23":         ["--modes", "v23"],
-    "v23-v8":      ["--modes", "v23", "--v8"],
-    "bell103":     ["--modes", "bell103"],
+    "v23":         ["--mode", "v23"],
+    "v23-v8":      ["--mode", "v23", "--v8"],
+    "bell103":     ["--mode", "bell103"],
     "auto":        [],
     "auto-v8":     ["--v8"],
     # MNP error correction.  Class 2 frames over the ordinary start-stop
@@ -56,8 +56,8 @@ CONFIGS = {
     # adaptive frame sizing.  Both fall through to an unprotected
     # connection if the far end does not answer a link request, so a board
     # with no error correction still gets its banner through.
-    "mnp2":        ["--modes", "v22bis", "--mnp-class", "2"],
-    "mnp4":        ["--modes", "v22bis", "--mnp"],
+    "mnp2":        ["--mode", "v22bis", "--mnp-class", "2"],
+    "mnp4":        ["--mode", "v22bis", "--mnp"],
 }
 
 def log(msg):

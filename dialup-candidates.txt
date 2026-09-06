@@ -61,6 +61,23 @@ there is no doubt at all: the bytes were supposed to be a date and a
 time, and they were not. The bug is reproducible on demand, on a service
 that never changes, without needing anyone's BBS.
 
+Correction, 6 September 2026. "The framer arms before the far end has
+begun sending" does not survive the recording. Taking the call apart
+symbol by symbol -- modec's own receiver dumping its phase decisions,
+descrambled by hand -- ACTS is transmitting: entropy in the descrambled
+bit stream sits at 50 % from 13 to 15 s, and after that the line is idle
+mark with a short burst of data every second, which is exactly the shape
+of a time code sent once a second. The far end was talking and we did
+not understand it. Whatever is wrong is downstream of the symbol
+decisions, and it is not an arming problem, so the fix is not the one
+this section assumed.
+
+Two things it is not. The V.22 receive path is sound in general: modec
+calls spandsp's V.22bis modem over a pair of FIFOs and text passes
+intact both ways at 1200 bit/s (SURVEY.md has the oracle recipe). And
+the scrambler is not per-direction: V.22 uses 1 + x^-14 + x^-17 in both
+directions, which the same spandsp reference confirms.
+
 
 3. Dial-up ISP points of presence
 -----------------------------------
@@ -325,3 +342,50 @@ nodelist.fidonet.cc now does publish downloadable nodelists covering
 2026, but it is still unreachable from this machine: plain HTTP is
 intercepted by a safebrowse interstitial and HTTPS fails the handshake
 outright. The Z2DAILY surveyed in section 4 was fetched by hand instead.
+
+pweck.com, cited by PhreakNet's own BBS page as "The BBS List," has
+lapsed: the domain now resolves to a GoDaddy parking page.
+
+PhreakNet publishes a 500-plus-entry "BBS Directory" PDF
+(w2k.phreaknet.org/bbs/bbs.pdf). Its file metadata gives a creation date
+of October 2018, it carries no per-entry last-verified date, and its
+contents are recognizable as the mega BBS list that has circulated since
+the 1990s -- large blocks of Twin Cities-area (612/651) boards, FidoNet
+nodes, and other names that read as archaeology rather than a maintained
+roster. A handful of entries do corroborate numbers already in this
+document at older values -- Empire of the Dragon 303-679-0161, Reign of
+Fire 931-494-9100, Xanadu 780-439-8364, Realm of Darkness 623-907-2858 --
+which confirms the list is real but stale, not that anything else in it
+still answers. Treat it like the textfiles.com list: good for area codes,
+not for dialling.
+
+
+9. PhreakNet / InterLinked BBS -- a live system the guide doesn't tag Dial-Up
+------------------------------------------------------------------------------
+
+bbs.phreaknet.org (InterLinked BBS, on Lightweight BBS software) is a
+working phone-phreak community board with a real modem bank -- the page
+says 23 modems -- and it is listed on the Telnet BBS Guide itself
+(telnetbbsguide.com/bbs/phreaknet/), which is why it is worth recording
+here: the guide tags that entry SSH and Telnet only, not Dial-Up, so it
+never appeared in the filtered dial-up listing this document's section 1
+is built from. A directory-style census of the guide's Dial-Up tag will
+always miss it.
+
+The BBS's own page gives three direct-dial lines by exchange and line
+number but never states the area code on any page this survey reached:
+
+    ...-270-2441   300 bps, 8N1 -- the modem line
+    ...-270-2445   45.45 bps, US TDD
+    ...-270-2450   50 bps, international TDD
+
+("Report-A-Payphone" and a handful of other numbers published in
+PhreakNet's own directory at portal.phreaknet.org/directory are DISA
+gateways into their phone network, not the BBS's modem line, and are not
+candidates here.) The page also repeats the same POTS-vs-VoIP caution
+already familiar from this project's own calls: "POTS connections are
+recommended but VoIP connections at 2400 baud also work well." Worth
+tracking down the area code and dialling -- a community that already
+reasons carefully about POTS versus VoIP on a real modem bank is a good
+match for what modec is trying to test against -- but not yet a candidate
+that can be called from what's on hand.

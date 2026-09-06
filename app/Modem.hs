@@ -132,7 +132,7 @@ runModem o = do
                        , mnLrTries = max 1 (moMnpProbes o), mnT401Lr = moMnpProbeGap o })
                     (moMnp o)
   when (moNoHandshake o && length (moModes o) /= 1) $ do
-    logMsg "--no-handshake needs exactly one mode, e.g. --standard v22"
+    logMsg "--no-handshake needs exactly one mode, e.g. --mode v22"
     exitFailure
   when (null (moModes o)) $ do
     logMsg "no modes enabled"

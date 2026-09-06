@@ -125,7 +125,7 @@ record what comes back:
 ```
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain toronto.voip.ms \
   --audio-sip-loop modec --listen 2323 \
-  --modes bell103 --no-handshake --record-rx echo.wav --record-tx sent.wav
+  --mode bell103 --no-handshake --record-rx echo.wav --record-tx sent.wav
 ```
 
 The long form, because this test wants both directions in one file each
@@ -151,8 +151,8 @@ both ends, which is far easier to debug than a BBS.
 **d. A real BBS.** Start slow and work up:
 
 ```
-modec dial <number> --modes bell103    # 300 bit/s, most forgiving
-modec dial <number> --modes v22        # 1200 bit/s
+modec dial <number> --mode bell103    # 300 bit/s, most forgiving
+modec dial <number> --mode v22        # 1200 bit/s
 modec dial <number>                    # 2400 bit/s if both ends manage it
 ```
 
@@ -201,9 +201,9 @@ One modern answering modem tested here cycles through a ladder:
 | 7-9 s | 1650 Hz | V.21 channel 2 mark |
 | 9-11 s | 1300 Hz | calling tone, then the ladder repeats |
 
-Against that answerer, `--modes v22bis,v22` connects at 2400 bit/s and
-`--modes v21` connects at 300, but the V.21 window is only about two
-seconds wide before it moves on. `--modes bell103` and `--modes bell212a`
+Against that answerer, `--mode v22bis,v22` connects at 2400 bit/s and
+`--mode v21` connects at 300, but the V.21 window is only about two
+seconds wide before it moves on. `--mode bell103` and `--mode bell212a`
 never connect, correctly: the 2250 Hz it sends is V.22 unscrambled binary
 1, not the 2225 Hz Bell answer tone, and modec tells the two apart by the
 phase-step quality rather than the frequency.

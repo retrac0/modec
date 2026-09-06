@@ -29,7 +29,7 @@ with an annotated timeline.
   dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
 - Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
   dominant-tone runs, offline FSK standard/channel identification.
-- V.23 duplex (`--modes v23`): 1200 bit/s from the answering modem on
+- V.23 duplex (`--mode v23`): 1200 bit/s from the answering modem on
   1300/2100 Hz, 75 bit/s back from the caller on 390/450 Hz. The only
   asymmetric mode here, and the one viewdata boards answer with. Calling
   one needs nothing special -- the 1300 Hz forward mark is unambiguous --
@@ -41,7 +41,7 @@ with an annotated timeline.
   enough for a continuous-phase carrier to add up over it.
 - Call establishment (`Modec.Handshake`): V.25 answer sequence with
   Bell 103, V.21, V.23, Bell 212A, V.22 and V.22bis on both sides, verified by
-  duplex simulations in the test suite. `--modes` chooses which of them
+  duplex simulations in the test suite. `--mode` chooses which of them
   the modem will negotiate, in order of preference; see
   [docs/negotiation.md](docs/negotiation.md) for the decision tree and a
   walkthrough of what happens when each kind of modem calls in.
@@ -72,7 +72,7 @@ with an annotated timeline.
   600/450 ms rate switch and the 32-ones completion) in the handshake and
   the live modem. Automode probes V.22 first, then V.21, then Bell 103,
   accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
-  with a V.22-only peer. `--modes v22` disables 2400 on our side.
+  with a V.22-only peer. `--mode v22` disables 2400 on our side.
 - V.8bis capabilities exchange (`Modec.V8bis`, `Modec.Hdlc`): after the
   billing delay the answerer sends CRe (dual tone 1375 + 2002 Hz, then
   400 Hz), a V.8bis caller replies with ESr and a CL message over V.21
@@ -157,9 +157,9 @@ cabal run modec -- modem --answer --audio-pipewire --listen 2323
 # call out: audio through PipeWire, bytes to a telnet host
 cabal run modec -- modem --originate --audio-pipewire --connect bbs.example.org --port 23
 # pick the PipeWire node explicitly, force Bell 103, skip the handshake
-cabal run modec -- modem --answer --audio-pipewire --pw-in usb --standard bell103 --no-handshake --listen 2323
+cabal run modec -- modem --answer --audio-pipewire --pw-in usb --mode bell103 --no-handshake --listen 2323
 # only the North American modes, best first
-cabal run modec -- modem --hayes --audio-pipewire --modes bell212a,bell103 --listen 2323
+cabal run modec -- modem --hayes --audio-pipewire --mode bell212a,bell103 --listen 2323
 # loop two instances through FIFOs with no sound card
 scripts/smoke-loopback.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
@@ -168,7 +168,7 @@ scripts/smoke-hayes.sh
 
 # SIP: install baresip and copy docs/baresip to ~/.baresip, edit accounts, then just
 cabal run modec -- dial +14042820600                              # starts baresip, dials, records
-cabal run modec -- dial +14042820600 --modes v21 --listen 2323    # on telnet instead of this terminal
+cabal run modec -- dial +14042820600 --mode v21 --listen 2323    # on telnet instead of this terminal
 # the long form, for an existing baresip or the answering side
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example --audio-sip-loop modec --listen 2323
 # and from a terminal program: ATDT<number> dials the BBS, ATA answers an incoming SIP call

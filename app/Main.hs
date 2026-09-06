@@ -66,11 +66,9 @@ cmdP = hsubparser
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
       <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
       <*> (option (maybeReader modesReader)
-             (long "modes" <> metavar "LIST"
+             (long "mode" <> metavar "LIST"
               <> help "comma-separated modes to negotiate, best first: bell103,v21,bell212a,v22,v22bis (default: all)")
-           <|> option (maybeReader (fmap (: []) . modeReader))
-                 (long "standard" <> metavar "MODE" <> help "shorthand for --modes with a single mode")
-           <|> pure H.allStandards)
+                <|> pure H.allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> switch (long "v8" <> help "V.8: answer with ANSam and exchange CM/JM capability menus")
@@ -136,10 +134,8 @@ cmdP = hsubparser
       , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir }
     modesP =
           option (maybeReader modesReader)
-            (long "modes" <> metavar "LIST"
+            (long "mode" <> metavar "LIST"
              <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis (default: all)")
-      <|> option (maybeReader (fmap (: []) . modeReader))
-            (long "standard" <> metavar "MODE" <> help "shorthand for --modes with a single mode")
       <|> pure H.allStandards
     mnpP =
           flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A), classes 2 to 4")

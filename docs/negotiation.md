@@ -1,13 +1,12 @@
 # Mode negotiation
 
 modec supports five modes. Which ones it will negotiate is configured with
-`--modes`, a comma-separated list in order of preference (best first):
+`--mode`, a comma-separated list in order of preference (best first):
 
 ```
---modes v22bis,v22,bell212a,v21,bell103      # the default
---modes bell212a,bell103                     # a North American 1200/300 modem
---modes v22                                  # V.22 only: 1200 bit/s, never offers 2400
---standard v21                               # shorthand for --modes v21
+--mode v22bis,v22,bell212a,v21,bell103      # the default
+--mode bell212a,bell103                     # a North American 1200/300 modem
+--mode v22                                  # V.22 only: 1200 bit/s, never offers 2400
 ```
 
 | Mode | Rate | Modulation | Carriers | Announced by |
