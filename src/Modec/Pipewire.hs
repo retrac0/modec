@@ -23,15 +23,21 @@ module Modec.Pipewire
   , resolveNode
   , waitForNodes
   , describeNodes
+    -- * Links
+  , PwLink (..)
+  , pwLinks
+  , pwUnlink
+  , pruneCompetingInputs
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, try)
+import Control.Exception (IOException, try)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit, toLower)
 import Data.List (isInfixOf)
-import System.Process (readProcess)
+import System.Exit (ExitCode (..))
+import System.Process (readProcess, readProcessWithExitCode)
 
 import Modec.Json
 
@@ -82,7 +88,7 @@ matchNode spec nodes
 -- | All PipeWire nodes, or an empty list if @pw-dump@ is unavailable.
 pwNodes :: IO [PwNode]
 pwNodes = do
-  r <- try (readProcess "pw-dump" ["Node"] "") :: IO (Either SomeException String)
+  r <- try (readProcess "pw-dump" ["Node"] "") :: IO (Either IOException String)
   return $ case r of
     Left _ -> []
     Right out -> parseNodes (BC.pack out)
@@ -129,6 +135,55 @@ waitForNodes names timeout = go (max 1 (round (timeout / 0.1) :: Int))
     missing = do
       ns <- pwNodes
       return [ nm | nm <- names, not (any ((== nm) . pnName) ns) ]
+
+-- | A link between two ports, named by the nodes at each end.
+data PwLink = PwLink
+  { plId  :: !Int
+  , plSrc :: String
+  , plDst :: String
+  } deriving (Eq, Show)
+
+-- | Every link in the graph, from @pw-link -I -l@.  Its output lists each
+-- port on an unindented line and each of that port's links indented with
+-- an arrow giving the direction.
+pwLinks :: IO [PwLink]
+pwLinks = do
+  r <- try (readProcess "pw-link" ["-I", "-l"] "") :: IO (Either IOException String)
+  return $ case r of
+    Left _ -> []
+    Right out -> go "" (lines out)
+  where
+    go _ [] = []
+    go cur (l : ls) = case words l of
+      (lid : arrow : _ : rest)
+        | arrow == "|->" , Just i <- readMaybeInt lid -> PwLink i cur (nodeOf (unwords rest)) : go cur ls
+        | arrow == "|<-" , Just i <- readMaybeInt lid -> PwLink i (nodeOf (unwords rest)) cur : go cur ls
+      (pid : rest) | Just _ <- readMaybeInt pid, not (null rest) -> go (nodeOf (unwords rest)) ls
+      _ -> go cur ls
+    nodeOf s = takeWhile (/= ':') s
+    readMaybeInt s = case reads s of { [(i, "")] -> Just (i :: Int); _ -> Nothing }
+
+-- | Destroy a link by id.
+pwUnlink :: Int -> IO Bool
+pwUnlink lid = do
+  r <- try (readProcessWithExitCode "pw-link" ["-d", show lid] "")
+         :: IO (Either IOException (ExitCode, String, String))
+  return $ case r of
+    Right (ExitSuccess, _, _) -> True
+    _ -> False
+
+-- | PipeWire's session manager often links the default capture device
+-- into a softphone's input as well as the node the softphone asked for,
+-- so the far end hears the microphone mixed with the modem.  Remove any
+-- link that feeds a node our line source feeds, unless it comes from the
+-- line source itself.  Returns what was removed.
+pruneCompetingInputs :: String -> IO [PwLink]
+pruneCompetingInputs lineNode = do
+  ls <- pwLinks
+  let fedByUs = [ plDst l | l <- ls, plSrc l == lineNode ]
+      stray = [ l | l <- ls, plDst l `elem` fedByUs, plSrc l /= lineNode ]
+  mapM_ (pwUnlink . plId) stray
+  return stray
 
 -- | A human-readable listing, one node per line.
 describeNodes :: [PwNode] -> String

@@ -115,6 +115,54 @@ ATDT<number>          # with the default modes (2400 bit/s if both ends manage i
 Always record with `--record-rx`; when a connection fails, the recording
 plus `modec detect` shows exactly how far the handshake got.
 
+## Field notes from a real call
+
+Confirmed working against voip.ms from this repository: registration on
+`toronto.voip.ms` (30 ms round trip, 2.8 ms jitter, no loss), PCMU
+negotiated both ways, and a **V.22bis connection at 2400 bit/s to a real
+answering modem**, whose banner and prompts decoded perfectly.
+
+Four things had to be fixed to get there, all of them worth knowing:
+
+**Do not set `medianat=stun` on the account.** baresip then sends a
+re-INVITE once STUN resolves the media address, and voip.ms answers
+`481 Call/Transaction Does Not Exist`, tearing the call down in the middle
+of the handshake. The supplied `accounts` file omits it.
+
+**Comment out `module_app stdio.so`** when running baresip headless; with
+no terminal it blocks startup. The supplied `config` has it commented.
+
+**PipeWire may link the default microphone into the softphone's capture**
+alongside the modem line, putting room noise on the wire while the far end
+tries to demodulate. modec now detects and removes such links when a call
+comes up, and logs what it removed.
+
+**Outbound calls need a registered caller ID.** Without a DID or a
+validated caller ID, voip.ms answers, plays "the number you are calling
+from has not been registered", and hangs up after about eight seconds.
+The 4443 echo test works without one, so use it to prove the audio path
+before sorting the caller ID out.
+
+## Reading the far end's answer sequence
+
+A recording plus `modec detect` tells you which modes an answering modem
+is actually offering, which is the fastest way to know what can connect.
+One modern answering modem tested here cycles through a ladder:
+
+| Time | Signal | Meaning |
+|---|---|---|
+| 0-4 s | 2100 Hz in 0.9 s segments | V.25 answer tone with phase reversals (V.8 ANSam) |
+| 4-7 s | 2250 Hz | V.22 unscrambled binary 1 |
+| 7-9 s | 1650 Hz | V.21 channel 2 mark |
+| 9-11 s | 1300 Hz | calling tone, then the ladder repeats |
+
+Against that answerer, `--modes v22bis,v22` connects at 2400 bit/s and
+`--modes v21` connects at 300, but the V.21 window is only about two
+seconds wide before it moves on. `--modes bell103` and `--modes bell212a`
+never connect, correctly: the 2250 Hz it sends is V.22 unscrambled binary
+1, not the 2225 Hz Bell answer tone, and modec tells the two apart by the
+phase-step quality rather than the frequency.
+
 ## What to expect
 
 Reports from people running vintage modems over VoIP put 300, 1200 and

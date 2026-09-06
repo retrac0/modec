@@ -1,3 +1,5 @@
 dist-newstyle/
 *.hi
 *.o
+pw
+*.wav.tmp

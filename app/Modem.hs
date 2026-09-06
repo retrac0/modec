@@ -11,7 +11,7 @@ module Modem
   ) where
 
 import Control.Concurrent
-import Control.Exception (SomeException, bracket, finally, throwTo, try)
+import Control.Exception (IOException, bracket, finally, throwTo, try)
 import Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
@@ -143,7 +143,10 @@ runModem o = do
                     aiWrite ai (encodeS16 (VS.replicate blockN 0))
                     return True
                   else return False
-      let cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
+      let lineNode = case moAudio o of
+            AudioSipLoop prefix -> Just (prefix ++ "-line")
+            _ -> Nothing
+          cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
                               , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o) } }
           traceStep st st' = when trace $ do
@@ -232,6 +235,15 @@ runModem o = do
                       SipCommand c params -> maybe (return ()) (\cl -> sipSend cl c params) sip
                       SipStartModem role -> do
                         logMsg ("SIP call up, modem role " ++ show role)
+                        -- PipeWire may have linked the default microphone into
+                        -- the softphone's capture alongside our line, which
+                        -- would put room noise on the wire; take it out now and
+                        -- again once the stream has settled
+                        forM_ lineNode $ \ln -> void $ forkIO $ forM_ [0, 1000000] $ \d -> do
+                          threadDelay d
+                          stray <- pruneCompetingInputs ln
+                          forM_ stray $ \l ->
+                            logMsg ("removed stray audio link into " ++ plDst l ++ " from " ++ plSrc l)
                         writeIORef lineRef (LineCall (modemInit (cfgFor role)) (cfgFor role))
                       SipStopModem -> writeIORef lineRef LineIdle
                       SipToDte ev -> modemEvent ev
@@ -309,7 +321,7 @@ sipConnect addr = withSocketsDo $ do
   queue <- newIORef []
   tok <- newIORef 0
   let reader buf = do
-        r <- try (NB.recv sock 4096) :: IO (Either SomeException B.ByteString)
+        r <- try (NB.recv sock 4096) :: IO (Either IOException B.ByteString)
         case r of
           Right bs | not (B.null bs) -> do
             let (msgs, rest) = netstringDecode (buf <> bs)
@@ -329,7 +341,7 @@ sipSend :: SipClient -> String -> String -> IO ()
 sipSend (SipClient sock _ tok) cmd params = do
   n <- atomicModifyIORef' tok (\k -> (k + 1, k))
   logMsg ("baresip <- " ++ cmd ++ (if null params then "" else " " ++ params))
-  r <- try (NB.sendAll sock (commandJson cmd params ("m" ++ show n))) :: IO (Either SomeException ())
+  r <- try (NB.sendAll sock (commandJson cmd params ("m" ++ show n))) :: IO (Either IOException ())
   either (\e -> logMsg ("baresip send failed: " ++ show e)) return r
 
 sipDrain :: SipClient -> IO [BsMessage]
@@ -383,8 +395,8 @@ withPwCatPair :: [String] -> [String] -> (AudioIf -> IO a) -> IO a
 withPwCatPair recArgs playArgs body = do
   ref <- newIORef Nothing
   let spawn = do
-        r <- try (createProcess (proc "pw-cat" recArgs) { std_out = CreatePipe, std_err = Inherit }) :: IO (Either SomeException ProcResult)
-        p <- try (createProcess (proc "pw-cat" playArgs) { std_in = CreatePipe, std_err = Inherit }) :: IO (Either SomeException ProcResult)
+        r <- try (createProcess (proc "pw-cat" recArgs) { std_out = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
+        p <- try (createProcess (proc "pw-cat" playArgs) { std_in = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
         case (r, p) of
           (Right (_, Just hin, _, rph), Right (Just hout, _, _, pph)) -> do
             hSetBinaryMode hin True
@@ -395,7 +407,7 @@ withPwCatPair recArgs playArgs body = do
           _ -> do
             logMsg ("could not start pw-cat" ++ hint r)
             return False
-      hint :: Either SomeException ProcResult -> String
+      hint :: Either IOException ProcResult -> String
       hint (Left e) = ": " ++ show e
       hint _ = ""
       -- say why the capture stopped, when the child has already exited
@@ -417,13 +429,16 @@ withPwCatPair recArgs playArgs body = do
           ignore (void (waitForProcess rph))
           ignore (void (waitForProcess pph))
       ignore :: IO () -> IO ()
-      ignore act = void (try act :: IO (Either SomeException ()))
+      ignore act = void (try act :: IO (Either IOException ()))
       rd n = do
         m <- readIORef ref
         case m of
           Nothing -> return B.empty
           Just (PwPair hin _ _ _) -> do
-            r <- try (B.hGet hin n) :: IO (Either SomeException B.ByteString)
+            -- IOException only: an asynchronous exception here is a
+            -- shutdown request and must propagate, or the loop would treat
+            -- it as audio loss and restart instead of exiting
+            r <- try (B.hGet hin n) :: IO (Either IOException B.ByteString)
             return (either (const B.empty) id r)
       wr bs = do
         m <- readIORef ref
@@ -520,7 +535,7 @@ withAudio aio rate role body = case aio of
     withPwCatPair recArgs playArgs body
   where
     common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
-    ignoreIO act = void (try act :: IO (Either SomeException ()))
+    ignoreIO act = void (try act :: IO (Either IOException ()))
     cleanupProc (mi, mo, _, ph) = do
       mapM_ hClose mi
       mapM_ hClose mo
@@ -553,7 +568,7 @@ withData dio body = case dio of
       telnetSession sock body
   where
     pump h buf = do
-      r <- try (B.hGetSome h 4096) :: IO (Either SomeException B.ByteString)
+      r <- try (B.hGetSome h 4096) :: IO (Either IOException B.ByteString)
       case r of
         Right bs | not (B.null bs) -> push buf bs >> pump h buf
         _ -> return ()
@@ -568,7 +583,7 @@ telnetSession sock body = do
   sendLock <- newMVar ()
   let send bs = withMVar sendLock (\_ -> NB.sendAll sock bs)
       reader = do
-        r <- try (NB.recv sock 4096) :: IO (Either SomeException B.ByteString)
+        r <- try (NB.recv sock 4096) :: IO (Either IOException B.ByteString)
         case r of
           Right bs | not (B.null bs) -> do
             (payload, reply) <- modifyMVar tsRef $ \ts ->
