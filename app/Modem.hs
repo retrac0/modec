@@ -11,7 +11,7 @@ module Modem
   ) where
 
 import Control.Concurrent
-import Control.Exception (SomeException, bracket, try)
+import Control.Exception (SomeException, bracket, finally, try)
 import Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
@@ -25,7 +25,6 @@ import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.IO
 import System.Process
-import Data.List (isSuffixOf)
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 
 import Modec.DSP (Signal, rms)
@@ -34,14 +33,27 @@ import Modec.Baresip
 import Modec.Dtmf
 import Modec.Hayes
 import Modec.Modem
+import Modec.Pipewire
 import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 
 data AudioIO
-  = AudioPipewire (Maybe String) Bool  -- ^ optional pw-cat target node (numeric id), capture the sink monitor
+  = AudioPipewire (Maybe String) (Maybe String) Bool
+    -- ^ input and output device specifications (node id, name or a
+    -- substring of either; 'Nothing' means the PipeWire default), and
+    -- whether to record the output's monitor instead of an input
   | AudioSipLoop String              -- ^ PipeWire loopback pair for a softphone; the prefix names the nodes
   | AudioFiles FilePath FilePath     -- ^ raw s16le mono: input, output (files or FIFOs)
   | AudioStdio                       -- ^ raw s16le mono on stdin/stdout
+
+-- | The audio interface the main loop sees.  Reading is the clock: a
+-- short read means the capture stream stopped, and 'aiRestart' offers to
+-- put it back (only the PipeWire backends can).
+data AudioIf = AudioIf
+  { aiRead    :: Int -> IO B.ByteString
+  , aiWrite   :: B.ByteString -> IO ()
+  , aiRestart :: IO Bool
+  }
 
 data DataIO
   = DataListen Int                   -- ^ telnet server on this port, one connection
@@ -83,14 +95,34 @@ runModem o = do
   sip <- case moSip o of
     Nothing -> return Nothing
     Just addr -> Just <$> sipConnect addr
-  withAudio (moAudio o) (moRate o) (moRole o) $ \ain aout ->
+  withAudio (moAudio o) (moRate o) (moRole o) $ \ai ->
     withData (moData o) $ \recvBytes sendBytes -> do
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
       blockRef <- newIORef (0 :: Int)
       -- output leads input by one block: two modems joined by pipes would
       -- otherwise each wait for the other's first block
-      B.hPut aout (encodeS16 (VS.replicate blockN 0))
-      hFlush aout
+      aiWrite ai (encodeS16 (VS.replicate blockN 0))
+      restarts <- newIORef (0 :: Int)
+      let readBlock = aiRead ai (2 * blockN)
+          writeBlock = aiWrite ai
+          -- The capture stream stopped (device unplugged, pw-cat killed,
+          -- the peer closed a FIFO).  Try to put it back a few times
+          -- before giving up, so a glitching USB interface does not end
+          -- the session.
+          audioLost = do
+            n <- readIORef restarts
+            if n >= 3
+              then logMsg "audio input ended (giving up after 3 restarts)" >> return False
+              else do
+                logMsg "audio input ended (the capture stream stopped)"
+                ok <- aiRestart ai
+                if ok
+                  then do
+                    writeIORef restarts (n + 1)
+                    logMsg ("audio restarted (attempt " ++ show (n + 1) ++ ")")
+                    aiWrite ai (encodeS16 (VS.replicate blockN 0))
+                    return True
+                  else return False
       let cfgFor role = let c0 = defaultModemConfig fs role (moStandard o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
                               , mcHandshake = (mcHandshake c0) { hcAllow2400 = not (moMax1200 o), hcV8bis = not (moNoV8bis o) } }
@@ -108,9 +140,9 @@ runModem o = do
           -- plain mode: one call in the configured role, then exit
           stRef <- newIORef (modemInit cfg)
           let loop = do
-                raw <- B.hGet ain (2 * blockN)
+                raw <- readBlock
                 if B.length raw < 2 * blockN
-                  then logMsg "audio input ended (the capture stream stopped)"
+                  then audioLost >>= \ok -> when ok loop
                   else do
                     pending <- recvBytes
                     st <- readIORef stRef
@@ -118,8 +150,7 @@ runModem o = do
                     writeIORef stRef st'
                     traceStep st st'
                     unless trace $ modifyIORef' blockRef (+ 1)
-                    B.hPut aout (encodeS16 audio)
-                    hFlush aout
+                    writeBlock (encodeS16 audio)
                     unless (null rxBytes) $ sendBytes (B.pack rxBytes)
                     mapM_ report events
                     unless (any isFinal events) loop
@@ -146,9 +177,16 @@ runModem o = do
                 writeIORef hayesRef hs'
                 unless (B.null out) $ sendBytes out
               loop = do
-                raw <- B.hGet ain (2 * blockN)
+                raw <- readBlock
                 if B.length raw < 2 * blockN
-                  then logMsg "audio input ended (the capture stream stopped)"
+                  then do
+                    -- losing the line drops any call in progress
+                    line <- readIORef lineRef
+                    case line of
+                      LineCall {} -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
+                      _ -> return ()
+                    ok <- audioLost
+                    when ok loop
                   else do
                     t <- tNow
                     modifyIORef' blockRef (+ 0)
@@ -207,16 +245,16 @@ runModem o = do
                             logMsg "auto-answer"
                             writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
                         when (n' > 25) $ writeIORef energyRef 0
-                        B.hPut aout (encodeS16 (VS.replicate blockN 0))
+                        writeBlock (encodeS16 (VS.replicate blockN 0))
                       LineDialing sig -> do
                         let (now, rest) = VS.splitAt blockN sig
                             block = now VS.++ VS.replicate (blockN - VS.length now) 0
-                        B.hPut aout (encodeS16 block)
+                        writeBlock (encodeS16 block)
                         writeIORef lineRef (if VS.null rest then LineCall (modemInit (cfgFor Originate)) (cfgFor Originate) else LineDialing rest)
                       LineCall st c -> do
                         let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack fwd else [])
                         traceStep st st'
-                        B.hPut aout (encodeS16 audio)
+                        writeBlock (encodeS16 audio)
                         when (online && not (null rxBytes)) $ sendBytes (B.pack rxBytes)
                         writeIORef lineRef (LineCall st' c)
                         forM_ events $ \ev -> do
@@ -225,7 +263,6 @@ runModem o = do
                             EvConnected _ link -> modemEvent (EvConnect (rateOf link))
                             EvDropped -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
                             EvFailed _ -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
-                    hFlush aout
                     modifyIORef' blockRef (+ 1)
                     loop
           loop
@@ -285,19 +322,6 @@ data Line
   | LineDialing Signal
   | LineCall ModemState ModemConfig
 
--- | True when PipeWire offers a capture device that is not a monitor of
--- an output.  Uses pactl; if that is unavailable, assume there is one.
-hasCaptureDevice :: IO Bool
-hasCaptureDevice = do
-  r <- try (readProcess "pactl" ["list", "short", "sources"] "") :: IO (Either SomeException String)
-  return $ case r of
-    Left _ -> True
-    Right out -> any real (lines out)
-  where
-    real l = case drop 1 (words l) of
-      (name : _) -> not (".monitor" `isSuffixOf` name)
-      _ -> False
-
 v22Info :: ModemState -> String
 v22Info st = case modemV22Rx st of
   (Just (ch, r), rate) -> "v22rx " ++ show ch ++ " " ++ show rate ++ " evm " ++ show (rxEvmEstimate r) ++ " ones2400 " ++ show (rxOnes2400Run r) ++ " sps " ++ show (rxSpsEstimate r)
@@ -317,10 +341,104 @@ encodeS16 x = BL.toStrict (BB.toLazyByteString (VS.foldr (\v acc -> BB.int16LE (
     toI16 :: Double -> Int16
     toI16 v = round (max (-1) (min 1 v) * 32767)
 
--- | Open the audio input and output handles.
-withAudio :: AudioIO -> Int -> Role -> (Handle -> Handle -> IO a) -> IO a
+-- | An audio interface backed by two handles that cannot be restarted.
+handleIf :: Handle -> Handle -> AudioIf
+handleIf hi ho = AudioIf
+  { aiRead = B.hGet hi
+  , aiWrite = \bs -> B.hPut ho bs >> hFlush ho
+  , aiRestart = return False
+  }
+
+-- | A running pw-cat pair: capture pipe, playback pipe, and the two
+-- child processes.
+data PwPair = PwPair Handle Handle ProcessHandle ProcessHandle
+
+-- | What 'createProcess' returns.
+type ProcResult = (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
+
+-- | Run a record/playback pw-cat pair, giving the body an interface that
+-- can respawn it.  Reads and writes go through an 'IORef' so that a
+-- restart is invisible to the caller.
+withPwCatPair :: [String] -> [String] -> (AudioIf -> IO a) -> IO a
+withPwCatPair recArgs playArgs body = do
+  ref <- newIORef Nothing
+  let spawn = do
+        r <- try (createProcess (proc "pw-cat" recArgs) { std_out = CreatePipe, std_err = Inherit }) :: IO (Either SomeException ProcResult)
+        p <- try (createProcess (proc "pw-cat" playArgs) { std_in = CreatePipe, std_err = Inherit }) :: IO (Either SomeException ProcResult)
+        case (r, p) of
+          (Right (_, Just hin, _, rph), Right (Just hout, _, _, pph)) -> do
+            hSetBinaryMode hin True
+            hSetBinaryMode hout True
+            hSetBuffering hout NoBuffering
+            writeIORef ref (Just (PwPair hin hout rph pph))
+            return True
+          _ -> do
+            logMsg ("could not start pw-cat" ++ hint r)
+            return False
+      hint :: Either SomeException ProcResult -> String
+      hint (Left e) = ": " ++ show e
+      hint _ = ""
+      -- say why the capture stopped, when the child has already exited
+      reportDeaths = do
+        m <- readIORef ref
+        forM_ m $ \(PwPair _ _ rph pph) -> do
+          rc <- getProcessExitCode rph
+          pc <- getProcessExitCode pph
+          forM_ rc $ \c -> logMsg ("pw-cat (capture) exited: " ++ show c)
+          forM_ pc $ \c -> logMsg ("pw-cat (playback) exited: " ++ show c)
+      stop = do
+        m <- readIORef ref
+        writeIORef ref Nothing
+        forM_ m $ \(PwPair hin hout rph pph) -> do
+          ignore (hClose hin)
+          ignore (hClose hout)
+          ignore (terminateProcess rph)
+          ignore (terminateProcess pph)
+          ignore (void (waitForProcess rph))
+          ignore (void (waitForProcess pph))
+      ignore :: IO () -> IO ()
+      ignore act = void (try act :: IO (Either SomeException ()))
+      rd n = do
+        m <- readIORef ref
+        case m of
+          Nothing -> return B.empty
+          Just (PwPair hin _ _ _) -> do
+            r <- try (B.hGet hin n) :: IO (Either SomeException B.ByteString)
+            return (either (const B.empty) id r)
+      wr bs = do
+        m <- readIORef ref
+        forM_ m $ \(PwPair _ hout _ _) -> ignore (B.hPut hout bs >> hFlush hout)
+      restart = do
+        reportDeaths
+        stop
+        threadDelay 300000
+        spawn
+  started <- spawn
+  unless started exitFailure
+  body (AudioIf rd wr restart) `finally` stop
+
+-- | Name a resolved device for the log.
+nodeLabel :: Maybe PwNode -> String
+nodeLabel Nothing = "PipeWire default"
+nodeLabel (Just n) = pnName n ++ " (id " ++ show (pnId n) ++ ")"
+
+-- | Resolve an optional device specification, exiting with a listing if
+-- it names nothing or is ambiguous.
+resolveOpt :: Maybe String -> PwClass -> IO (Maybe PwNode)
+resolveOpt Nothing _ = return Nothing
+resolveOpt (Just spec) want = do
+  r <- resolveNode spec want
+  case r of
+    Right n -> return (Just n)
+    Left why -> do
+      logMsg why
+      logMsg "list the devices with: modec devices"
+      exitFailure
+
+-- | Open the audio interface.
+withAudio :: AudioIO -> Int -> Role -> (AudioIf -> IO a) -> IO a
 withAudio aio rate role body = case aio of
-  AudioStdio -> body stdin stdout
+  AudioStdio -> body (handleIf stdin stdout)
   AudioFiles i o -> do
     -- Blocking POSIX opens (GHC's openFile opens FIFOs non-blocking and
     -- fails with ENXIO when no reader exists yet).  Each FIFO open waits
@@ -335,62 +453,55 @@ withAudio aio rate role body = case aio of
     hSetBinaryMode hi True
     hSetBinaryMode ho True
     hSetBuffering ho NoBuffering
-    r <- body hi ho
-    hClose hi
-    hClose ho
-    return r
+    body (handleIf hi ho) `finally` (ignoreIO (hClose hi) >> ignoreIO (hClose ho))
   AudioSipLoop prefix -> do
-    -- two loopbacks: modec plays into <prefix>-to-sip whose other side is the
-    -- Audio/Source <prefix>-line (the softphone captures it); the softphone
-    -- plays into sip-to-<prefix> whose other side is <prefix>-sip-line
-    -- (modec captures it).  Node classes are exactly what baresip accepts.
+    -- Two loopbacks: modec plays into <prefix>-to-sip whose other side is
+    -- the Audio/Source <prefix>-line (the softphone captures it); the
+    -- softphone plays into sip-to-<prefix> whose other side is
+    -- <prefix>-sip-line (modec captures it).  Those classes are exactly
+    -- what baresip's PipeWire module accepts.
     let lb name sink src = proc "pw-loopback"
           [ "-n", name
           , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" }"
           , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" }" ]
         toSip = prefix ++ "-to-sip"; lineSrc = prefix ++ "-line"
         fromSip = "sip-to-" ++ prefix; sipSrc = prefix ++ "-sip-line"
-        common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
-        rec = (proc "pw-cat" (["--record", "--target", sipSrc, "-P", "{ node.name = " ++ prefix ++ "-rx }"] ++ common ++ ["-"])) { std_out = CreatePipe, std_err = Inherit }
-        play = (proc "pw-cat" (["--playback", "--target", toSip, "-P", "{ node.name = " ++ prefix ++ "-tx }"] ++ common ++ ["-"])) { std_in = CreatePipe, std_err = Inherit }
-    bracket (createProcess (lb (prefix ++ "-lb1") toSip lineSrc)) cleanup $ \_ ->
-      bracket (createProcess (lb (prefix ++ "-lb2") fromSip sipSrc)) cleanup $ \_ -> do
-        threadDelay 800000   -- let the loopback nodes appear before targeting them
-        bracket (createProcess rec) cleanup $ \r ->
-          bracket (createProcess play) cleanup $ \pl -> case (r, pl) of
-            ((_, Just hin, _, _), (Just hout, _, _, _)) -> do
-              hSetBinaryMode hin True
-              hSetBinaryMode hout True
-              hSetBuffering hout NoBuffering
-              logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
-              body hin hout
-            _ -> logMsg "could not start pw-cat" >> exitFailure
-  AudioPipewire target monitor0 -> do
-    -- On a machine with no capture device the only thing to record is the
-    -- output's monitor; pw-cat cannot auto-connect to that, and a failed
-    -- capture stream would end the audio-paced loop before anything is
-    -- heard.  Fall back to monitor capture rather than dying silently.
+    bracket (createProcess (lb (prefix ++ "-lb1") toSip lineSrc)) cleanupProc $ \_ ->
+      bracket (createProcess (lb (prefix ++ "-lb2") fromSip sipSrc)) cleanupProc $ \_ -> do
+        -- wait for the nodes rather than guessing how long they take
+        missing <- waitForNodes [toSip, lineSrc, fromSip, sipSrc] 5
+        unless (null missing) $ do
+          logMsg ("pw-loopback did not create: " ++ unwords missing)
+          logMsg "is pipewire running, and is pw-loopback installed?"
+          exitFailure
+        logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
+        withPwCatPair
+          (["--record", "--target", sipSrc, "-P", "{ node.name = " ++ prefix ++ "-rx }"] ++ common ++ ["-"])
+          (["--playback", "--target", toSip, "-P", "{ node.name = " ++ prefix ++ "-tx }"] ++ common ++ ["-"])
+          body
+  AudioPipewire inSpec outSpec monitor0 -> do
+    -- With no capture device the only thing to record is an output's
+    -- monitor; pw-cat cannot auto-connect to that, and a failed capture
+    -- stream would end the audio-paced loop before anything is heard.
     haveCapture <- hasCaptureDevice
-    let monitor = monitor0 || (target == Nothing && not haveCapture)
+    let monitor = monitor0 || (inSpec == Nothing && not haveCapture)
     when (monitor && not monitor0) $
       logMsg "no capture device: recording the playback monitor (the modem hears its own tones)"
-    let common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
-                 ++ maybe [] (\t -> ["--target", t]) target
-        -- pw-cat wants a numeric node id as target; stream.capture.sink records a sink's monitor
-        recExtra = if monitor then ["-P", "{ stream.capture.sink = true }"] else []
-        rec = (proc "pw-cat" (["--record"] ++ recExtra ++ common ++ ["-"])) { std_out = CreatePipe, std_err = Inherit }
-        play = (proc "pw-cat" (["--playback"] ++ common ++ ["-"])) { std_in = CreatePipe, std_err = Inherit }
-    bracket (createProcess rec) cleanup $ \r ->
-      bracket (createProcess play) cleanup $ \pl -> case (r, pl) of
-        ((_, Just hin, _, _), (Just hout, _, _, _)) -> do
-          hSetBinaryMode hin True
-          hSetBinaryMode hout True
-          hSetBuffering hout NoBuffering
-          logMsg ("pw-cat record/playback at " ++ show rate ++ " Hz")
-          body hin hout
-        _ -> logMsg "could not start pw-cat" >> exitFailure
+    outN <- resolveOpt outSpec PwSink
+    -- in monitor mode the capture target is a sink, so it follows the output
+    inN <- if monitor then maybe (resolveOpt inSpec PwSink) (return . Just) outN
+                      else resolveOpt inSpec PwSource
+    let target = maybe [] (\n -> ["--target", show (pnId n)])
+        recArgs = ["--record"] ++ (if monitor then ["-P", "{ stream.capture.sink = true }"] else [])
+                  ++ target inN ++ common ++ ["-"]
+        playArgs = ["--playback"] ++ target outN ++ common ++ ["-"]
+    logMsg ("audio in: " ++ (if monitor then "monitor of " else "") ++ nodeLabel inN
+            ++ ", out: " ++ nodeLabel outN ++ ", " ++ show rate ++ " Hz")
+    withPwCatPair recArgs playArgs body
   where
-    cleanup (mi, mo, _, ph) = do
+    common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
+    ignoreIO act = void (try act :: IO (Either SomeException ()))
+    cleanupProc (mi, mo, _, ph) = do
       mapM_ hClose mi
       mapM_ hClose mo
       terminateProcess ph

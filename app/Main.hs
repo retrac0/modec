@@ -8,6 +8,7 @@ import System.IO
 import Text.Printf (printf)
 
 import Modec.Detect
+import Modec.Pipewire (describeNodes, pwAudioNodes)
 import Modec.DSP
 import qualified Modec.Handshake as H
 import Modem
@@ -24,6 +25,7 @@ data Cmd
   | Probe FilePath
   | Detect FilePath
   | RunModem ModemOpts
+  | ListDevices
 
 channelP :: Parser Channel
 channelP =
@@ -41,6 +43,7 @@ cmdP = hsubparser
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
   <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
+  <> command "devices" (info (pure ListDevices) (progDesc "List the PipeWire audio devices usable with --pw-in / --pw-out"))
   )
   where
     decodeP = Decode <$> stdP <*> channelP
@@ -73,10 +76,16 @@ cmdP = hsubparser
       "v22" -> Just (Just H.V22)
       _ -> Nothing
     audioP =
-          flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> (AudioPipewire <$> optional (strOption (long "pw-target" <> metavar "ID" <> help "PipeWire node id (pw-cli ls Node) for capture and playback")) <*> switch (long "pw-monitor" <> help "capture the playback sink's monitor instead of a source (hear and receive your own tones)"))
+          flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> pipewireP
       <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")
       <|> AudioSipLoop <$> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> help "PipeWire loopback pair for a softphone (nodes PREFIX-to-sip / PREFIX-line and sip-to-PREFIX / PREFIX-sip-line)")
       <|> flag' AudioStdio (long "audio-stdio" <> help "raw s16le mono audio on stdin/stdout")
+    pipewireP = mkPw
+      <$> optional (strOption (long "pw-in" <> metavar "DEV" <> help "capture device: node id, name, or part of either (see: modec devices)"))
+      <*> optional (strOption (long "pw-out" <> metavar "DEV" <> help "playback device: node id, name, or part of either"))
+      <*> optional (strOption (long "pw-target" <> metavar "DEV" <> help "shorthand setting both --pw-in and --pw-out"))
+      <*> switch (long "pw-monitor" <> help "capture the output's monitor instead of an input (hear and receive your own tones)")
+    mkPw i o both mon = AudioPipewire (maybe both Just i) (maybe both Just o) mon
     dataP =
           DataListen <$> option auto (long "listen" <> metavar "PORT" <> help "telnet server")
       <|> (DataConnect <$> strOption (long "connect" <> metavar "HOST") <*> option auto (long "port" <> metavar "PORT" <> value 23))
@@ -117,6 +126,11 @@ main = do
       let spec = specFor std (if ch == Auto then Originate else ch)
           fs = fromIntegral rate
       writeWav16Mono out rate (encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes))
+    ListDevices -> do
+      ns <- pwAudioNodes
+      if null ns
+        then putStrLn "no PipeWire audio devices found (is pipewire running, and is pw-dump installed?)"
+        else putStr (describeNodes ns)
     RunModem mo -> runModem mo
     Detect path -> do
       w <- readWav path

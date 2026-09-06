@@ -28,6 +28,8 @@ import Modec.V8bis
 import Modec.Hayes
 import Modec.Dtmf
 import Modec.Baresip
+import Modec.Json
+import Modec.Pipewire
 import Data.Bits (testBit, xor)
 import Modec.Stream
 import Modec.FSK
@@ -540,7 +542,46 @@ baresipTests = testGroup "baresip control protocol and SIP line"
       assertEqual "no answer" [SipToDte EvNoAnswer] a2
   ]
 
+pipewireTests :: TestTree
+pipewireTests = testGroup "PipeWire device discovery"
+  [ testCase "parse pw-dump Node output" $
+      assertEqual "nodes" expected (parseNodes dump)
+  , testCase "match by node id" $
+      assertEqual "id 56" (Unique (nodes !! 1)) (matchNode "56" nodes)
+  , testCase "match by exact node name and description" $ do
+      assertEqual "name" (Unique (head nodes)) (matchNode "alsa_output.pci-0000_00_1f.3.analog-stereo" nodes)
+      assertEqual "description" (Unique (nodes !! 2)) (matchNode "USB Audio" nodes)
+  , testCase "match by case-insensitive substring" $
+      assertEqual "usb" (Unique (nodes !! 2)) (matchNode "usb" nodes)
+  , testCase "an ambiguous substring is refused, not guessed" $
+      assertEqual "analog" (Ambiguous [head nodes, nodes !! 1]) (matchNode "ANALOG" nodes)
+  , testCase "no match" $
+      assertEqual "nothing" NoMatch (matchNode "hdmi" nodes)
+  , testCase "unknown ids and malformed input do not throw" $ do
+      assertEqual "id" NoMatch (matchNode "999" nodes)
+      assertEqual "garbage" [] (parseNodes (BC.pack "not json"))
+      assertEqual "empty" [] (parseNodes (BC.pack "[]"))
+  ]
+  where
+    dump = BC.pack (concat
+      [ "[ {\"id\": 52, \"type\": \"PipeWire:Interface:Node\", \"info\": { \"props\": {"
+      , " \"node.name\": \"alsa_output.pci-0000_00_1f.3.analog-stereo\","
+      , " \"node.description\": \"Built-in Audio Analog Stereo\", \"media.class\": \"Audio/Sink\" } } },"
+      , " {\"id\": 56, \"info\": { \"props\": {"
+      , " \"node.name\": \"alsa_input.pci-0000_00_1f.3.analog-stereo\","
+      , " \"node.description\": \"Built-in Audio Analog Stereo\", \"media.class\": \"Audio/Source\" } } },"
+      , " {\"id\": 61, \"info\": { \"props\": {"
+      , " \"node.name\": \"alsa_input.usb-Focusrite\", \"node.description\": \"USB Audio\","
+      , " \"media.class\": \"Audio/Source\" } } },"
+      , " {\"id\": 29, \"info\": { \"props\": { \"node.name\": \"Dummy-Driver\" } } } ]" ])
+    expected =
+      [ PwNode 52 "alsa_output.pci-0000_00_1f.3.analog-stereo" "Built-in Audio Analog Stereo" PwSink
+      , PwNode 56 "alsa_input.pci-0000_00_1f.3.analog-stereo" "Built-in Audio Analog Stereo" PwSource
+      , PwNode 61 "alsa_input.usb-Focusrite" "USB Audio" PwSource
+      , PwNode 29 "Dummy-Driver" "" (PwOther "") ]
+    nodes = take 3 expected
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests, pipewireTests])

@@ -28,9 +28,12 @@ library
                       Modec.V8bis
                       Modec.Hayes
                       Modec.Dtmf
+                      Modec.Json
                       Modec.Baresip
+                      Modec.Pipewire
     build-depends:    base ^>=4.18,
                       bytestring,
+                      process,
                       vector
     hs-source-dirs:   src
     default-language: Haskell2010

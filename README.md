@@ -7,8 +7,9 @@ establishment.
 
 See [SURVEY.md](SURVEY.md) for the survey of existing work and the design
 plan, [docs/line-interface.md](docs/line-interface.md) for hooking a real
-modem to a sound card, and [docs/sip-options.md](docs/sip-options.md) for
-the VoIP/SIP plan.
+modem to a sound card, [docs/sip-options.md](docs/sip-options.md) for the
+VoIP/SIP plan, and [docs/recordings/](docs/recordings/) for recorded
+handshakes with an annotated timeline.
 
 ## Status
 
@@ -101,6 +102,7 @@ cabal test
 cabal run modec -- decode test/fixtures/bell103_ans_8k.wav       # auto channel
 cabal run modec -- decode --originate --v21 file.wav
 printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
+cabal run modec -- devices                                        # PipeWire audio devices
 cabal run modec -- probe recording.wav                            # tone energies
 cabal run modec -- detect recording.wav                           # which standard, tone runs
 cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep (also v21, v22low/high, v22bislow/high)
@@ -123,12 +125,17 @@ cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example 
 scripts/smoke-sip.sh
 ```
 
-With `--audio-pipewire` the default PipeWire source and sink are used.
-On a machine with no capture device modec records the playback monitor
-instead (it says so on startup), so the modem hears its own tones and you
-hear them too; `--pw-monitor` forces that mode. To pick a specific device,
-pass its numeric node id from `pw-cli ls Node` as `--pw-target 52`, since
-pw-cat does not accept node names. To play with it live from a terminal:
+With `--audio-pipewire` the PipeWire defaults are used. `modec devices`
+lists what is available, and `--pw-in` / `--pw-out` select an input and an
+output independently by node id, node name, or any unambiguous part of
+either (`--pw-in usb --pw-out analog`); `--pw-target` sets both at once.
+An unknown or ambiguous name is refused with a listing rather than
+guessed. On a machine with no capture device modec records the playback
+monitor instead and says so, which lets the modem hear its own tones;
+`--pw-monitor` forces that mode. If the capture stream stops (device
+unplugged, pw-cat killed) the modem reports NO CARRIER, restarts the
+audio and carries on, giving up after three attempts. To play with it
+live from a terminal:
 
 ```
 cabal run modec -- modem --hayes --audio-pipewire --pw-monitor --data-stdio
