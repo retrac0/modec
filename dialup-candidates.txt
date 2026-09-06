@@ -91,24 +91,211 @@ NetZero, Juno and MSN also still sell dial-up; their access numbers are
 behind a signup and were not collected.
 
 
-4. FidoNet nodelist
---------------------
+4. FidoNet nodelist -- surveyed
+--------------------------------
 
-The weekly nodelist carries the phone number, location and modem
-capability flags of every node in the network, which makes it the largest
-structured source of dial-up numbers that still exists. It could not be
-downloaded from here: filegate.net does not respond, and
-nodelist.fidonet.cc is behind a security interstitial. nodehist.fidonet.org.ua
-is reachable and holds nodelists up to 2026-09-06 but exposes them only
-through a per-node search form.
+nodelist.249 in the repository root is the Z2DAILY for Sunday
+6 September 2026. 1233 entries: 391 in zone 1 (North America), 759 in
+zone 2 (Europe), 39 in zone 3, 44 in zone 4. Zones 3 and 4 publish no
+telephone number at all. Zone 2 publishes 107 and is set aside here.
 
-Worth noting before spending effort on it: most surviving FidoNet nodes
-are IP-only, and the ones with real phone numbers are private mail
-systems rather than public-access services. Their modems answer, but
-nobody invited us.
+Zone 1 publishes 35 node entries, which collapse to 20 distinct numbers:
+coordinators, gateways and hubs routinely list the same sysop's line
+under several node numbers.
+
+Four of the twenty are already in bbslist.txt, and the nodelist has all
+four exactly right -- Dark Realms 647-847-2083, Phoenix BBS
+860-446-6118, Sursum Corda 256-895-4786, Moe's Tavern 502-875-8938.
+Four for four is the useful part: the phone field is being maintained
+rather than left to rot, so the other sixteen are worth dialling.
+
+None of the twenty is flagged Down, Hold or Pvt.
+
+Nodes reachable only by telephone -- no INA, IBN, IFC or ITN flag of any
+kind, so a modem is the only way in and the line has to be live for the
+node to still be in the list:
+
+    1-703-777-8383  Leesburg VA      Lincoln Legacy         HST V32B V42B
+    1-817-489-5063  Fort Worth TX    The Black Knights BBS  V32B V34 VFC V42B
+    1-301-949-5764  Wheaton MD       The Idea Link (+2)     V32B V42
+    1-703-310-7439  Vienna VA        bbs.cyberchatnet.com   V32B V42
+
+These four are the strongest candidates in this whole document. Lincoln
+Legacy's HST flag means a USR Courier at the far end, which is the modem
+modec has the most to learn from: it answers HST, V.32bis, V.22bis,
+V.22, V.23, V.21 and Bell 103/212A depending on what it hears.
+
+Nodes with both modem flags and an internet address -- the mailer traffic
+goes over IP now, but the modem is still advertised:
+
+    1-780-439-8364  Edmonton AB      Xanadu BBS             V32B V34 VFC V42B
+    1-587-754-2760  Edmonton AB      Joes BBS               V34 V42B
+    1-757-481-6611  Laurel MD        Eagle's Dare (+2)      V32B V34 V42B
+    1-412-342-5891  Pittsburgh PA    The Oracle BBS         V32B V34
+    1-623-907-2858  Phoenix AZ       The Realm of Darkness  V32B V42B
+    1-209-785-4189  Copperopolis CA  The Wastelands BBS     V34 VFC V42B
+    1-559-429-8280  Visalia CA       US 99 BBS              V32B
+
+Nodes that publish a number but no modem capability flags at all. The
+number may be a voice line or a leftover; lowest priority:
+
+    1-201-601-4011  Old Bridge NJ    ASCIIattic
+    1-724-552-9698  New Derry PA     The Titantic BBS
+    1-931-494-9100  Franklin WI      Reign Of Fire BBS
+    1-936-333-6077  Houston TX       InterMail Help
+    1-484-784-9994  Coatesville PA   Pioneer's Station      MO
+
+Two notes on that last group. Reign of Fire is already in bbslist.txt at
+423-541-8271, where it answered and connected at V.22; 931-494-9100 is a
+second line for the same board, so it is a same-system comparison rather
+than a new one. Pioneer's Station carries MO, mail only: it will answer
+and handshake but there is no human side to it, so it is a handshake
+sample and nothing else.
+
+Where an entry above shows 300 in the nodelist baud field it is the
+nodelist default left untouched by a sysop whose node is IP-only; it is
+not a claim of 300 bit/s service.
+
+On V.21: every modem flagged here is V.32bis or later, and boxes of that
+generation -- Courier, ZyXEL, Supra -- carry the full ITU set including
+V.21, so this is the first realistic chance to exercise modec's V.21 half
+in North America. The catch is which end picks. A US-firmware modem
+answering defaults to Bell 103 (ATB1) and only answers V.21 tones when
+the sysop has set ATB0 or a non-US country profile. So originate V.21,
+expect a Bell 103 answer as the ordinary outcome, and treat any board
+that comes back at 1650/1850 Hz as the find.
 
 
-5. Dead ends
+5. BBSes the guide's dial-up list misses
+-----------------------------------------
+
+The twenty-six systems in section 1 are everything the Telnet BBS Guide
+tags as Dial-Up. That tag is not a census of the guide: Magnum BBS and
+Dial Up Nights both publish dial-in numbers in their own listings and
+appear in neither the brief nor the detail dial-up list. Everything below
+was found outside that tag.
+
+Magnum BBS -- Synchronet, 16 nodes, guide entry last verified 5/2026:
+
+    +44 1484 280168    Huddersfield UK, line 1
+    +44 1484 320007    Huddersfield UK, lines 2-6
+    +44 208 077 3185   London UK
+    +44 131 516 2430   Edinburgh UK
+    +44 56 0023 3132   sipgate UK
+    +46 81 211 1814    Stockholm
+    +48 22 266 2296    Warsaw
+    +61 2 8880 0290    Sydney
+    +64 9 977 9964     Auckland
+    +1 647 498 6669    Toronto
+    +1 415 839 5099    San Francisco
+    +1 773 541 4390    Chicago
+    +1 917 391 2777    New York
+
+End Of The Line publishes the same thirteen numbers as gateway lines --
+dial any one, log in as "eotl" -- so this is one modem bank sitting in
+front of at least two systems, not thirteen systems. That is what makes
+it worth calling: we already have End Of The Line at V.22 on
++14692003550, so the same far-end modems can be reached over thirteen
+different international paths. Any difference in what connects is the
+transport talking, not the modem. It also has a direct UK line:
+
+    End Of The Line     +44 330 117 1548    UK local rate
+
+Dial Up Nights
+
+    +44 20 8363 3637
+
+Dial-up only -- no telnet -- running Max's BBS on MorphOS 3.12 on a
+PowerBook, and the sysop says it is on a real copper line rather than
+VoIP. Open 21:00-06:00 UK time on weekdays, 24 hours at weekends. If the
+copper claim holds it is the only candidate anywhere on this list whose
+far end is not behind an ATA, which makes it the reference against which
+every VoIP-side impairment we have been chasing can be measured.
+
+BlackICE BBS -- Mystic, Duesseldorf, 18 nodes:
+
+    +49 2137 9350250    Germany
+    +41 52 508 0256     Switzerland
+
+Advertised as 19k2 on ZyXEL modems.
+
+BLUP BBS
+
+    +49 209 38143       Gelsenkirchen, 2400-64000, ISDN/V.34
+
+Online since 1995; the sysop posted on 2 February 2026 that the box had
+already logged 90 successful connections in the first month of 2026. That
+is the strongest evidence of a live line anywhere in this survey -- not a
+listing, a call count.
+
+Elektron BBS -- Leipzig, NCBMail on Debian, USR Couriers:
+
+    +49 341 4410686     analogue
+    +49 341 4411747     ISDN/V.90
+
+
+6. Boards that still run at 300 bit/s
+--------------------------------------
+
+modec implements V.21 (v21Channel1/v21Channel2 in Standards.hs) and has
+never once used it against a real system: every 300 bit/s connection in
+bbslist.txt is Bell 103, because every system in it is North American.
+These three are European boards that advertise 300 bit/s, so they should
+answer with V.21's 1650/1850 Hz pair, and they are the only way to find
+out whether that half of the FSK code works outside the bench.
+
+    300 baud-BBS      +49 39424 940818    300/8/N/1, TTY
+    SnobSoft BBS      +49 40 609 43485    300 baud, 7N1, ASCII
+    TECS Hamburg      +49 40 6441 3888
+
+300 baud-BBS is run by the efb-1 computer museum specifically so that
+people can point acoustic couplers at something. The software is IBBS, a
+BASIC board from 1982; file transfer is disabled; there is no compression
+and no error correction, which is exactly what we want -- nothing between
+our demodulator and the bytes. Its page was updated 11/2024 with a log of
+the hardware callers have used, so the sysop is still reading the board.
+It is the closest thing to a second oracle after NIST ACTS: not a known
+plaintext, but a known-slow, known-plain line.
+
+It is V.21, said in as many words on the museum's own page: "Eine 300 bps
+- V.21 Verbindung kann zwar fast jedes Modem herstellen, hat aber weder
+Datenkompression noch Fehlerkorrektur." Nothing on the page mentions Bell
+103, and a German-firmware modem answering a German board would not offer
+it, so this is a pure V.21 target: we originate on channel 1 (980/1180)
+and it answers on channel 2 (1650/1850). That makes it the one number in
+this document that tests a code path bbslist.txt has never touched.
+
+One thing to fix before dialling it: the sweep decided a line had picked
+up by listening for 2100 Hz or 2225 Hz, and a board that answers V.21
+without sending ANS first sends neither. Its channel 2 mark idles at
+1650 Hz, so that frequency is now in AnswerWatch.FREQS in bbs-sweep.py;
+without it this call would have been scored as no answer whatever came
+back.
+
+SnobSoft is a Commodore 64 board in Hamburg. A caller reached it from
+Australia at 300 baud over VoIP on both ends in November 2025, which
+settles the question of whether 300 bit/s survives two ATAs and 13000 km.
+
+TECS has been reached with an acoustic coupler at 300 baud and also
+answers faster modes.
+
+
+7. North American systems outside the dial-up tag
+--------------------------------------------------
+
+    Vertrauen        951-549-9994    Riverside CA, Synchronet via SEXPOTS
+
+Vertrauen is the Synchronet home system. The number is real but the
+announcement of it is from June 2007 and nothing since confirms the line;
+treat it as one speculative call, not a listing.
+
+Level 29 (916-965-1701) is still advertised on its own site as 300, 1200
+and 2400 bit/s, and was still being recommended in a November 2024
+round-up, yet it never answered any of our calls. Worth one retry
+originating in Bell 103 rather than V.22 before writing it off.
+
+
+8. Dead ends
 -------------
 
 The textfiles.com BBS list is an archive of numbers from the 1980s and
@@ -116,3 +303,25 @@ The textfiles.com BBS list is an archive of numbers from the 1980s and
 
 817-844-6611 (Fort Worth time and temperature) and similar time lines are
 voice announcers, not modems.
+
+300baud.dev is a browser simulation of a Bell 103 board. Its numbers
+(702-555-01xx) are fiction and there is no server behind them.
+
+The 8-Bit Boyz BBS directory claims to cover dial-up but lists telnet
+addresses only.
+
+The European BBS List (ytm5.bplaced.net/european-bbslist), linked from
+several German forums as the continental equivalent of the Telnet BBS
+Guide, is dead: the live site returns a PHP fatal error on an undefined
+mysql_connect, and the January 2025 Wayback snapshot captures only the
+country menu, not the records behind it.
+
+Elektron BBS also publishes a German mailbox list, but it was last
+touched in December 2009. Its two other entries -- BodySnatcher BBS
+0511-2708643 and PBSOUND HQ 030-47300910 -- are seventeen years stale and
+should be treated as archaeology unless something else corroborates them.
+
+nodelist.fidonet.cc now does publish downloadable nodelists covering
+2026, but it is still unreachable from this machine: plain HTTP is
+intercepted by a safebrowse interstitial and HTTPS fails the handshake
+outright. The Z2DAILY surveyed in section 4 was fetched by hand instead.

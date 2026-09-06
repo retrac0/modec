@@ -71,6 +71,34 @@ KEEP BBS:
 
 No V.8 menu at all: C64 Pub, Dark Realms, Last Telegraph Office, Never Never Land, Particles BBS, Sursum Corda, TuxedoCat Lounge.
 
+V.21 was attempted against the seven boards whose V.8 menu listed it,
+originating on channel 1 (980/1180 Hz) with no V.8. Four answered in
+V.21 and passed a banner:
+
+    Digital Distortion    CONNECT 300, full Synchronet banner
+    End Of The Line       CONNECT 300, banner offering Terminal or Viewdata
+    ENiAC 2.0             CONNECT 300, ANSI banner
+    Reign of Fire         CONNECT 300, carrier up, no banner before hangup
+
+Basement BBS and Phoenix BBS answered and never put a carrier up against
+V.21 tones; Kludge BBS did not answer at all. So a menu listing V.21 is a
+statement about the modem's capability, not a promise that its answer
+side is configured for it -- which is what a US-firmware modem left on
+ATB1 looks like from the outside.
+
+V.23 duplex was tried against End Of The Line, the one board that offers
+viewdata and lists V.23 duplex in its V.8 menu. Offered under V.8 it was
+accepted -- the JM came back "data, V.23 duplex" -- and then nothing
+followed: the far end went silent after CJ and never put up a forward
+carrier. Offered without V.8 it walked its ordinary ladder instead,
+2250 Hz unscrambled binary 1 for three seconds and then V.21 channel 2,
+with no 1300 Hz rung anywhere in it. So the menu entry is the modem's
+capability list rather than its answer ladder, and the board's Viewdata
+option is a terminal mode reached over an ordinary connection, not a V.23
+line. V.23 duplex works end to end in the simulator; it has yet to be
+confirmed against a real board, and the boards that would answer it are
+European.
+
 Bell 212A was attempted against twelve of these and connected with
 none. Their fallback ladder runs ANSam, then V.22's 2250 Hz
 unscrambled binary 1, with a Bell 103 rung below it on some; the

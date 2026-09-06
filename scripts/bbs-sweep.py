@@ -43,6 +43,11 @@ CONFIGS = {
     "bell212a":    ["--modes", "bell212a"],
     "v21":         ["--modes", "v21"],
     "v21-v8":      ["--modes", "v21", "--v8"],
+    # V.23 duplex: we send 75 bit/s and receive 1200, so a banner arrives
+    # in a quarter of the time a V.21 one does and anything typed back
+    # crawls.  Boards that offer viewdata answer this.
+    "v23":         ["--modes", "v23"],
+    "v23-v8":      ["--modes", "v23", "--v8"],
     "bell103":     ["--modes", "bell103"],
     "auto":        [],
     "auto-v8":     ["--v8"],
@@ -69,8 +74,13 @@ class AnswerWatch:
     (2100 Hz) or the Bell one (2225 Hz) standing well above everything
     else.  Ringback is around 400-500 Hz and fails the test, which is the
     whole point: a ringing line is not an occupied one.
+
+    1650 Hz is here for the V.21-only boards: an answering modem that
+    sends no ANS at all still has to idle at its channel 2 mark, and
+    without this the sweep would score such a board as never having
+    picked up.
     """
-    FREQS = (2100.0, 2225.0)
+    FREQS = (2100.0, 2225.0, 1650.0)
     FS = 8000
     FRAME = 320                       # 40 ms
     NEEDED = 8                        # 0.32 s of tone
