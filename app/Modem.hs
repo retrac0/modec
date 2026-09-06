@@ -35,6 +35,7 @@ import Modec.Baresip
 import Modec.Dtmf
 import Modec.Hayes
 import Modec.Modem
+import Modec.Mnp (MnpEvent (..))
 import Modec.Pipewire
 import Modec.V8 (describeMenu)
 import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
@@ -73,6 +74,7 @@ data ModemOpts = ModemOpts
   , moNoV8bis  :: Bool
   , moV8       :: Bool
   , moV8All    :: Bool
+  , moMaxEvm   :: Double
   , moHayes    :: Bool
   , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
   , moSipDomain :: String
@@ -97,7 +99,7 @@ runModem o = do
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       cfg0 = defaultModemConfig fs (moRole o) (moModes o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
   when (moNoHandshake o && length (moModes o) /= 1) $ do
     logMsg "--no-handshake needs exactly one mode, e.g. --standard v22"
     exitFailure
@@ -152,7 +154,7 @@ runModem o = do
             _ -> Nothing
           cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
-                              , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+                              , mcMaxEvm = moMaxEvm o, mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
           traceStep st st' = when trace $ do
             k <- readIORef blockRef
             writeIORef blockRef (k + 1)
@@ -163,6 +165,10 @@ runModem o = do
             EvDropped -> logMsg "NO CARRIER"
             EvFailed why -> logMsg ("connection failed: " ++ why)
             EvV8Menu m -> logMsg ("V.8 far end offers: " ++ describeMenu m)
+            EvMnp (MnpUp cls k n401) ->
+              logMsg ("MNP class " ++ show cls ++ ", " ++ show k ++ " outstanding frames, N401 " ++ show n401)
+            EvMnp MnpTransparentFallback -> logMsg "no error correction: the far end did not answer"
+            EvMnp (MnpDown why) -> logMsg ("MNP link down: " ++ why)
       if not (moHayes o) && sip == Nothing
         then do
           -- plain mode: one call in the configured role, then exit
@@ -301,8 +307,11 @@ runModem o = do
                             EvDropped -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
                             EvFailed _ -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
                             -- reported to the log by `report`; the DTE
-                            -- has no Hayes result code for a V.8 menu
+                            -- has no Hayes result code for a V.8 menu,
+                            -- and none for the error-correcting protocol
+                            -- either until the CONNECT message carries it
                             EvV8Menu _ -> return ()
+                            EvMnp _ -> return ()
                     modifyIORef' blockRef (+ 1)
                     loop
           loop `finally` closeRecordings

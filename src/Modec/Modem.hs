@@ -15,6 +15,11 @@ module Modec.Modem
   , modemConnected
   , modemTxCmd
   , modemV22Rx
+  , modemMnp
+    -- * Link properties, for the error-correcting protocol
+  , linkBitRate
+  , linkSyncable
+  , mnpRoleOf
     -- * Transmitter
   , TxState
   , txInit
@@ -22,6 +27,7 @@ module Modec.Modem
   ) where
 
 import qualified Data.Vector.Storable as VS
+import Data.Maybe (isJust)
 import Data.Word (Word8)
 
 import Modec.Async
@@ -33,6 +39,7 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.Hdlc
+import Modec.Mnp
 import Modec.V8
 
 data ModemConfig = ModemConfig
@@ -44,6 +51,8 @@ data ModemConfig = ModemConfig
   , mcTxAmp     :: Double
   , mcSettle    :: Double        -- ^ seconds of idle mark after CONNECT before data flows
   , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
+  , mcMnp       :: Maybe MnpConfig  -- ^ MNP error correction; 'Nothing' passes bytes straight through
+  , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
 -- | @modes@ lists the standards the modem may negotiate, best first.
@@ -57,6 +66,8 @@ defaultModemConfig fs role modes = ModemConfig
   , mcTxAmp = 0.5
   , mcSettle = 0.6
   , mcGuardTone = False
+  , mcMnp = Nothing
+  , mcMaxEvm = 1.0
   }
 
 data ModemEvent
@@ -64,6 +75,7 @@ data ModemEvent
   | EvDropped
   | EvFailed String
   | EvV8Menu V8Menu        -- ^ the far end's V.8 capabilities
+  | EvMnp MnpEvent         -- ^ the error-correcting protocol's state
   deriving (Eq, Show)
 
 -- | Streaming transmitter: phase-continuous tones, FSK with a byte
@@ -180,13 +192,17 @@ data ModemState = ModemState
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
   , msSettled :: !Double     -- ^ seconds spent in data mode so far
   , msStatus  :: HsStatus
+  , msDte     :: [Word8]     -- ^ terminal bytes the protocol layer has not taken yet
+  , msMnp     :: Maybe MnpState
+  , msTxBits  :: [Bool]      -- ^ synchronous line bits waiting for the transmitter
   }
 
 modemInit :: ModemConfig -> ModemState
 modemInit cfg
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
-      in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link }
+      in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
+              , msMnp = mnpFor cfg link }
   | otherwise = base
   where
     hs = mcHandshake cfg
@@ -194,9 +210,55 @@ modemInit cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
              (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200 0 0 0 HsBusy
+             [] Nothing []
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
+
+-- | The line rate of an established link, for the protocol layer's timers.
+linkBitRate :: Link -> Double
+linkBitRate (FskLink tx _) = fskBaud tx
+linkBitRate (V22Link _ _ R1200) = 1200
+linkBitRate (V22Link _ _ R2400) = 2400
+
+-- | Whether the link can carry bit-oriented framing.  Only the V.22 data
+-- pump can: dropping the start and stop bits at 300 bit/s would buy 20 %
+-- of thirty characters a second, and the FSK link is noise limited rather
+-- than framing limited anyway.
+linkSyncable :: Link -> Bool
+linkSyncable V22Link {} = True
+linkSyncable FskLink {} = False
+
+-- | Which end starts the protocol.  This reads the established link, not
+-- the configured role: a V.8bis mode select reverses the two before the
+-- data pump ever starts, and the station transmitting on the calling
+-- side's channel is the one that sends the first link request.
+mnpRoleOf :: Link -> MnpRole
+mnpRoleOf (V22Link LowChannel _ _) = MnpInitiator
+mnpRoleOf (V22Link HighChannel _ _) = MnpResponder
+mnpRoleOf (FskLink tx _)
+  | fskName tx `elem` [fskName bell103Originate, fskName v21Channel1] = MnpInitiator
+  | otherwise = MnpResponder
+
+-- | Start the protocol layer for a link, if the configuration asks for it.
+-- The rate and whether synchronous framing is possible are properties of
+-- the link, so they are filled in here rather than by the caller.
+mnpFor :: ModemConfig -> Link -> Maybe MnpState
+mnpFor cfg link = case mcMnp cfg of
+  Nothing -> Nothing
+  Just _ -> Just (mnpInit (mnpConfFor cfg link) (mnpRoleOf link))
+
+-- | The configuration the protocol layer runs under on this link.
+mnpConfFor :: ModemConfig -> Link -> MnpConfig
+mnpConfFor cfg link = case mcMnp cfg of
+  Nothing -> defaultMnpConfig (linkBitRate link) False
+  Just tmpl -> tmpl { mnBitRate = linkBitRate link
+                    , mnSyncable = mnSyncable tmpl && linkSyncable link }
+
+-- | Octets still waiting to go on the line, across both transmitters.
+txPending :: TxState -> Int
+txPending st = length (txQueue st) + v22TxPending (txV22 st) + (length (txBits st) + 7) `div` 8
+
 
 dataCmd :: Link -> TxCmd
 dataCmd (FskLink tx _) = TxData tx
@@ -214,6 +276,10 @@ modemStatus = msStatus
 modemTxCmd :: ModemState -> TxCmd
 modemTxCmd = msTxCmd
 
+-- | The error-correcting protocol's state, for tracing.
+modemMnp :: ModemState -> Maybe MnpState
+modemMnp = msMnp
+
 -- | The V.22 receiver state and its decision rate (for tracing).
 modemV22Rx :: ModemState -> (Maybe (V22Channel, V22RxState), Rate)
 modemV22Rx st = (msV22Rx st, msRxRate st)
@@ -228,7 +294,11 @@ modemConnected st = case msMode st of
 -- the audio to transmit (same length), received bytes and events.
 modemStep :: ModemConfig -> ModemState -> Signal -> [Word8] -> (ModemState, Signal, [Word8], [ModemEvent])
 modemStep cfg st0 rxBlock newBytes =
-  let st = st0 { msTx = (msTx st0) { txQueue = txQueue (msTx st0) ++ newBytes } }
+  let st = case mcMnp cfg of
+        Nothing -> st0 { msTx = (msTx st0) { txQueue = txQueue (msTx st0) ++ newBytes } }
+        -- with error correction the terminal's bytes belong to the
+        -- protocol layer, which decides when they go on the line
+        Just _ -> st0 { msDte = msDte st0 ++ newBytes }
       fs = mcRate cfg
       n = VS.length rxBlock
       hs = mcHandshake cfg
@@ -291,7 +361,8 @@ modemStep cfg st0 rxBlock newBytes =
              let mode = case link of
                    FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
                    V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
-                 st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0 }
+                 st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0
+                           , msMnp = mnpFor cfg link }
                  (txSt, audio) = transmit (markCmd link) st2
              in (st2 { msTx = txSt }, audio, [], v8Menus ++ [EvConnected s link])
            HsFailed why ->
@@ -305,29 +376,71 @@ modemStep cfg st0 rxBlock newBytes =
       let (disc', d) = stepStage disc rxBlock
           (framer', bytes) = stepStage framer d
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
-      in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) bytes
+      in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) (LineOctets bytes)
     DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
             Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)
             Nothing -> v22RxBlock fs rx rxBlock (v22RxSetRate rate (v22RxInit fs))
           -- frame nothing until the receiver has locked and seen idle mark,
           -- otherwise the start-up bits produce junk characters
-          armed' = armed || roOnesRun o >= 16
-          (framer', bytes) = if armed then asyncRxBits framer (roBits o) else (framer, [])
+          -- Locking once is not enough.  The receiver's own error measure
+          -- sits near 0.01 on a good link and still only 0.35 at 20 dB
+          -- SNR, where 97% of the text comes through; but while it is
+          -- still converging after CONNECT, and again while a carrier is
+          -- collapsing because the far end hung up, it runs from 1 to
+          -- over 100, and every bit handed over in that state is noise.
+          -- A modem that passes on characters its own receiver knows are
+          -- worthless is worse than one that passes none, because nothing
+          -- downstream can tell the difference.
+          trust = rxEvmEstimate rxSt' < mcMaxEvm cfg
+          armed' = armed || (roOnesRun o >= 16 && trust)
+          (framer', bytes) = if armed && trust then asyncRxBits framer (roBits o) else (framer, [])
           st1 = st { msV22Rx = Just (rx, rxSt'), msRxRate = rate }
-      in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) bytes
+      in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) (LineOctets bytes)
   where
     -- common tail of the data modes: carrier watchdog, settle time, transmit
-    finishData st mode link present bytes =
+    finishData st mode link present line =
       let fs = mcRate cfg
           n = VS.length rxBlock
           blockSec = fromIntegral n / fs
           hs = mcHandshake cfg
           lost = if present then 0 else msLost st + blockSec
           settled = msSettled st + blockSec
+
+          -- The protocol layer runs only after the settle window.  Before
+          -- it the transmitter is still sending idle mark, which would
+          -- swallow a link request, and the far end's start-stop framer
+          -- may not have armed yet.
+          ran = settled >= mcSettle cfg
+          (mnp', toLine, toDte, mnpEvs) = case msMnp st of
+            Just m | ran ->
+              let (m', o) = mnpStep (mnpConfFor cfg link) m MnpIn
+                    { miDt = blockSec, miLine = line, miDte = msDte st
+                    , miTxPending = txPending (msTx st), miDteReady = maxBound }
+              in (Just m', moLine o, moDte o, moEvents o)
+            Just m -> (Just m, OutOctets [], [], [])
+            Nothing -> (Nothing, OutOctets [], lineOctets line, [])
+
+          tx0 = msTx st
+          tx1 = case toLine of
+            OutOctets bs -> tx0 { txQueue = txQueue tx0 ++ bs }
+            OutBits _ -> tx0
+          bits1 = case toLine of
+            OutBits bs -> msTxBits st ++ bs
+            OutOctets _ -> msTxBits st
+
           cmd = if settled < mcSettle cfg then markCmd link else dataCmd link
-          (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n (msTx st)
-          st1 = st { msMode = mode, msTx = txSt, msLost = lost, msSettled = settled }
-      in if lost > hcDrop hs
-           then (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }, VS.replicate n 0, bytes, [EvDropped])
-           else (st1, audio, bytes, [])
+          (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n tx1
+          st1 = st { msMode = mode, msTx = txSt, msLost = lost, msSettled = settled
+                   , msMnp = mnp', msTxBits = bits1
+                   , msDte = if isJust (msMnp st) && ran then [] else msDte st }
+          evs = map EvMnp mnpEvs
+          -- a disconnected error-correcting link is a dead data path, so
+          -- it ends the call the same way a lost carrier does
+          fatal = any (\e -> case e of { MnpDown _ -> True; _ -> False }) mnpEvs
+      in if lost > hcDrop hs || fatal
+           then (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }, VS.replicate n 0, toDte, evs ++ [EvDropped])
+           else (st1, audio, toDte, evs)
+
+    lineOctets (LineOctets os) = os
+    lineOctets (LineBits _) = []

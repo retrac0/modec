@@ -59,6 +59,7 @@ module Modec.V22
   , v22RxRun
   , rrcTaps
   , txBitsOf
+  , v22TxPending
   , withBits
   ) where
 
@@ -170,6 +171,13 @@ data V22TxState = V22TxState
 
 v22TxInit :: V22TxState
 v22TxInit = V22TxState 0 0 [] 0 0 False [] [] 0 0
+
+-- | Octets still waiting to go on the line: queued bytes plus whatever
+-- part of the current character has not been shifted out yet.  A protocol
+-- layer above uses this to pace itself, so that a retransmission timer
+-- measures the far end's silence rather than our own backlog.
+v22TxPending :: V22TxState -> Int
+v22TxPending st = length (txQueue st) + (length (txBits st) + 7) `div` 8
 
 -- | Generate @n@ samples.  @guard@ adds the 1800 Hz guard tone at -6 dB
 -- (high channel option).

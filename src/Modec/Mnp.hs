@@ -43,6 +43,7 @@ module Modec.Mnp
   , mnpInit
   , MnpPhase (..)
   , mnpPhase
+  , mnpRole
   , mnpFraming
   , mnpNegotiated
   , mnpTrace
@@ -254,6 +255,10 @@ mnpInit c role = MnpState
 
 mnpPhase :: MnpState -> MnpPhase
 mnpPhase = msPhase
+
+-- | Which end of the protocol this station is.
+mnpRole :: MnpState -> MnpRole
+mnpRole = msRole
 
 mnpFraming :: MnpState -> MnpFraming
 mnpFraming = msFraming

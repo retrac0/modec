@@ -284,7 +284,12 @@ detectTests = testGroup "detection" $
 -- | Two complete modems talking through attenuated, noisy audio in
 -- 20 ms blocks; text is queued on both sides once connected.
 modemDuplex :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
-modemDuplex cfgO cfgA snr textO textA maxT = go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False [] [] [] []
+modemDuplex cfgO cfgA snr textO textA maxT = modemDuplexCut cfgO cfgA snr textO textA maxT (maxT * 2)
+
+-- | As 'modemDuplex', but the answerer's audio stops at @cutAt@, the way
+-- a far end that hangs up stops.
+modemDuplexCut :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+modemDuplexCut cfgO cfgA snr textO textA maxT cutAt = go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False [] [] [] []
   where
     fs = mcRate cfgO
     blk = 160 :: Int
@@ -294,10 +299,95 @@ modemDuplex cfgO cfgA snr textO textA maxT = go 0 (modemInit cfgO) (modemInit cf
       | otherwise =
           let queueO = if modemConnected so && not sentO then textO else []
               queueA = if modemConnected sa && not sentA then textA else []
-              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t fromA) queueO
+              heard = if t >= cutAt then VS.replicate (VS.length fromA) 0 else fromA
+              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t heard) queueO
               (sa', audioA, bytesA, eA) = modemStep cfgA sa (impair 2 t fromO) queueA
           in go (t + fromIntegral blk / fs) so' sa' audioA audioO (sentO || not (null queueO)) (sentA || not (null queueA))
                 (reverse bytesO ++ rxO) (reverse bytesA ++ rxA) (reverse eO ++ evO) (reverse eA ++ evA)
+
+-- | Like 'modemDuplex', but each side is offered @perBlock@ bytes of its
+-- text on every block once connected, rather than the whole of it in one
+-- burst.  A protocol layer needs a continuous stream to exercise its
+-- window, and a burst larger than the window would simply sit in a buffer.
+modemDuplexStream :: ModemConfig -> ModemConfig -> Double -> Int
+                  -> [Word8] -> [Word8] -> Double
+                  -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+modemDuplexStream cfgO cfgA snr perBlock textO textA maxT =
+  go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0)
+     textO textA [] [] [] []
+  where
+    fs = mcRate cfgO
+    blk = 160 :: Int
+    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
+    go t so sa fromA fromO bufO bufA rxO rxA evO evA
+      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA)
+      | otherwise =
+          let (queueO, bufO') = if modemConnected so then splitAt perBlock bufO else ([], bufO)
+              (queueA, bufA') = if modemConnected sa then splitAt perBlock bufA else ([], bufA)
+              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t fromA) queueO
+              (sa', audioA, bytesA, eA) = modemStep cfgA sa (impair 2 t fromO) queueA
+          in go (t + fromIntegral blk / fs) so' sa' audioA audioO bufO' bufA'
+                (reverse bytesO ++ rxO) (reverse bytesA ++ rxA)
+                (reverse eO ++ evO) (reverse eA ++ evA)
+
+mnpModemTests :: TestTree
+mnpModemTests = testGroup "MNP over the data pump"
+  [ testCase "exactly one end of a link starts the protocol" $ do
+      -- V.8bis reverses the roles after negotiation, so this reads the
+      -- established link rather than the configured role.  Two initiators
+      -- or two responders would both be wrong.
+      forM_ [ (V22Link LowChannel HighChannel R1200, V22Link HighChannel LowChannel R1200)
+            , (V22Link HighChannel LowChannel R2400, V22Link LowChannel HighChannel R2400)
+            , (FskLink v21Channel1 v21Channel2, FskLink v21Channel2 v21Channel1)
+            , (FskLink bell103Originate bell103Answer, FskLink bell103Answer bell103Originate)
+            ] $ \(a, b) ->
+        assertBool ("roles for " ++ show (a, b))
+          (mnpRoleOf a /= mnpRoleOf b)
+  , testCase "only the V.22 links can carry synchronous framing" $ do
+      assertBool "V.22" (linkSyncable (V22Link LowChannel HighChannel R1200))
+      assertBool "FSK" (not (linkSyncable (FskLink v21Channel1 v21Channel2)))
+      assertEqual "1200" 1200 (linkBitRate (V22Link LowChannel HighChannel R1200))
+      assertEqual "2400" 2400 (linkBitRate (V22Link LowChannel HighChannel R2400))
+      assertEqual "300" 300 (linkBitRate (FskLink v21Channel1 v21Channel2))
+  , testCase "MNP corrects a link that is corrupting bytes" $ do
+      -- the same channel and the same seeds, run twice: once bare, once
+      -- with the protocol.  The bare run is the premise, so the test
+      -- cannot quietly pass on a link that was clean all along.
+      let payload = map (fromIntegral . (`mod` 251)) [1 .. 200 :: Int]
+          mnp = Just ((defaultMnpConfig 1200 False) { mnClass = 2, mnN401 = 16, mnK = 4 })
+          cfg m r = (defaultModemConfig 8000 r [V22]) { mcNoHandshake = True, mcMnp = m }
+          snr = 5
+          (rawO, rawA, _, _) =
+            modemDuplexStream (cfg Nothing Originate) (cfg Nothing Answer) snr 1 payload payload 12
+          (mnpO, mnpA, evO, evA) =
+            modemDuplexStream (cfg mnp Originate) (cfg mnp Answer) snr 1 payload payload 18
+      assertBool ("the bare link must be damaging bytes: "
+                  ++ show (byteErrorRate payload rawO, byteErrorRate payload rawA))
+        (byteErrorRate payload rawO > 0.01 && byteErrorRate payload rawA > 0.01)
+      assertBool ("originate saw the link come up: " ++ show evO) (any isMnpUp evO)
+      assertBool ("answer saw the link come up: " ++ show evA) (any isMnpUp evA)
+      assertEqual "answer to originate, corrected" payload mnpO
+      assertEqual "originate to answer, corrected" payload mnpA
+  , testCase "a full automode call carries the protocol through the role reversal" $ do
+      let text = map (fromIntegral . fromEnum) "The quick brown fox, 0123456789\r\n"
+          mnp = Just ((defaultMnpConfig 2400 False) { mnClass = 2, mnN401 = 16, mnK = 4 })
+          cfg r = (defaultModemConfig 8000 r allStandards) { mcMnp = mnp }
+          (rxO, rxA, evO, evA) = modemDuplexStream (cfg Originate) (cfg Answer) 30 1 text text 30
+      assertBool ("originate events " ++ show evO) (any isMnpUp evO)
+      assertBool ("answer events " ++ show evA) (any isMnpUp evA)
+      assertEqual "answer to originate" text rxO
+      assertEqual "originate to answer" text rxA
+  , testCase "without the protocol the modem behaves exactly as before" $ do
+      -- mcMnp defaults to Nothing, and then not one byte takes a
+      -- different path through modemStep
+      let text = map (fromIntegral . fromEnum) "plain bytes\r\n"
+          cfg r = (defaultModemConfig 8000 r [V22]) { mcNoHandshake = True }
+          (rxO, rxA, _, _) = modemDuplexStream (cfg Originate) (cfg Answer) 20 1 text text 8
+      assertEqual "answer to originate" text rxO
+      assertEqual "originate to answer" text rxA
+  ]
+  where
+    isMnpUp e = case e of { EvMnp (MnpUp {}) -> True; _ -> False }
 
 modemTests :: TestTree
 modemTests = testGroup "full modem duplex"
@@ -340,6 +430,17 @@ modemTests = testGroup "full modem duplex"
           (rxO, rxA, _, _) = modemDuplex (cfg Originate) (cfg Answer) 15 textO textA 6
       assertEqual "answer to originate" textA rxO
       assertEqual "originate to answer" textO rxA
+  , testCase "a carrier that stops delivers no junk behind it" $ do
+      -- A far end that hangs up mid-call used to cost about a hundred
+      -- characters of noise: the receiver kept framing its own decisions
+      -- while the carrier decayed, and the DTE had no way to tell those
+      -- from the banner that came before them.  The receiver knows,
+      -- though -- its decision error goes from about 0.01 to past 100 --
+      -- so it now stops handing bytes over.
+      let cfg r = (defaultModemConfig 8000 r [V22]) { mcNoHandshake = True }
+          textA = map (fromIntegral . fromEnum) "BANNER\r\n"
+          (rxO, _, _, _) = modemDuplexCut (cfg Originate) (cfg Answer) 30 [] textA 12 6
+      assertEqual "the banner, and nothing after it" textA rxO
   , testCase "Bell 212A both ends -> 1200 bit/s DPSK, text both ways" $ do
       let bell = [Bell212A, Bell103]
           (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate bell) (defaultModemConfig 8000 Answer bell) 25 textO textA 14
@@ -1001,7 +1102,7 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, hayesTests, baresipTests, pipewireTests, v8Tests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
