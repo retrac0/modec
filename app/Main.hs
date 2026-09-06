@@ -72,7 +72,9 @@ cmdP = hsubparser
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")
       <*> audioP
       <*> dataP
-      <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))
+      <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
+      <*> optional (strOption (long "record-rx" <> metavar "FILE.wav" <> help "record everything received to a WAV file"))
+      <*> optional (strOption (long "record-tx" <> metavar "FILE.wav" <> help "record everything transmitted to a WAV file")))
     modesReader s = case s of
       "auto" -> Just H.allStandards
       "all" -> Just H.allStandards

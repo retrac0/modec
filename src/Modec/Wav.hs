@@ -8,9 +8,15 @@ module Modec.Wav
   , encodeWav16Mono
   , readWav
   , writeWav16Mono
+    -- * Streaming writer
+  , WavWriter
+  , openWav16Mono
+  , wavAppendRaw
+  , closeWav
   ) where
 
 import Data.Bits (shiftL, (.&.), (.|.))
+import Data.IORef
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
 import qualified Data.ByteString.Lazy as BL
@@ -18,6 +24,7 @@ import Data.Int (Int16, Int32)
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word32)
 import GHC.Float (castWord32ToFloat)
+import System.IO
 
 import Modec.DSP (Signal)
 
@@ -108,3 +115,47 @@ readWav path = do
 
 writeWav16Mono :: FilePath -> Int -> Signal -> IO ()
 writeWav16Mono path rate x = BL.writeFile path (encodeWav16Mono rate x)
+
+-- | A WAV file being written incrementally.  The length fields are
+-- rewritten every half second as well as by 'closeWav', so a recording
+-- that is killed mid-call is still a playable file, missing at most the
+-- last half second.
+data WavWriter = WavWriter Handle (IORef (Int, Int))
+
+-- | Open a 16-bit mono WAV file for appending sample blocks.
+openWav16Mono :: FilePath -> Int -> IO WavWriter
+openWav16Mono path rate = do
+  h <- openBinaryFile path WriteMode
+  hSetBuffering h (BlockBuffering Nothing)
+  B.hPut h (BL.toStrict (encodeWav16Mono rate VS.empty))
+  n <- newIORef (0, 0)
+  return (WavWriter h n)
+
+-- | Append little-endian 16-bit samples exactly as they came off the wire.
+wavAppendRaw :: WavWriter -> B.ByteString -> IO ()
+wavAppendRaw w@(WavWriter h ref) bs = do
+  B.hPut h bs
+  (n, k) <- readIORef ref
+  let n' = n + B.length bs
+  if k >= 24
+    then writeIORef ref (n', 0) >> patchLengths w n'
+    else writeIORef ref (n', k + 1)
+
+-- | Rewrite the RIFF and data lengths, leaving the handle at the end.
+patchLengths :: WavWriter -> Int -> IO ()
+patchLengths (WavWriter h _) dataLen = do
+  hFlush h
+  let w32 off v = do
+        hSeek h AbsoluteSeek off
+        B.hPut h (BL.toStrict (BB.toLazyByteString (BB.word32LE (fromIntegral (v :: Int)))))
+  w32 4 (36 + dataLen)
+  w32 40 dataLen
+  hFlush h
+  hSeek h SeekFromEnd 0
+
+-- | Patch the lengths a final time, then close.
+closeWav :: WavWriter -> IO ()
+closeWav w@(WavWriter h ref) = do
+  (dataLen, _) <- readIORef ref
+  patchLengths w dataLen
+  hClose h

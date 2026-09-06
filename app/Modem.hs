@@ -11,7 +11,7 @@ module Modem
   ) where
 
 import Control.Concurrent
-import Control.Exception (SomeException, bracket, finally, try)
+import Control.Exception (SomeException, bracket, finally, throwTo, try)
 import Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
@@ -22,10 +22,11 @@ import qualified Data.Vector.Storable as VS
 import Network.Socket
 import qualified Network.Socket.ByteString as NB
 import System.Environment (lookupEnv)
-import System.Exit (exitFailure)
+import System.Exit (ExitCode (..), exitFailure)
 import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
+import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 
 import Modec.DSP (Signal, rms)
 import Modec.Handshake
@@ -36,6 +37,7 @@ import Modec.Modem
 import Modec.Pipewire
 import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
+import Modec.Wav (closeWav, openWav16Mono, wavAppendRaw)
 
 data AudioIO
   = AudioPipewire (Maybe String) (Maybe String) Bool
@@ -73,6 +75,8 @@ data ModemOpts = ModemOpts
   , moAudio    :: AudioIO
   , moData     :: DataIO
   , moAmp      :: Double
+  , moRecordRx :: Maybe FilePath   -- ^ write everything received to this WAV
+  , moRecordTx :: Maybe FilePath   -- ^ write everything transmitted to this WAV
   }
 
 logMsg :: String -> IO ()
@@ -80,6 +84,10 @@ logMsg s = hPutStrLn stderr ("modec: " ++ s)
 
 runModem :: ModemOpts -> IO ()
 runModem o = do
+  -- SIGTERM must unwind rather than kill the process outright, or child
+  -- processes are orphaned and recordings are left unterminated
+  mainTid <- myThreadId
+  _ <- installHandler sigTERM (Catch (throwTo mainTid ExitSuccess)) Nothing
   hSetBinaryMode stdin True
   hSetBinaryMode stdout True
   let fs = fromIntegral (moRate o)
@@ -105,8 +113,18 @@ runModem o = do
       -- otherwise each wait for the other's first block
       aiWrite ai (encodeS16 (VS.replicate blockN 0))
       restarts <- newIORef (0 :: Int)
-      let readBlock = aiRead ai (2 * blockN)
-          writeBlock = aiWrite ai
+      -- optional session recordings, useful for checking what a VoIP trunk
+      -- does to modem tones (modec detect / probe read them back)
+      recRx <- mapM (\f -> logMsg ("recording received audio to " ++ f) >> openWav16Mono f (moRate o)) (moRecordRx o)
+      recTx <- mapM (\f -> logMsg ("recording transmitted audio to " ++ f) >> openWav16Mono f (moRate o)) (moRecordTx o)
+      let readBlock = do
+            bs <- aiRead ai (2 * blockN)
+            mapM_ (\w -> wavAppendRaw w bs) recRx
+            return bs
+          writeBlock bs = do
+            mapM_ (\w -> wavAppendRaw w bs) recTx
+            aiWrite ai bs
+          closeRecordings = mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
           -- the peer closed a FIFO).  Try to put it back a few times
           -- before giving up, so a glitching USB interface does not end
@@ -156,7 +174,7 @@ runModem o = do
                     unless (null rxBytes) $ sendBytes (B.pack rxBytes)
                     mapM_ report events
                     unless (any isFinal events) loop
-          loop
+          loop `finally` closeRecordings
         else do
           -- Hayes mode: an AT command interpreter controls calls on the line
           hayesRef <- newIORef hayesInit
@@ -267,7 +285,7 @@ runModem o = do
                             EvFailed _ -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
                     modifyIORef' blockRef (+ 1)
                     loop
-          loop
+          loop `finally` closeRecordings
   where
     isFinal EvDropped = True
     isFinal (EvFailed _) = True

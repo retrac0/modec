@@ -8,8 +8,8 @@ establishment.
 See [SURVEY.md](SURVEY.md) for the survey of existing work and the design
 plan, [docs/line-interface.md](docs/line-interface.md) for hooking a real
 modem to a sound card, [docs/negotiation.md](docs/negotiation.md) for how modes are detected and
-negotiated, [docs/sip-options.md](docs/sip-options.md) for the VoIP/SIP
-plan, and [docs/recordings/](docs/recordings/) for recorded handshakes
+negotiated, [docs/sip-options.md](docs/sip-options.md) for the VoIP/SIP plan,
+[docs/voipms.md](docs/voipms.md) for dialling out through voip.ms, and [docs/recordings/](docs/recordings/) for recorded handshakes
 with an annotated timeline.
 
 ## Status
@@ -87,7 +87,12 @@ with an annotated timeline.
   Audio reaches the softphone through a PipeWire loopback pair created by
   `--audio-sip-loop` (see `docs/baresip/` for the baresip configuration).
   `scripts/smoke-sip.sh` runs the whole control path against a fake
-  baresip pair.
+  baresip pair, and [docs/voipms.md](docs/voipms.md) walks through a real
+  provider.
+- Session recording: `--record-rx` and `--record-tx` write everything
+  heard and sent to WAV files, which `modec probe` and `modec detect` read
+  back. The length fields are refreshed twice a second, so a recording is
+  usable even if the process is killed mid-call.
 - WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
 
 Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
