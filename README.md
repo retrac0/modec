@@ -86,6 +86,18 @@ with an annotated timeline.
   `scripts/smoke-sip.sh` runs the whole control path against a fake
   baresip pair, and [docs/voipms.md](docs/voipms.md) walks through a real
   provider.
+- MNP error correction (`Modec.Mnp`, `Modec.MnpFrame`, `--mnp`): classes 2,
+  3 and 4 of ITU-T V.42 (10/96) Annex A, which is MNP de-branded. Frames
+  the data, checks it with CRC-16/ARC or the HDLC check sequence, and asks
+  again for what the line damaged; go-back-N with a credit window, the
+  timers of A.7.5, and both of A.7.2.2's fallbacks, including the silent
+  one that carries on unprotected when nothing answers. Class 3 drops the
+  start and stop bits between the modems, worth 21 % of the line on a
+  256-octet frame and 31 % on a 16-octet one; class 4 shortens the headers
+  and sizes the frames to the line. Through the simulator it delivers every
+  byte where the bare link is damaging 3 % of them, and comes up at 4 dB
+  where better than one byte in ten arrives damaged. See
+  [docs/mnp.md](docs/mnp.md).
 - Session recording: `--record-rx` and `--record-tx` write everything
   heard and sent to WAV files, which `modec probe` and `modec detect` read
   back. The length fields are refreshed twice a second, so a recording is

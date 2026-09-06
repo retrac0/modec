@@ -409,6 +409,21 @@ mnpModemTests = testGroup "MNP over the data pump"
       assertBool ("and is well behind: octet " ++ show (length octet)
                   ++ " against bit " ++ show (length sync'))
         (5 * length sync' >= 6 * length octet)
+  , testCase "synchronous framing at 2400 bit/s uses the whole constellation" $ do
+      -- Every other test here runs the pump at 1200 bit/s, where a symbol
+      -- carries one dibit.  At 2400 it carries two, and a transmit mode
+      -- left out of the list that fetches the second one sends half the
+      -- bits on the 1200 bit/s points while the far end decodes four to
+      -- the symbol.  That is invisible at 1200 and fatal at 2400.
+      let payload = map (fromIntegral . (`mod` 251)) [1 .. 200 :: Int]
+          mnp = Just ((defaultMnpConfig 2400 True) { mnClass = 4, mnN401 = 32, mnK = 4 })
+          cfg r = (defaultModemConfig 8000 r [V22bis])
+                    { mcNoHandshake = True, mcMnp = mnp }
+          (rxO, rxA, evO, evA) = modemDuplexStream (cfg Originate) (cfg Answer) 20 4 payload payload 20
+      assertBool ("originate came up: " ++ show (take 2 evO)) (any isMnpUp evO)
+      assertBool ("answer came up: " ++ show (take 2 evA)) (any isMnpUp evA)
+      assertEqual "answer to originate" payload rxO
+      assertEqual "originate to answer" payload rxA
   , testCase "the framing switch survives a lost acknowledgement" $ do
       -- at this signal to noise ratio the frame that closes establishment
       -- is regularly lost.  The far end goes on repeating its link

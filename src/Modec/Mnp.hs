@@ -90,6 +90,7 @@ data MnpConfig = MnpConfig
   , mnRxWindow   :: !Int      -- ^ receive buffer in frames; the source of credit
   , mnDataDetect :: !Bool     -- ^ fall through as soon as the far end sends plain data
   , mnAdaptive   :: !Bool     -- ^ class 4 adaptive packet assembly: shrink frames on loss, grow back
+  , mnTrt        :: !Double   -- ^ round trip allowed for in the retransmission timer, seconds
   } deriving (Show)
 
 -- | Offer everything: class 4, eight outstanding frames, the 256-octet
@@ -108,6 +109,7 @@ defaultMnpConfig bitRate syncable = MnpConfig
   , mnRxWindow = 8
   , mnDataDetect = True
   , mnAdaptive = True
+  , mnTrt = 0.5
   }
 
 -- | The link request this configuration offers.  A station whose data
@@ -143,7 +145,7 @@ mnpT401 c fr dpo k n401 =
     lla = if dpo then 4 else 8
     kh = fromIntegral (max 1 (k `div` 2)) :: Double
     rate = max 1 (mnBitRate c)
-    trt = 0.5   -- round trip, including the far end's processing
+    trt = mnTrt c   -- round trip, including the far end's processing
 
 data MnpPhase
   = MnpEstablish

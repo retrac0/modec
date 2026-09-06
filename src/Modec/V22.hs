@@ -211,6 +211,12 @@ v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
           (b3, b4, stB) = case (rate, mode) of
             (R2400, TxScrambledOnes) -> let (x, s1) = nextBit stA; (y, s2) = nextBit s1 in (x, y, s2)
             (R2400, TxScrambledData) -> let (x, s1) = nextBit stA; (y, s2) = nextBit s1 in (x, y, s2)
+            -- synchronous data is data: at 2400 bit/s it takes the second
+            -- dibit and the full sixteen-point constellation like any
+            -- other, and leaving it out of this list transmits half the
+            -- bits on the 1200 bit/s points while the far end decodes four
+            -- to the symbol
+            (R2400, TxSyncData) -> let (x, s1) = nextBit stA; (y, s2) = nextBit s1 in (x, y, s2)
             _ -> (False, True, stA)     -- 1200 bit/s and handshake signals use the "01" points
           (gx, gy) = gridPoint q b3 b4
           t0 = if null (txSymbols st) then txSymClock st else txSymT0 st

@@ -58,6 +58,7 @@ data HayesEvent
   | EvNoCarrier
   | EvNoAnswer
   | EvRing              -- ^ a calling signal was detected while idle
+  | EvProtocol String   -- ^ an error-correcting protocol came up, named here
   deriving (Eq, Show)
 
 hayesOnline :: HayesState -> Bool
@@ -165,6 +166,13 @@ hayesEvent st ev = case ev of
   EvNoCarrier -> (st { hsMode = Command, hsConnected = False }, result st "NO CARRIER" 3)
   EvNoAnswer -> (st { hsMode = Command, hsConnected = False }, result st "NO ANSWER" 8)
   EvRing -> (st, result st "RING" 2)
+  -- Reported the way the modems that spoke this protocol reported it, on
+  -- its own line after CONNECT.  There is no numeric result code for it,
+  -- so a terminal in numeric mode hears nothing, which is what those
+  -- modems did too.
+  EvProtocol name
+    | hsQuiet st || not (hsVerbose st) -> (st, B.empty)
+    | otherwise -> (st, crlf <> BC.pack ("PROTOCOL: " ++ name) <> crlf)
   where
     connectCode r = case r of { 300 -> 1; 1200 -> 5; 2400 -> 10; _ -> 1 }
 

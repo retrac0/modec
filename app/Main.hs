@@ -71,6 +71,11 @@ cmdP = hsubparser
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full. A survey option: the mode it then selects will not be one this modem can run")
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
              <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this; a good link sits near 0.01 and 20 dB SNR near 0.35, while a converging or collapsing carrier runs past 1. Raise it to pass noisy data through, lower it to pass only what is trustworthy")
+      <*> (flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A): frames the data, checks it, and asks again for whatever the line damaged. Classes 2 to 4; falls through to an unprotected connection if the far end does not answer")
+           <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, but offering only up to class N: 2 start-stop framing, 3 synchronous framing, 4 adds the data phase optimization and adaptive frame sizing")
+           <|> pure Nothing)
+      <*> option auto (long "mnp-round-trip" <> value 0.5 <> showDefault <> metavar "S"
+                       <> help "seconds of round trip the MNP retransmission timer allows for. Raise it on a path that buffers: a satellite hop, or a loopback through FIFOs, where a reply can take longer than the timer and every frame looks lost")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
       <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")
