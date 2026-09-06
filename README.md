@@ -124,11 +124,11 @@ scripts/smoke-sip.sh
 ```
 
 With `--audio-pipewire` the default PipeWire source and sink are used.
-pw-cat takes a numeric node id as target, so pick one with `pw-cli ls
-Node` and pass `--pw-target 52`; if there is no capture device (the default
-source is a monitor) pw-cat reports "no target node available", and
-`--pw-monitor` captures the playback sink's monitor instead, which lets the
-modem hear its own tones. To play with it live from a terminal:
+On a machine with no capture device modec records the playback monitor
+instead (it says so on startup), so the modem hears its own tones and you
+hear them too; `--pw-monitor` forces that mode. To pick a specific device,
+pass its numeric node id from `pw-cli ls Node` as `--pw-target 52`, since
+pw-cat does not accept node names. To play with it live from a terminal:
 
 ```
 cabal run modec -- modem --hayes --audio-pipewire --pw-monitor --data-stdio

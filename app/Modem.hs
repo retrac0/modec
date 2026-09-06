@@ -25,6 +25,7 @@ import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.IO
 import System.Process
+import Data.List (isSuffixOf)
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 
 import Modec.DSP (Signal, rms)
@@ -109,7 +110,7 @@ runModem o = do
           let loop = do
                 raw <- B.hGet ain (2 * blockN)
                 if B.length raw < 2 * blockN
-                  then logMsg "audio input ended"
+                  then logMsg "audio input ended (the capture stream stopped)"
                   else do
                     pending <- recvBytes
                     st <- readIORef stRef
@@ -147,7 +148,7 @@ runModem o = do
               loop = do
                 raw <- B.hGet ain (2 * blockN)
                 if B.length raw < 2 * blockN
-                  then logMsg "audio input ended"
+                  then logMsg "audio input ended (the capture stream stopped)"
                   else do
                     t <- tNow
                     modifyIORef' blockRef (+ 0)
@@ -284,6 +285,19 @@ data Line
   | LineDialing Signal
   | LineCall ModemState ModemConfig
 
+-- | True when PipeWire offers a capture device that is not a monitor of
+-- an output.  Uses pactl; if that is unavailable, assume there is one.
+hasCaptureDevice :: IO Bool
+hasCaptureDevice = do
+  r <- try (readProcess "pactl" ["list", "short", "sources"] "") :: IO (Either SomeException String)
+  return $ case r of
+    Left _ -> True
+    Right out -> any real (lines out)
+  where
+    real l = case drop 1 (words l) of
+      (name : _) -> not (".monitor" `isSuffixOf` name)
+      _ -> False
+
 v22Info :: ModemState -> String
 v22Info st = case modemV22Rx st of
   (Just (ch, r), rate) -> "v22rx " ++ show ch ++ " " ++ show rate ++ " evm " ++ show (rxEvmEstimate r) ++ " ones2400 " ++ show (rxOnes2400Run r) ++ " sps " ++ show (rxSpsEstimate r)
@@ -351,7 +365,15 @@ withAudio aio rate role body = case aio of
               logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
               body hin hout
             _ -> logMsg "could not start pw-cat" >> exitFailure
-  AudioPipewire target monitor -> do
+  AudioPipewire target monitor0 -> do
+    -- On a machine with no capture device the only thing to record is the
+    -- output's monitor; pw-cat cannot auto-connect to that, and a failed
+    -- capture stream would end the audio-paced loop before anything is
+    -- heard.  Fall back to monitor capture rather than dying silently.
+    haveCapture <- hasCaptureDevice
+    let monitor = monitor0 || (target == Nothing && not haveCapture)
+    when (monitor && not monitor0) $
+      logMsg "no capture device: recording the playback monitor (the modem hears its own tones)"
     let common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
                  ++ maybe [] (\t -> ["--target", t]) target
         -- pw-cat wants a numeric node id as target; stream.capture.sink records a sink's monitor
