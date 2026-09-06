@@ -972,6 +972,44 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
       assertEqual "the buffer drains to the terminal" 32 (length dte3)
       assertBool ("credit is offered again unprompted " ++ show out3)
         (any (\f -> case f of { FrLA _ k -> k > 0; _ -> False }) out3)
+  , testCase "class 4 shortens its frames on a bad line and lets them grow back" $ do
+      -- the retransmission timer is pinned so this measures the policy
+      -- rather than how long the timer happens to be: with a 256-octet
+      -- maximum at 1200 bit/s it is about nineteen seconds, longer than
+      -- any sensible test would run
+      let c ad = (defaultMnpConfig 1200 False)
+                   { mnClass = 4, mnN401 = 256, mnK = 8, mnAdaptive = ad, mnT401 = Just 0.3 }
+          payload = map (fromIntegral . (`mod` 251)) [1 .. 251 :: Int]
+          step ad dmg (si, sr, toI, toR) k =
+            let (si', oi) = mnpStep (c ad) si (MnpIn 0.02 (lineIn toI) (take 16 payload) 0 maxBound)
+                (sr', orr) = mnpStep (c ad) sr (MnpIn 0.02 (lineIn toR) [] 0 maxBound)
+            in (si', sr', dmg k (moLine orr), dmg k (moLine oi))
+          run0 ad dmg n from = foldl (step ad dmg) from [1 .. n :: Int]
+          start ad = (mnpInit (c ad) MnpInitiator, mnpInit (c ad) MnpResponder,
+                      OutOctets [], OutOctets [])
+          sizeOf (si, _, _, _) = mnpSendSize si
+          phaseOf (si, _, _, _) = mnpPhase si
+      -- bring the link up on a clean line first: half the blocks missing
+      -- from the outset would stop it establishing at all, and then there
+      -- would be nothing to measure
+      let up ad = run0 ad clean 200 (start ad)
+      assertEqual "clean line keeps the negotiated maximum" 256
+        (sizeOf (run0 True clean 300 (up True)))
+      -- a line losing most blocks does shorten them
+      -- long enough to shorten the frames, short enough not to exhaust
+      -- the retransmission limit and take the link down with it
+      let lossy = run0 True (dropEvery 5) 200 (up True)
+      assertBool ("a lossy line shortens the frames: " ++ show (sizeOf lossy))
+        (sizeOf lossy < 256)
+      assertEqual "and the link is still up to measure" MnpData (phaseOf lossy)
+      -- and once it clears, the frames grow again rather than leaving the
+      -- rest of the call paying for a burst of noise
+      let recovered = run0 True clean 600 lossy
+      assertBool ("and they grow back: " ++ show (sizeOf lossy) ++ " -> " ++ show (sizeOf recovered)
+                  ++ " phase " ++ show (phaseOf recovered))
+        (sizeOf recovered > sizeOf lossy)
+      assertEqual "none of it happens when the behaviour is switched off" 256
+        (sizeOf (run0 False (dropEvery 5) 200 (up False)))
   , testCase "the retransmission limit disconnects with reason 4" $ do
       -- nothing is ever acknowledged, so every attempt times out
       let c = (defaultMnpConfig 1200 False) { mnN401 = 4, mnT401 = Just 0.1 }

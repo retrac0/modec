@@ -46,6 +46,7 @@ module Modec.Mnp
   , mnpRole
   , mnpFraming
   , mnpNegotiated
+  , mnpSendSize
   , mnpTrace
     -- * Stepping
   , MnpLineIn (..)
@@ -88,6 +89,7 @@ data MnpConfig = MnpConfig
   , mnT403       :: Maybe Double  -- ^ inactivity timer, 59 s or more when enabled
   , mnRxWindow   :: !Int      -- ^ receive buffer in frames; the source of credit
   , mnDataDetect :: !Bool     -- ^ fall through as soon as the far end sends plain data
+  , mnAdaptive   :: !Bool     -- ^ class 4 adaptive packet assembly: shrink frames on loss, grow back
   } deriving (Show)
 
 -- | Offer everything: class 4, eight outstanding frames, the 256-octet
@@ -105,6 +107,7 @@ defaultMnpConfig bitRate syncable = MnpConfig
   , mnT403 = Nothing
   , mnRxWindow = 8
   , mnDataDetect = True
+  , mnAdaptive = True
   }
 
 -- | The link request this configuration offers.  A station whose data
@@ -201,6 +204,8 @@ data MnpState = MnpState
   , msOutQ    :: [Pending]       -- ^ numbered, not yet transmitted
   , msUnacked :: [Pending]       -- ^ transmitted, awaiting acknowledgement
   , msDupSeen :: !Bool           -- ^ the one free duplicate of A.7.3.2.2 is spent
+  , msSendSize :: !Int          -- ^ information field currently being cut, at most N401
+  , msRunGood  :: !Int          -- ^ frames acknowledged since the last loss
   , msTxBuf   :: [Word8]
   , msRxBuf   :: [Word8]
   , msAckRx   :: !Int            -- ^ accepted LTs not yet acknowledged
@@ -238,6 +243,8 @@ mnpInit c role = MnpState
   , msOutCtrl = []
   , msOutQ = [], msUnacked = []
   , msDupSeen = False
+  , msSendSize = mnN401 c
+  , msRunGood = 0
   , msTxBuf = [], msRxBuf = []
   , msAckRx = 0
   , msAckForce = False
@@ -267,6 +274,12 @@ mnpFraming = msFraming
 mnpNegotiated :: MnpState -> MnpLr
 mnpNegotiated = msNeg
 
+-- | The information field currently being cut, which class 4 adaptive
+-- packet assembly moves up and down between 16 octets and the negotiated
+-- N401 as the line comes and goes.
+mnpSendSize :: MnpState -> Int
+mnpSendSize = msSendSize
+
 -- | A one-line summary of the link, for tracing a real call.
 mnpTrace :: MnpState -> String
 mnpTrace st = unwords
@@ -275,6 +288,7 @@ mnpTrace st = unwords
   , "unacked=" ++ show (length (msUnacked st))
   , "outq=" ++ show (length (msOutQ st))
   , "retries=" ++ show (msRetries st)
+  , "size=" ++ show (msSendSize st)
   , "t=" ++ show (msT st)
   , "t401=" ++ show (msT401At st)
   ]
@@ -410,14 +424,14 @@ handleFrame c (st, evs) frame = case (msPhase st, frame) of
                              then Just (asyncRxInit framing8N1, mode2RxInit)
                              else Nothing
              , msGraceAt = if framingOf (msNeg st) == FramingBit
-                             then msT st + 2 * t401Of c (msNeg st)
+                             then msT st + 2 * t401Of c st
                              else never
              }
        , evs )
 
   -- data phase
   (MnpData, FrLT ns info) -> (receiveLt c st ns info, evs)
-  (MnpData, FrLA nr nk) -> (receiveLa st nr nk, evs)
+  (MnpData, FrLA nr nk) -> (receiveLa c st nr nk, evs)
   -- an attention is acknowledged but never originated: modec has no
   -- break signal to carry, and a link that stalled on one would be worse
   -- than one that ignores it
@@ -432,6 +446,7 @@ enterData c st n evs =
        , msDpo = lrDpo n .&. 2 /= 0
        , msPeerNk = lrK n
        , msLastNk = lrK n
+       , msSendSize = lrN401 n
        , msT401At = never
        , msT402At = never
        , msT404At = msT st + t404 c
@@ -442,7 +457,9 @@ enterData c st n evs =
        -- and sent that frame in the framing the far end is still reading.
        , msNextFraming = framingOf n
        , msRxGrace = grace
-       , msGraceAt = if lrFraming n == 3 then msT st + 2 * t401Of c n else never
+       , msGraceAt = if lrFraming n == 3
+                       then msT st + 2 * mnpT401 c FramingBit (lrDpo n .&. 2 /= 0) (lrK n) (lrN401 n)
+                       else never
        }
   , evs ++ [MnpUp (negClass n) (lrK n) (lrN401 n)] )
   where
@@ -461,11 +478,21 @@ looksLikeText os =
 framingOf :: MnpLr -> MnpFraming
 framingOf x = if lrFraming x == 3 then FramingBit else FramingOctet
 
-t401Of :: MnpConfig -> MnpLr -> Double
-t401Of c n = case mnT401 c of
+-- | The retransmission timer for the frames actually being sent.
+--
+-- The formula of A.7.5.1 is written around N401, but N401 is a ceiling
+-- and class 4 spends most of a bad call well below it.  Timing against
+-- the ceiling makes every loss cost the better part of a minute at
+-- 1200 bit/s with a 256-octet maximum, which swamps any benefit from
+-- shortening the frames in the first place: the frames get smaller and
+-- the recovery does not.  So the length that goes into it is the length
+-- on the line.
+t401Of :: MnpConfig -> MnpState -> Double
+t401Of c st = case mnT401 c of
   Just v -> v
-  Nothing -> mnpT401 c (if lrFraming n == 3 then FramingBit else FramingOctet)
-                       (lrDpo n .&. 2 /= 0) (lrK n) (lrN401 n)
+  Nothing -> mnpT401 c (msFraming st) (msDpo st) (lrK n)
+                       (max 1 (min (lrN401 n) (msSendSize st)))
+  where n = msNeg st
 
 -- | The forced acknowledgement timer (A.7.5.4): seven seconds at
 -- 1200 bit\/s, three above it.
@@ -488,26 +515,41 @@ receiveLt c st ns info
   -- far end is told at once where we actually are
   | otherwise = forceAck c st
 
-receiveLa :: MnpState -> Word8 -> Word8 -> MnpState
-receiveLa st nr nk
+receiveLa :: MnpConfig -> MnpState -> Word8 -> Word8 -> MnpState
+receiveLa c st nr nk
   -- A.7.3.5(a): an acknowledgement repeating the previous N(R) is an
   -- implicit negative acknowledgement.  It only means that when something
   -- is actually outstanding: an idle far end repeats N(R) every time its
   -- forced acknowledgement timer expires, and reading those as losses
   -- would walk the retransmission count up to N400 on a healthy link.
-  | Just nr == msLastNR st && not (null (msUnacked st)) = retransmit st { msPeerNk = nk }
+  | Just nr == msLastNR st && not (null (msUnacked st)) = retransmit c st { msPeerNk = nk }
   | otherwise =
       let unacked' = [ f | f@(ns, _) <- msUnacked st, not (acked nr ns) ]
+          took = length (msUnacked st) - length unacked'
+          good = msRunGood st + took
+          -- and back up again once the line has settled, so a burst of
+          -- noise does not cost the rest of the call its throughput
+          (size', good') | took == 0 = (msSendSize st, good)
+                         | good >= 8 = (min (lrN401 (msNeg st)) (msSendSize st * 2), 0)
+                         | otherwise = (msSendSize st, good)
           st' = st { msUnacked = unacked', msPeerNk = nk, msLastNR = Just nr
-                   , msRetries = 0 }
+                   , msRetries = 0
+                   , msSendSize = if mnAdaptive c then size' else msSendSize st
+                   , msRunGood = good' }
       in st' { msT401At = if null unacked' && null (msOutQ st') then never else msT401At st' }
 
 -- | Go-back-N: everything not yet acknowledged goes back on the queue, in
 -- order, ahead of anything new.  There is no selective reject.
-retransmit :: MnpState -> MnpState
-retransmit st = st
+retransmit :: MnpConfig -> MnpState -> MnpState
+retransmit c st = st
   { msOutQ = msUnacked st ++ msOutQ st
   , msUnacked = []
+  -- Class 4 adaptive packet assembly.  A frame is lost whole, so on a
+  -- line that is losing them the shorter the frame the less there is to
+  -- lose and the sooner the next attempt starts.  The floor is low
+  -- enough to keep making progress on a line that is barely usable.
+  , msSendSize = if mnAdaptive c then max 16 (msSendSize st `div` 2) else msSendSize st
+  , msRunGood = 0
   , msRetries = if null (msUnacked st) then msRetries st else msRetries st + 1
   , msT401At = never
   }
@@ -517,7 +559,7 @@ retransmit st = st
 ackSoon :: MnpConfig -> MnpState -> MnpState
 ackSoon c st
   | msT402At st < never = st
-  | otherwise = st { msT402At = msT st + 0.5 * t401Of c (msNeg st) }
+  | otherwise = st { msT402At = msT st + 0.5 * t401Of c st }
 
 -- | An acknowledgement is owed now, whatever the count of frames taken.
 -- An out-of-sequence frame increments nothing, so without this the far
@@ -571,7 +613,7 @@ timers c st plain = case msPhase st of
     | msRetries st > 12 ->
         ( (sendCtrl st (FrLD 4 Nothing)) { msPhase = MnpClosed }
         , [MnpDown "retransmission limit reached"] )
-    | msT st >= msT401At st && not (null (msUnacked st)) -> (retransmit st, [])
+    | msT st >= msT401At st && not (null (msUnacked st)) -> (retransmit c st, [])
     | otherwise -> (st, [])
   _ -> (st, [])
   where
@@ -601,7 +643,7 @@ emit c st inp =
         | length q + length (msUnacked st) >= window = (q, buf, v)
         | null buf = (q, buf, v)
         | otherwise =
-            let (chunk, rest) = splitAt n401 buf
+            let (chunk, rest) = splitAt (max 1 (min n401 (msSendSize st))) buf
             in fill (q ++ [(v, chunk)]) rest (v + 1)
 
       -- one information frame per block, and only once the transmitter has
@@ -618,7 +660,7 @@ emit c st inp =
       -- it could never expire and nothing would ever be retransmitted.
       t401'
         | null unacked' = never
-        | Just _ <- sendLt = msT st + t401Of c (msNeg st)
+        | Just _ <- sendLt = msT st + t401Of c st
         | otherwise = msT401At st
 
       -- what the terminal will take, and therefore what credit we can
