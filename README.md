@@ -97,7 +97,9 @@ with an annotated timeline.
   and sizes the frames to the line. Through the simulator it delivers every
   byte where the bare link is damaging 3 % of them, and comes up at 4 dB
   where better than one byte in ten arrives damaged. See
-  [docs/mnp.md](docs/mnp.md).
+  [docs/mnp.md](docs/mnp.md), and
+  [docs/mnp-bench.md](docs/mnp-bench.md) for what is confirmed against real
+  hardware, what is not, and the order to test it in on the bench.
 - Session recording: `--record-rx` and `--record-tx` write everything
   heard and sent to WAV files, which `modec probe` and `modec detect` read
   back. The length fields are refreshed twice a second, so a recording is
