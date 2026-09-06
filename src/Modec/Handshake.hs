@@ -263,6 +263,7 @@ data Phase
   | AProbe Standard              -- ^ answering: sending this standard's answer signal
   | AV22Ones                     -- ^ answering: scrambled ones for 765 ms (1200 bit/s)
   | AV22S1                       -- ^ answering: S1 seen (112 ON), sending S1 for 100 ms
+  | AV22U11                      -- ^ answering: unscrambled ones for 456 ms after S1
   | AV22Ones1200                 -- ^ answering: scrambled ones at 1200 until 600 ms after 112 ON
   | AV22Ones2400                 -- ^ answering: scrambled ones at 2400, waiting for 32 of the remote's
   | OListen
@@ -275,6 +276,7 @@ data Phase
   | OReply Standard              -- ^ our FSK carrier is up, qualifying the remote
   | OV22Wait                     -- ^ unscrambled ones seen; 456 ms of silence
   | OV22S1                       -- ^ sending S1 for 100 ms (2400 capable)
+  | OV22U11                      -- ^ unscrambled ones for 456 ms after S1 (6.3.1.2)
   | OV22Ones                     -- ^ sending scrambled ones, waiting for the remote's (or its S1)
   | OV22Settle                   -- ^ remote scrambled ones seen; 765 ms more (1200 bit/s)
   | OV22Ones1200                 -- ^ remote S1 seen (112 ON); scrambled ones at 1200 until 600 ms
@@ -582,7 +584,9 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       AV22Ones
         | inPhase >= 0.765 -> enter (Connected (hsFamily st) R1200)
       AV22S1
-        | inPhase >= 0.1 -> enter AV22Ones1200
+        | inPhase >= 0.1 -> enter AV22U11
+      AV22U11
+        | inPhase >= 0.456 -> enter AV22Ones1200
       AV22Ones1200
         | since112 >= 0.6 -> enter AV22Ones2400
       AV22Ones2400
@@ -643,7 +647,15 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       OV22Wait
         | inPhase >= 0.456 -> enter (if allow2400 && hsFamily st /= Bell212A then OV22S1 else OV22Ones)
       OV22S1
-        | inPhase >= 0.1 -> enter OV22Ones
+        | inPhase >= 0.1 -> enter OV22U11
+      -- 6.3.1.2: S1 is followed by unscrambled binary 1, and only then by
+      -- scrambled ones.  Leaving it out shortens everything after it by
+      -- 456 ms, and the far end -- which changes rate on its own clock,
+      -- not on ours -- then reads our 2400 bit/s as 1200 for the rest of
+      -- the call while its own transmission stays perfectly readable.
+      OV22U11
+        | s1Seen -> enter112 OV22Ones1200
+        | inPhase >= 0.456 -> enter OV22Ones
       OV22Ones
         | s1Seen -> enter112 OV22Ones1200
         | scrambledOnesSeen -> enter OV22Settle
@@ -697,6 +709,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       AProbe s -> TxMark (fskTx Answer s)
       AV22Ones -> TxV22 HighChannel R1200 TxScrambledOnes
       AV22S1 -> TxV22 HighChannel R1200 TxS1
+      AV22U11 -> TxV22 HighChannel R1200 TxU11
       AV22Ones1200 -> TxV22 HighChannel R1200 TxScrambledOnes
       AV22Ones2400 -> TxV22 HighChannel R2400 TxScrambledOnes
       OListen -> TxSilence
@@ -710,6 +723,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       OReply s -> TxMark (fskTx Originate s)
       OV22Wait -> TxSilence
       OV22S1 -> TxV22 LowChannel R1200 TxS1
+      OV22U11 -> TxV22 LowChannel R1200 TxU11
       OV22Ones -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Settle -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Ones1200 -> TxV22 LowChannel R1200 TxScrambledOnes
