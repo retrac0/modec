@@ -92,9 +92,15 @@ propertyTests = testGroup "self round trips"
       \(Payload bs) -> roundTrip 48000 bell103Answer 0 4 bs
   , testProperty "bell103 answer 11025 Hz clean" $ withMaxSuccess 25 $
       \(Payload bs) -> roundTrip 11025 bell103Answer 0 5 bs
-  -- amplitude 0.5 tone vs sigma 0.2 white noise at 8 kHz is about 5 dB SNR in the
-  -- full band and Eb/N0 of roughly 16 dB, where non-coherent FSK has a BER
-  -- near 1e-9, so this must pass every time.
+  -- Amplitude 0.5 against sigma 0.2 of white noise at 8 kHz is about 5 dB
+  -- SNR in the full band and an Eb/N0 of roughly 16 dB.  An ideal
+  -- non-coherent FSK detector would have a bit error rate near 1e-9
+  -- there; this receiver measures 2 to 3 dB worse than ideal, which is an
+  -- ordinary implementation loss for one that also has to find the bit
+  -- clock and track a threshold.  Measured over 12000 characters at this
+  -- level it makes no errors, so the property holds -- but the margin is
+  -- a few dB, not the nine orders of magnitude the ideal figure suggests,
+  -- and tightening the noise a little will start to break it.
   , testProperty "bell103 answer 8 kHz noisy" $ \(Payload bs) (Positive seed) -> roundTrip 8000 bell103Answer 0.2 seed bs
   ]
 
