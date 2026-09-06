@@ -76,6 +76,10 @@ cmdP = hsubparser
            <|> pure Nothing)
       <*> option auto (long "mnp-round-trip" <> value 0.5 <> showDefault <> metavar "S"
                        <> help "seconds of round trip the MNP retransmission timer allows for. Raise it on a path that buffers: a satellite hop, or a loopback through FIFOs, where a reply can take longer than the timer and every frame looks lost")
+      <*> option auto (long "mnp-probes" <> value 6 <> showDefault <> metavar "N"
+                       <> help "how many MNP link requests to send before deciding the far end has no error correction")
+      <*> option auto (long "mnp-probe-interval" <> value 2.5 <> showDefault <> metavar "S"
+                       <> help "seconds between those link requests. A far end running V.42's detection phase abandons it 750 ms into the data phase, so probing early matters as much as probing often")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
       <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")

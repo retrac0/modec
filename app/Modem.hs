@@ -77,6 +77,8 @@ data ModemOpts = ModemOpts
   , moMaxEvm   :: Double
   , moMnp      :: Maybe Int          -- ^ highest MNP class to offer (2, 3 or 4)
   , moMnpTrt   :: Double             -- ^ round trip the retransmission timer allows for
+  , moMnpProbes :: Int               -- ^ link requests sent before giving up
+  , moMnpProbeGap :: Double          -- ^ seconds between them
   , moHayes    :: Bool
   , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
   , moSipDomain :: String
@@ -105,7 +107,10 @@ runModem o = do
       -- The rate and whether the link can go synchronous belong to the
       -- link rather than to the command line, so those two are left for
       -- Modec.Modem to fill in once the call is established.
-      mnpCfg = fmap (\cls -> (defaultMnpConfig 1200 True) { mnClass = cls, mnTrt = moMnpTrt o }) (moMnp o)
+      mnpCfg = fmap (\cls -> (defaultMnpConfig 1200 True)
+                       { mnClass = cls, mnTrt = moMnpTrt o
+                       , mnLrTries = max 1 (moMnpProbes o), mnT401Lr = moMnpProbeGap o })
+                    (moMnp o)
   when (moNoHandshake o && length (moModes o) /= 1) $ do
     logMsg "--no-handshake needs exactly one mode, e.g. --standard v22"
     exitFailure

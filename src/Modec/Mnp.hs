@@ -226,7 +226,8 @@ data MnpState = MnpState
   , msT404At  :: !Double
   , msT403At  :: !Double
   , msSawBad  :: !Bool
-  , msSawGood :: !Bool
+  , msSawGood :: !Bool     -- ^ a step of the establishment exchange completed
+  , msSawFrame :: !Bool    -- ^ any well formed frame at all arrived
   }
 
 never :: Double
@@ -266,7 +267,7 @@ mnpInit c role = MnpState
       MnpInitiator -> never
       MnpResponder -> mnT401Lr c * fromIntegral (max 1 (mnLrTries c))
   , msT402At = never, msT404At = never, msT403At = never
-  , msSawBad = False, msSawGood = False
+  , msSawBad = False, msSawGood = False, msSawFrame = False
   }
 
 mnpPhase :: MnpState -> MnpPhase
@@ -329,7 +330,8 @@ mnpStep c st0 inp =
        _ ->
          let (st2, frames, bad, plain) = decodeLine st1 (miLine inp)
              st3 = st2 { msSawBad = msSawBad st2 || bad }
-             (st4, evs0) = foldl (handleFrame c) (st3, []) frames
+             st3' = st3 { msSawFrame = msSawFrame st3 || any evidence frames }
+             (st4, evs0) = foldl (handleFrame c) (st3', []) frames
              (st5, evs1) = timers c st4 plain
          in if msPhase st5 == MnpTransparent || msPhase st5 == MnpClosed
               then let (st6, out) = if msPhase st5 == MnpTransparent
@@ -475,6 +477,22 @@ enterData c st n evs =
     grace | lrFraming n == 3 = Just (asyncRxInit framing8N1, mode2RxInit)
           | otherwise = Nothing
 
+-- | Whether a frame is evidence that there is a protocol at the far end.
+--
+-- Any frame that survived its check sequence and parsed counts, not only
+-- the ones the establishment exchange is waiting for.  A far end that has
+-- already opened its data phase sends information frames, and reading
+-- those as "nobody answered" abandons a link that is plainly working --
+-- and worse, hands the terminal frame headers and check sequences as if
+-- they were characters.  An unknown frame type is not counted, since a
+-- sixteen-bit check will pass on noise once in every sixty-five thousand
+-- candidates, and neither is a link request that names a protocol level
+-- this specification does not have.
+evidence :: MnpFrame -> Bool
+evidence (FrOther _ _) = False
+evidence (FrLR lr) = lrConst1 lr == 2
+evidence _ = True
+
 -- | Whether a run of octets reads as text a terminal would have been
 -- shown, rather than as the wreckage of frames that did not survive the
 -- line.  Nearly all of it must be printable ASCII or ordinary whitespace.
@@ -597,7 +615,7 @@ timers c st plain = case msPhase st of
     -- correction and give up on it precisely when it is needed most.  A
     -- damaged frame is likewise evidence of a protocol, not of its
     -- absence.
-    | mnDataDetect c && not (msSawGood st) && not (msSawBad st)
+    | mnDataDetect c && not (msSawFrame st) && not (msSawBad st)
     , length plain > 16, looksLikeText plain -> fallThrough st
     | msRole st == MnpInitiator && msLrTries st == 0 ->
         ( (sendCtrl st (FrLR (offerLr c)))
@@ -610,7 +628,7 @@ timers c st plain = case msPhase st of
           -- A.7.2.2: damaged frames were seen, so there is a protocol over
           -- there and it is worth saying goodbye; silence means there
           -- never was one, and then no disconnect may be sent at all
-          else if msSawBad st || msSawGood st
+          else if msSawBad st || msSawFrame st
             then ( (sendCtrl st (FrLD 1 Nothing)) { msPhase = MnpClosed }
                  , [MnpDown "no reply to the link request"] )
             else fallThrough st

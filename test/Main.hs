@@ -905,6 +905,42 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
       assertBool "no LD on the wire"
         (null [ () | Right b <- snd (mode2RxOctets mode2RxInit sent)
                    , Right (FrLD _ _) <- [decodeFrame b] ])
+  , testCase "a far end already sending data is not abandoned as silent" $ do
+      -- This is what a real call did: our link request went unanswered
+      -- (or its answer was lost), the far end opened its data phase
+      -- anyway, and we timed out and fell through to passing bytes
+      -- straight up -- which handed the terminal frame headers and check
+      -- sequences as though they were characters.  Any well formed frame
+      -- is proof there is a protocol over there.
+      let c = defaultMnpConfig 1200 False
+          lt n = mode2Encode (encodeFrame False (FrLT n (map (fromIntegral . fromEnum) "Synchronet ")))
+          st0 = mnpInit c MnpInitiator
+          step (st, evs) k =
+            let line = if k `mod` (25 :: Int) == 0 then LineOctets (lt (fromIntegral (k `div` 25))) else LineOctets []
+                (st', o) = mnpStep c st (MnpIn 0.02 line [] 0 maxBound)
+            in (st', evs ++ moEvents o)
+          ticks = ceiling ((mnT401Lr c * fromIntegral (mnLrTries c) + 3) / 0.02) :: Int
+          (stEnd, evs) = foldl step (st0, []) [1 .. ticks]
+      assertBool ("must not fall through: " ++ show (mnpPhase stEnd))
+        (mnpPhase stEnd /= MnpTransparent)
+      assertBool ("and must not report the far end silent: " ++ show evs)
+        (notElem MnpTransparentFallback evs)
+  , testCase "noise that happens to pass a check is not taken as evidence" $ do
+      -- a sixteen-bit check passes on one candidate in sixty-five
+      -- thousand, so an unknown frame type, or a link request naming a
+      -- protocol level that does not exist, must not hold the link open
+      let c = defaultMnpConfig 1200 False
+          junkFrames = mode2Encode (encodeFrame False (FrOther 9 [1, 2, 3]))
+                    ++ mode2Encode (encodeFrame False (FrLR defaultLr { lrConst1 = 7 }))
+          st0 = mnpInit c MnpInitiator
+          step (st, evs) k =
+            let line = if k == (5 :: Int) then LineOctets junkFrames else LineOctets []
+                (st', o) = mnpStep c st (MnpIn 0.02 line [] 0 maxBound)
+            in (st', evs ++ moEvents o)
+          ticks = ceiling ((mnT401Lr c * fromIntegral (mnLrTries c) + 3) / 0.02) :: Int
+          (stEnd, _) = foldl step (st0, []) [1 .. ticks]
+      assertBool ("should still fall through: " ++ show (mnpPhase stEnd))
+        (mnpPhase stEnd == MnpTransparent || mnpPhase stEnd == MnpClosed)
   , testCase "a far end that only sends data is detected at once" $ do
       let c = defaultMnpConfig 1200 False
           banner = map (fromIntegral . fromEnum) "\r\nWelcome to the board\r\n"
@@ -1089,6 +1125,66 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
               (sr', orr) = mnpStep c sr (MnpIn 0.02 (lineIn toR) [] 0 maxBound)
           in go (n - 1) si' sr' (moLine orr) (moLine oi)
 
+-- | What real modems actually sent us, taken off recordings of calls and
+-- kept as fixtures so the decoder is pinned against hardware rather than
+-- against our own encoder.  No calls are placed to run these.
+mnpFieldTests :: TestTree
+mnpFieldTests = testGroup "MNP against recorded modems"
+  [ testCase "A-Net Online, class 2: the whole exchange decodes" $ do
+      octets <- B.unpack <$> B.readFile (fixtureDir </> "mnp" </> "anet-online-class2.octets")
+      let (_, out) = mode2RxOctets mode2RxInit octets
+          frames = [ f | Right b <- out, Right f <- [decodeFrame b] ]
+          bad = length [ () | Left _ <- out ]
+          payload = concat [ inf | FrLT _ inf <- frames ]
+      assertEqual "frames recovered" 5 (length frames)
+      -- one frame in this recording failed its check sequence: real line
+      -- damage, caught rather than delivered
+      assertEqual "frames the check sequence rejected" 1 bad
+      case frames of
+        (FrLR lr : _) -> do
+          assertEqual "protocol level" 2 (lrConst1 lr)
+          assertEqual "start-stop framing" 2 (lrFraming lr)
+          assertEqual "outstanding frames" 8 (lrK lr)
+          assertEqual "information field" 64 (lrN401 lr)
+          assertEqual "no data phase optimization" 0 (lrDpo lr)
+          -- and the part that matters for interworking: this modem does
+          -- not send the constant the Recommendation prints.  Validating
+          -- it strictly would have refused a link that works.
+          assertEqual "constant parameter 2, as sent" [7, 1, 247, 0, 0, 1] (lrConst2 lr)
+          assertBool "our class 2 offer negotiates against it"
+            (case negotiateLr (offerLr ((defaultMnpConfig 2400 False) { mnClass = 2 })) lr of
+               Right n -> lrFraming n == 2 && lrK n == 8 && lrN401 n == 64
+               Left _ -> False)
+        _ -> assertFailure ("first frame was not a link request: " ++ show (take 1 frames))
+      assertBool ("an acknowledgement came back: " ++ show frames)
+        (any (\f -> case f of { FrLA {} -> True; _ -> False }) frames)
+      assertBool ("the banner arrived in information frames: " ++ show payload)
+        ("Synchronet External PO" `isInfixOf` map (toEnum . fromIntegral) payload)
+  , testCase "Basement BBS, class 4: synchronous framing decodes" $ do
+      raw <- B.unpack <$> B.readFile (fixtureDir </> "mnp" </> "basement-bbs-class4.bits")
+      let bits = [ testBit o i | o <- raw, i <- [0 .. 7 :: Int] ]
+          -- the link request is start-stop framed; everything after the
+          -- switch is bit oriented
+          (_, octets) = asyncRxBits (asyncRxInit framing8N1) bits
+          (_, out) = mode2RxOctets mode2RxInit octets
+          lrs = [ lr | Right b <- out, Right (FrLR lr) <- [decodeFrame b] ]
+          (_, bodies) = hdlcRxBits hdlcRxInit bits
+          frames = [ f | b <- bodies, Right f <- [decodeFrame b] ]
+          payload = concat [ inf | FrLT _ inf <- frames ]
+          text = map (toEnum . fromIntegral) payload :: String
+      case lrs of
+        (lr : _) -> do
+          assertEqual "bit-oriented framing offered" 3 (lrFraming lr)
+          assertEqual "both optimization bits" 3 (lrDpo lr)
+          assertEqual "seven outstanding frames" 7 (lrK lr)
+          assertEqual "sixteen-octet information field" 16 (lrN401 lr)
+        [] -> assertFailure "no link request in the start-stop part of the stream"
+      assertBool ("frames after the switch: " ++ show (length frames)) (length frames >= 40)
+      assertBool ("the banner reassembles: " ++ show (take 80 text))
+        ("Synchronet External POTS Support v1.30" `isInfixOf` text)
+      assertBool "and carries on past the banner" ("VT52 Colour" `isInfixOf` text)
+  ]
+
 hayesTests :: TestTree
 hayesTests = testGroup "Hayes AT interpreter"
   [ testCase "AT, ATE0, ATI, S0" $ do
@@ -1236,7 +1332,7 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
