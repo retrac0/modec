@@ -14,7 +14,8 @@ with an annotated timeline.
 
 ## Status
 
-- Bell 103 and V.21 asynchronous FSK modulator and demodulator,
+- Bell 103, V.21 and V.23 duplex asynchronous FSK modulator and
+  demodulator,
 - Receiver: band-pass prefilter, O(n) prefix-sum tone correlators,
   adaptive slicer, UART-style framer with sub-sample start-edge location,
   one timing correction per bit boundary, integrate-and-dump decisions and
@@ -28,8 +29,18 @@ with an annotated timeline.
   dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
 - Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
   dominant-tone runs, offline FSK standard/channel identification.
+- V.23 duplex (`--modes v23`): 1200 bit/s from the answering modem on
+  1300/2100 Hz, 75 bit/s back from the caller on 390/450 Hz. The only
+  asymmetric mode here, and the one viewdata boards answer with. Calling
+  one needs nothing special -- the 1300 Hz forward mark is unambiguous --
+  but answering one means measuring 390 Hz, which is one bin from the
+  V.8bis CRe tone at 400 Hz, so a V.23 answerer trades V.8bis for it
+  (`withModes` does the swap). Offline `modec detect` names the backward
+  channel but not the forward one: at 1200 bit/s no analysis window can
+  both separate 1300 Hz from the Bell 103 mark 30 Hz away and stay short
+  enough for a continuous-phase carrier to add up over it.
 - Call establishment (`Modec.Handshake`): V.25 answer sequence with
-  Bell 103, V.21, Bell 212A, V.22 and V.22bis on both sides, verified by
+  Bell 103, V.21, V.23, Bell 212A, V.22 and V.22bis on both sides, verified by
   duplex simulations in the test suite. `--modes` chooses which of them
   the modem will negotiate, in order of preference; see
   [docs/negotiation.md](docs/negotiation.md) for the decision tree and a

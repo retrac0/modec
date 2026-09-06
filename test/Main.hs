@@ -243,6 +243,13 @@ handshakeTests = testGroup "handshake simulation"
   , call "originate auto / answer Bell 103" allStandards [Bell103] Bell103
   , call "originate auto / answer V.21" allStandards [V21] V21
   , call "Bell 103 / Bell 103" [Bell103] [Bell103] Bell103
+  , call "V.23 duplex both ends" [V23] [V23] V23
+  , testCase "V.23 gives each end the other's channel" $ do
+      -- the asymmetry is the point: the caller sends 75 bit/s and
+      -- receives 1200, and a link that had it the other way round would
+      -- still connect but never decode anything
+      assertEqual "originate" (FskLink v23Backward v23Forward) (linkFor Originate V23)
+      assertEqual "answer" (FskLink v23Forward v23Backward) (linkFor Answer V23)
   , testCase "answerer respects V.25 timing" $ do
       let (_, a) = simulateCall (defaultHsConfig Originate) { hcV8bis = False } (defaultHsConfig Answer) { hcV8bis = False } 30 20
           tr = sdTrace a
@@ -260,7 +267,7 @@ handshakeTests = testGroup "handshake simulation"
   where
     fsk = [V21, Bell103]
     call name so sa expect = testCase name $ do
-      let (o, a) = simulateCall (defaultHsConfig Originate) { hcModes = so, hcV8bis = False } (defaultHsConfig Answer) { hcModes = sa, hcV8bis = False } 30 20
+      let (o, a) = simulateCall (withModes so (defaultHsConfig Originate)) { hcV8bis = False } (withModes sa (defaultHsConfig Answer)) { hcV8bis = False } 30 20
       assertEqual "originate" (HsConnected expect (linkFor Originate expect)) (sdStatus o)
       assertEqual "answer" (HsConnected expect (linkFor Answer expect)) (sdStatus a)
 
@@ -483,6 +490,15 @@ modemTests = testGroup "full modem duplex"
   , testCase "originate fixed V.21, answer automode -> V.21" $ do
       let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate [V21]) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 16
       assertBool ("originate events " ++ show evO) (case evO of (EvConnected V21 _ : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "V.23 duplex fixed both sides -> 1200 down, 75 up" $ do
+      -- the caller's line is 37 characters at 75 bit/s, five seconds of
+      -- transmission on its own, so this call runs longer than the
+      -- symmetric ones do
+      let (rxO, rxA, evO, _) = modemDuplex (defaultModemConfig 8000 Originate [V23]) (defaultModemConfig 8000 Answer [V23]) 30 textO textA 20
+      assertBool ("originate events " ++ show evO)
+        (case evO of (EvConnected V23 (FskLink tx rx) : _) -> fskBaud tx == 75 && fskBaud rx == 1200; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
   , testCase "V.22 fixed both sides, 20 dB -> 2400 bit/s" $ do

@@ -59,7 +59,7 @@ data ModemConfig = ModemConfig
 defaultModemConfig :: Double -> Role -> [Standard] -> ModemConfig
 defaultModemConfig fs role modes = ModemConfig
   { mcRate = fs
-  , mcHandshake = (defaultHsConfig role) { hcModes = modes }
+  , mcHandshake = withModes modes (defaultHsConfig role)
   , mcNoHandshake = False
   , mcDemod = defaultDemodParams
   , mcFraming = framing8N1
@@ -220,8 +220,11 @@ modemInit cfg
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
 
 -- | The line rate of an established link, for the protocol layer's timers.
+-- On an asymmetric link the slow direction is the one that governs: an
+-- acknowledgement crawling back at 75 bit/s is what a timeout has to
+-- wait for, whatever the other direction manages.
 linkBitRate :: Link -> Double
-linkBitRate (FskLink tx _) = fskBaud tx
+linkBitRate (FskLink tx rx) = min (fskBaud tx) (fskBaud rx)
 linkBitRate (V22Link _ _ R1200) = 1200
 linkBitRate (V22Link _ _ R2400) = 2400
 
@@ -241,7 +244,7 @@ mnpRoleOf :: Link -> MnpRole
 mnpRoleOf (V22Link LowChannel _ _) = MnpInitiator
 mnpRoleOf (V22Link HighChannel _ _) = MnpResponder
 mnpRoleOf (FskLink tx _)
-  | fskName tx `elem` [fskName bell103Originate, fskName v21Channel1] = MnpInitiator
+  | fskName tx `elem` [fskName bell103Originate, fskName v21Channel1, fskName v23Backward] = MnpInitiator
   | otherwise = MnpResponder
 
 -- | Start the protocol layer for a link, if the configuration asks for it.

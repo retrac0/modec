@@ -45,6 +45,16 @@ place:
 
 What the caller sends back, not what we sent, decides the outcome.
 
+V.23 duplex is a fourth probe, added only when it is asked for: it
+transmits the 1300 Hz forward-channel mark and listens for the caller's
+390 Hz backward mark. It sits outside the default ladder because it is
+asymmetric -- 1200 bit/s out, 75 bit/s back -- which is a bargain only for
+viewdata, and because answering it costs the V.8bis CRe tone: 390 Hz and
+400 Hz are one bin apart at a 40 ms window, so a bank that measures one
+cannot measure the other. `withModes` makes that trade explicitly when
+V.23 is configured on the answering side. Calling a V.23 answerer costs
+nothing, since the 1300 Hz mark it sends is unambiguous.
+
 ## Answering a call
 
 1. **Billing delay.** Silence for 2 s (V.25 allows 1.8 to 2.5).

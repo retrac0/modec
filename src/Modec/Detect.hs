@@ -114,7 +114,16 @@ dominant cfg squelch ratio fr =
 detectFsk :: Double -> Signal -> [(FskSpec, Double)]
 detectFsk fs x = sortBy (comparing (Down . snd)) [ (s, score s) | s <- fskStandards ]
   where
+    -- Offline this bank can be wider and slower than the handshake's:
+    -- it needs the V.23 backward pair, which the handshake deliberately
+    -- leaves out (390 Hz is one bin from the V.8bis CRe tone at 400 Hz),
+    -- and it needs to separate the V.23 forward mark at 1300 Hz from the
+    -- Bell 103 originate mark at 1270 Hz.  Thirty Hz is inside a 40 ms
+    -- window's bin, so the window is doubled here; 12.5 Hz bins tell them
+    -- apart, at the cost of a resolution in time no report needs.
     cfg = defaultToneBank
+      { tbFreqs = fskMark v23Backward : fskSpace v23Backward : tbFreqs defaultToneBank
+      , tbWindowSec = 0.08 }
     frames = toneFrames fs cfg x
     n = max 1 (length frames)
     energy fr s = let m = toneAmp cfg fr (fskMark s); sp = toneAmp cfg fr (fskSpace s) in m * m + sp * sp

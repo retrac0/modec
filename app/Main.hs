@@ -17,7 +17,7 @@ import Modec.Standards
 import Modec.Wav
 
 data Channel = Originate | Answer | Auto deriving (Eq, Show)
-data Std = Bell103 | V21 deriving (Eq, Show)
+data Std = Bell103 | V21 | V23 deriving (Eq, Show)
 
 data Cmd
   = Decode Std Channel Double FilePath
@@ -34,7 +34,10 @@ channelP =
   <|> pure Auto
 
 stdP :: Parser Std
-stdP = flag Bell103 V21 (long "v21" <> help "use V.21 tones instead of Bell 103")
+stdP =
+      flag' V21 (long "v21" <> help "use V.21 tones instead of Bell 103")
+  <|> flag' V23 (long "v23" <> help "V.23 duplex: --answer is the 1200 bit/s forward channel, --originate the 75 bit/s backward one")
+  <|> pure Bell103
 
 cmdP :: Parser Cmd
 cmdP = hsubparser
@@ -95,6 +98,7 @@ cmdP = hsubparser
     modeReader m = case m of
       "bell103" -> Just H.Bell103
       "v21" -> Just H.V21
+      "v23" -> Just H.V23
       "bell212a" -> Just H.Bell212A
       "bell212" -> Just H.Bell212A
       "v22" -> Just H.V22
@@ -124,6 +128,8 @@ specFor Bell103 Originate = bell103Originate
 specFor Bell103 _        = bell103Answer
 specFor V21 Originate    = v21Channel1
 specFor V21 _            = v21Channel2
+specFor V23 Originate    = v23Backward
+specFor V23 _            = v23Forward
 
 -- | Mean tone energy for a spec over the whole file, used to pick a channel.
 bandEnergy :: Double -> FskSpec -> Signal -> Double

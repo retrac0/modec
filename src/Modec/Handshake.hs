@@ -75,6 +75,7 @@ module Modec.Handshake
   , Link (..)
   , HsConfig (..)
   , defaultHsConfig
+  , withModes
   , TxCmd (..)
   , V22Report (..)
   , HsOut (..)
@@ -104,9 +105,14 @@ import Data.Word (Word8)
 -- handshake timings as V.22, but announced with the 2225 Hz Bell answer
 -- tone instead of unscrambled binary 1, without guard tones, and with no
 -- 2400 bit/s rate.  'V22bis' is V.22 that negotiated 2400 bit/s.
-data Standard = Bell103 | V21 | Bell212A | V22 | V22bis deriving (Eq, Show, Enum, Bounded)
+-- 'V23' is V.23 duplex: 1200 bit/s from the answering modem, 75 bit/s
+-- back from the calling one.  It is the only asymmetric mode here, and
+-- the only one whose two directions run at different rates.
+data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis deriving (Eq, Show, Enum, Bounded)
 
--- | Every mode, best first; the default configuration.
+-- | Every mode, best first; the default configuration.  V.23 is not in
+-- it: 75 bit/s upstream is worse than V.21 for anything but viewdata, so
+-- it is a mode to ask for rather than one to fall into.
 allStandards :: [Standard]
 allStandards = [V22bis, V22, Bell212A, V21, Bell103]
 
@@ -129,6 +135,11 @@ linkFor Originate Bell103 = FskLink bell103Originate bell103Answer
 linkFor Answer Bell103 = FskLink bell103Answer bell103Originate
 linkFor Originate V21 = FskLink v21Channel1 v21Channel2
 linkFor Answer V21 = FskLink v21Channel2 v21Channel1
+-- The caller has the 75 bit/s backward channel and listens to the 1200
+-- bit/s forward one; the answerer, which is the end with something to
+-- say, has it the other way round.
+linkFor Originate V23 = FskLink v23Backward v23Forward
+linkFor Answer V23 = FskLink v23Forward v23Backward
 linkFor role s = v22LinkAt role (if s == V22bis then R2400 else R1200)
 
 v22LinkAt :: Role -> Rate -> Link
@@ -159,6 +170,27 @@ defaultHsConfig role = HsConfig
   , hcSquelch = 3e-3, hcDomRatio = 1.5
   , hcBilling = 2.0, hcAnsDuration = 3.0, hcAnsGap = 0.075, hcProbe = 1.5
   , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True, hcV8 = False, hcV8OfferAll = False }
+
+-- | Apply a mode set, adjusting whatever the modes themselves imply.
+--
+-- Answering a V.23 call means hearing the caller's 390 Hz backward mark,
+-- so the bank gains that pair and loses the V.8bis CRe tone at 400 Hz.
+-- The two cannot share a bank: one bin apart at a 40 ms window, neither
+-- would ever dominate the other and the answerer would sit through its
+-- own timeout hearing nothing.  V.8bis goes off with its tone.  Calling a V.23 answerer needs neither change: the 1300 Hz
+-- forward mark is in the bank already and nothing else claims it.
+--
+-- Set 'hcModes' directly and none of this happens, which is why a V.23
+-- answerer configured that way waits out its timeout rather than
+-- connecting: it is listening for a tone it never measures.
+withModes :: [Standard] -> HsConfig -> HsConfig
+withModes ms cfg
+  | V23 `elem` ms && hcRole cfg == Answer =
+      cfg { hcModes = ms, hcV8bis = False
+          , hcBank = (hcBank cfg)
+              { tbFreqs = fskMark v23Backward : fskSpace v23Backward
+                          : filter (/= 400) (tbFreqs (hcBank cfg)) } }
+  | otherwise = cfg { hcModes = ms }
 
 -- | What the transmitter should be doing right now.
 data TxCmd
@@ -361,9 +393,12 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
       -- whole menu; nothing it then selects will be runnable, which is
       -- the price of asking.
       | hcV8OfferAll cfg = [minBound .. maxBound]
-      | otherwise = [ MV22 | any (`elem` modes) [V22, V22bis] ] ++ [ MV21 | V21 `elem` modes ]
+      | otherwise = [ MV22 | any (`elem` modes) [V22, V22bis] ]
+                    ++ [ MV23Duplex | v23Allowed ]
+                    ++ [ MV21 | V21 `elem` modes ]
     canRun m = case m of
       MV22 -> any (`elem` modes) [V22, V22bis]
+      MV23Duplex -> v23Allowed
       MV21 -> V21 `elem` modes
       _ -> False
     v8Offer = emptyMenu { v8Call = Just CfData, v8Mods = ourV8Mods }
@@ -402,7 +437,9 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     allowed s = s `elem` modes
     v22Allowed = any (`elem` modes) [V22, V22bis]
     allow2400 = V22bis `elem` modes
-    ituAllowed = any (`elem` modes) [V21, V22, V22bis]
+    -- V.23 belongs here too: its answerer opens with the ITU answer tone
+    -- like any other ITU mode, and only a Bell-only modem skips it
+    ituAllowed = any (`elem` modes) [V21, V22, V22bis, V23]
     -- scrambled DPSK marks answering our 2225 Hz mean a 1200 bit/s link;
     -- V.22 modems do this too (V.22 §6.3.1.1 note), so accept either name
     bellDpsk = [ s | s <- [Bell212A, V22], allowed s ]
@@ -411,8 +448,9 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     -- the answer tone ends rather than waiting to hear the answerer's.
     -- An answering modem that steps through a fallback ladder may hold
     -- each rung open for only a second or two.
-    fskOnly = not v22Allowed && (allowed V21 || allowed Bell103)
-    preferredFsk = case [ s | s <- modes, s `elem` [V21, Bell103] ] of
+    fskOnly = not v22Allowed && (allowed V21 || allowed Bell103 || v23Allowed)
+    v23Allowed = allowed V23
+    preferredFsk = case [ s | s <- modes, s `elem` [V21, Bell103, V23] ] of
       (s : _) -> s
       [] -> V21
     -- which Bell mode a 2225 Hz answer tone should be answered with
@@ -442,6 +480,11 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     -- an FSK carrier counts once it has persisted; the Bell 103 answer
     -- mark must not be V.22 unscrambled ones in disguise
     qualified s | isV22Family s = False   -- qualified through the V.22 receiver, not tones
+    -- Answering a V.23 caller would mean detecting its 390 Hz backward
+    -- mark, and 390 Hz cannot be told from the V.8bis CRe tone at 400 Hz
+    -- by a bank whose 40 ms window resolves 25 Hz.  Calling one only
+    -- needs the 1300 Hz forward mark, which is already unambiguous, so
+    -- V.23 is offered on the calling side only.
     qualified s = heardFor (fskMark (fskRx role s)) >= hcQualify cfg && not (s == Bell103 && role == Originate && u11Seen)
     -- V.22 §6.3.1.1 note: some answering modems emit 2225 Hz where the
     -- Recommendation has unscrambled binary 1; that is a Bell 212A answerer
@@ -454,7 +497,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
               _ -> hsLastTone st
     -- one probe per family, in the traditional order, skipping families
     -- this modem is not configured for
-    probeOrder = [ p | (p, needed) <- [ (V22, v22Allowed), (V21, allowed V21)
+    probeOrder = [ p | (p, needed) <- [ (V22, v22Allowed), (V21, allowed V21), (V23, v23Allowed)
                                       , (Bell103, allowed Bell103 || allowed Bell212A) ], needed ]
     rotating = length probeOrder > 1
     nextProbe s = case dropWhile (/= s) probeOrder of
@@ -472,7 +515,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
             if hcV8 cfg && ituAllowed then enter AV8Ansam
             else if hcV8bis cfg && ituAllowed then enter A8Dual
             -- a Bell-only modem answers with 2225 Hz, never with the ITU tone
-            else if ituAllowed then enter AAns else enter (AProbe Bell103)
+            else if ituAllowed then enter AAns else enter (AProbe firstProbe)
       -- V.8bis, answering station initiating with CRe (transaction 2, no ACK requested)
       A8Dual
         | inPhase >= 0.4 -> enter A8Tone
@@ -560,6 +603,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
         -- our carrier is already up in FSK-only mode, so the answerer's
         -- carrier is all that is still needed
         | allowed V21 && qualified V21 -> enter (if fskOnly then Connected V21 R1200 else OReply V21)
+        | v23Allowed && qualified V23 -> enter (if fskOnly then Connected V23 R1200 else OReply V23)
         | allowed Bell103 && qualified Bell103 -> enter (if fskOnly then Connected Bell103 R1200 else OReply Bell103)
       -- Te, the silence before CM: at least 0.5 s, and a full second
       -- when network echo cancellers are to be disabled (8.1.1)
@@ -577,6 +621,7 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
             -- sends unscrambled binary 1 and the rate is settled by the
             -- usual S1 exchange
             Just MV22 | canRun MV22 -> enter OAfterAns
+            Just MV23Duplex | canRun MV23Duplex -> enter (OReply V23)
             Just MV21 | canRun MV21 -> enter (OReply V21)
             _ -> enter V8NoMode
       OReply s
