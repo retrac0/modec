@@ -36,6 +36,7 @@ import Modec.Dtmf
 import Modec.Hayes
 import Modec.Modem
 import Modec.Pipewire
+import Modec.V8 (describeMenu)
 import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 import Modec.Wav (closeWav, openWav16Mono, wavAppendRaw)
@@ -70,6 +71,7 @@ data ModemOpts = ModemOpts
   , moModes    :: [Standard]        -- ^ modes to negotiate, best first
   , moNoHandshake :: Bool
   , moNoV8bis  :: Bool
+  , moV8       :: Bool
   , moHayes    :: Bool
   , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
   , moSipDomain :: String
@@ -94,7 +96,7 @@ runModem o = do
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       cfg0 = defaultModemConfig fs (moRole o) (moModes o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o) } }
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o } }
   when (moNoHandshake o && length (moModes o) /= 1) $ do
     logMsg "--no-handshake needs exactly one mode, e.g. --standard v22"
     exitFailure
@@ -149,7 +151,7 @@ runModem o = do
             _ -> Nothing
           cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
-                              , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o) } }
+                              , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o } }
           traceStep st st' = when trace $ do
             k <- readIORef blockRef
             writeIORef blockRef (k + 1)
@@ -159,6 +161,7 @@ runModem o = do
             EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
             EvDropped -> logMsg "NO CARRIER"
             EvFailed why -> logMsg ("connection failed: " ++ why)
+            EvV8Menu m -> logMsg ("V.8 far end offers: " ++ describeMenu m)
       if not (moHayes o) && sip == Nothing
         then do
           -- plain mode: one call in the configured role, then exit

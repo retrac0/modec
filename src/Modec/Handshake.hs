@@ -81,6 +81,8 @@ module Modec.Handshake
   , HsStatus (..)
   , HsState
   , initialHandshake
+  , HsIn (..)
+  , noHsIn
   , handshakeStep
   , handshakeStage
   , linkFor
@@ -93,6 +95,7 @@ import Modec.Hdlc (hdlcFrameBits)
 import Modec.Standards
 import Modec.Stream
 import Modec.V22 (Rate (..), TxMode (..), V22Channel (..))
+import Modec.V8
 import Modec.V8bis
 import Data.Word (Word8)
 
@@ -146,6 +149,7 @@ data HsConfig = HsConfig
   , hcDrop        :: Double           -- ^ carrier loss for this long drops the connection
   , hcTimeout     :: Double           -- ^ give up after this long
   , hcV8bis       :: Bool             -- ^ try a V.8bis capabilities exchange before the modem start-up
+  , hcV8          :: Bool             -- ^ answer with ANSam and exchange V.8 CM/JM menus
   } deriving (Show)
 
 defaultHsConfig :: Role -> HsConfig
@@ -153,7 +157,7 @@ defaultHsConfig role = HsConfig
   { hcRole = role, hcModes = allStandards, hcBank = defaultToneBank
   , hcSquelch = 3e-3, hcDomRatio = 1.5
   , hcBilling = 2.0, hcAnsDuration = 3.0, hcAnsGap = 0.075, hcProbe = 1.5
-  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True }
+  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True, hcV8 = False }
 
 -- | What the transmitter should be doing right now.
 data TxCmd
@@ -164,6 +168,7 @@ data TxCmd
   | TxV22 V22Channel Rate TxMode
   | TxDual Double Double Double   -- ^ two tones at the given amplitude factor (V.8bis segment 1)
   | TxBits FskSpec [Bool]         -- ^ queue these bits on the FSK channel, then idle mark
+  | TxAnsam              -- ^ V.8 modified answer tone
   deriving (Eq, Show)
 
 -- | What a V.22 receiver listening to the remote channel currently sees.
@@ -177,6 +182,18 @@ data V22Report = V22Report
   , vrOnes2400 :: !Int      -- ^ consecutive descrambled ones decided 16-way
   } deriving (Show)
 
+-- | What the receivers found for the handshake this hop.  Everything
+-- here arrives on the first tone frame of an audio block.
+data HsIn = HsIn
+  { hiFrames :: [[Word8]]    -- ^ HDLC frames (V.8bis)
+  , hiV8     :: [V8Event]    -- ^ V.8 signals off the async V.21 receiver
+  , hiAnsam  :: !Bool        -- ^ ANSam was confirmed in this block
+  }
+
+-- | Nothing was received.
+noHsIn :: HsIn
+noHsIn = HsIn [] [] False
+
 -- | What the handshake wants from the modem this hop.
 data HsOut = HsOut
   { hoTx     :: TxCmd
@@ -184,6 +201,8 @@ data HsOut = HsOut
   , hoRxRate :: Rate            -- ^ decision rate for the V.22 receiver
   , hoRole   :: Role            -- ^ effective modem role (V.8bis can reverse it)
   , hoHdlc   :: Maybe FskSpec   -- ^ run a synchronous V.21 receiver on this channel for HDLC frames
+  , hoV8     :: Maybe FskSpec   -- ^ run a V.21 receiver on this channel for V.8 signals
+  , hoV8Menu :: Maybe V8Menu    -- ^ the remote's menu, the hop it is confirmed
   } deriving (Show)
 
 data HsStatus
@@ -203,6 +222,9 @@ data Phase
   | O8Tone                       -- ^ V.8bis: ESr segment 2 / message preamble (1650 Hz mark)
   | O8SendCL                     -- ^ V.8bis: CL message going out on V.21 channel 2
   | O8WaitMS                     -- ^ V.8bis: waiting for MS on V.21 channel 1
+  | AV8Ansam                     -- ^ V.8: ANSam out, listening for CM
+  | AV8JM                        -- ^ V.8: JM going out on V.21 channel 2
+  | AV8Gap                       -- ^ V.8: 75 ms of silence before sigA
   | AAns
   | AGap
   | AProbe Standard              -- ^ answering: sending this standard's answer signal
@@ -213,6 +235,10 @@ data Phase
   | OListen
   | OAnsEnding                   -- ^ ITU answer tone heard, waiting for it to end
   | OAfterAns                    -- ^ answer tone over, waiting for a carrier
+  | OV8Wait                      -- ^ V.8: ANSam heard, silent for Te before CM
+  | OV8CM                        -- ^ V.8: CM going out on V.21 channel 1
+  | OV8CJ                        -- ^ V.8: CJ acknowledging JM
+  | OV8Gap                       -- ^ V.8: 75 ms of silence before sigC
   | OReply Standard              -- ^ our FSK carrier is up, qualifying the remote
   | OV22Wait                     -- ^ unscrambled ones seen; 456 ms of silence
   | OV22S1                       -- ^ sending S1 for 100 ms (2400 capable)
@@ -221,6 +247,7 @@ data Phase
   | OV22Ones1200                 -- ^ remote S1 seen (112 ON); scrambled ones at 1200 until 600 ms
   | OV22Ones2400                 -- ^ scrambled ones at 2400, waiting for 32 of the remote's
   | Connected Standard Rate
+  | V8NoMode                     -- ^ V.8 ran but found nothing in common
   | Done
   deriving (Eq, Show)
 
@@ -239,11 +266,16 @@ data HsState = HsState
   , hs112At     :: !Double   -- ^ time circuit 112 went ON (S1 exchanged)
   , hsToneSince :: !(Maybe (Double, Double))  -- ^ current dominant tone and when it started
   , hsLastTone  :: !Double   -- ^ last time any tone was dominant
+  , hsAnsam     :: !Bool     -- ^ ANSam has been confirmed on this call
+  , hsV8Last    :: !(Maybe V8Menu)  -- ^ the last V.8 sequence received
+  , hsV8Reps    :: !Int      -- ^ how many times running it has been identical
+  , hsV8Peer    :: !(Maybe V8Menu)  -- ^ the remote's menu, once confirmed
+  , hsV8Mod     :: !(Maybe Modulation)  -- ^ what V.8 selected
   , hsT         :: !Double
   }
 
 initialHandshake :: HsConfig -> HsState
-initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) Nothing 0 Nothing Nothing False Nothing V22 False 0 0 Nothing (-1) 0
+initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) Nothing 0 Nothing Nothing False Nothing V22 False 0 0 Nothing (-1) False Nothing 0 Nothing Nothing 0
 
 fskTx, fskRx :: Role -> Standard -> FskSpec
 fskTx role s = case linkFor role s of
@@ -262,8 +294,8 @@ s1Symbols = 30
 
 -- | Advance the state machine by one tone frame and the latest V.22
 -- receiver report (if a V.22 receiver is running).
-handshakeStep :: HsConfig -> HsState -> ToneFrame -> Maybe V22Report -> [[Word8]] -> (HsState, HsOut)
-handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'') hdlcListen)
+handshakeStep :: HsConfig -> HsState -> ToneFrame -> Maybe V22Report -> HsIn -> (HsState, HsOut)
+handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcListen v8Listen v8MenuOut)
   where
     t = tfTime fr
     dom = dominant (hcBank cfg) (hcSquelch cfg) (hcDomRatio cfg) fr
@@ -298,6 +330,7 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       _ -> Nothing
     sig = seg2
     -- messages received this hop
+    frames = hiFrames inp
     msgs = map decodeMessage frames
     clOffered = [ ms | CL ms <- msgs ]
     msSelected = [ m | MS m <- msgs ]
@@ -309,6 +342,25 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       V22bis -> Just ModeV22bis
       _ -> Nothing
     ourModes = [ m | s <- modes, Just m <- [standardToMode s] ]
+    -- V.8 signals seen this hop.  Two identical sequences are required
+    -- before either side acts on a menu (7.4, 8.1.2).
+    v8Seqs = [ m | V8Sequence _ m <- hiV8 inp ]
+    cjSeen = V8CJ `elem` hiV8 inp
+    (v8Last', v8Reps') = foldl again (hsV8Last st, hsV8Reps st) v8Seqs
+      where again (prev, k) m | prev == Just m = (Just m, k + 1)
+                              | otherwise = (Just m, 1)
+    v8Confirmed = if v8Reps' >= 2 then v8Last' else Nothing
+    ansamSeen = hsAnsam st || hiAnsam inp
+    -- only ITU modes have codepoints in Table 4, so a Bell-only
+    -- configuration has nothing it can offer here
+    ourV8Mods = [ MV22 | any (`elem` modes) [V22, V22bis] ] ++ [ MV21 | V21 `elem` modes ]
+    v8Offer = emptyMenu { v8Call = Just CfData, v8Mods = ourV8Mods }
+    -- JM lists what both have, and keeps the CM's octet count even when
+    -- that is nothing at all (8.2.3)
+    v8Reply peer = emptyMenu
+      { v8Call = v8Call peer
+      , v8Mods = [ m | m <- v8Mods peer, m `elem` ourV8Mods ]
+      , v8ModOctets = v8ModOctets peer }
     pickMode offered = case [ m | m <- ourModes, m `elem` offered ] of
       (m : _) -> Just m
       [] -> Nothing
@@ -328,6 +380,7 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       Just (f, since) | f /= 2100 -> t - since
       _ -> 0
     st' = st { hsToneSince = toneSince, hsLastTone = lastTone, hsT = t
+             , hsAnsam = ansamSeen, hsV8Last = v8Last', hsV8Reps = v8Reps'
              , hsPairRun = pairRun', hsPairSeen = if sig /= Nothing then Nothing else pairSeen'', hsSig = sig, hsLastRsp = rspPair }
     inPhase = t - hsPhaseAt st
     -- the configured modes, narrowed to one by a V.8bis mode select
@@ -404,7 +457,8 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       -- answering side
       ABilling
         | inPhase >= hcBilling cfg ->
-            if hcV8bis cfg && ituAllowed then enter A8Dual
+            if hcV8 cfg && ituAllowed then enter AV8Ansam
+            else if hcV8bis cfg && ituAllowed then enter A8Dual
             -- a Bell-only modem answers with 2225 Hz, never with the ITU tone
             else if ituAllowed then enter AAns else enter (AProbe Bell103)
       -- V.8bis, answering station initiating with CRe (transaction 2, no ACK requested)
@@ -420,6 +474,19 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       A8SendMS
         -- 100 ms preamble plus about 15 octets at 300 bit/s; then we are the calling modem
         | inPhase >= 0.6 -> (enter OListen) { hsRole = Originate }
+      -- 8.2.2: ANSam runs for 5 +/- 1 s if nothing takes it up
+      AV8Ansam
+        | Just peer <- v8Confirmed -> (enter AV8JM) { hsV8Peer = Just peer, hsV8Mod = v8Pick peer }
+        | inPhase >= 5 -> enter AGap
+      -- 8.2.3: JM continues until all three octets of CJ are in
+      AV8JM
+        | cjSeen -> enter AV8Gap
+        | inPhase >= 3 -> enter AV8Gap
+      AV8Gap
+        | inPhase >= 0.075 -> case hsV8Mod st of
+            Just MV22 -> enter (AProbe V22)
+            Just MV21 -> enter (AProbe V21)
+            _ -> enter V8NoMode
       AAns
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
         | inPhase >= hcAnsDuration cfg -> enter AGap
@@ -472,6 +539,9 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         | bellChoice == Just Bell103 && qualified Bell103 -> enter (OReply Bell103)
         | heardFor 2100 >= hcQualify cfg -> enter OAnsEnding
       OAnsEnding
+        -- the answer tone is modulated: the far end speaks V.8 and is
+        -- waiting to be told what we have (7.2, 8.1.1)
+        | hcV8 cfg && ansamSeen && not (null ourV8Mods) -> enter OV8Wait
         | dom /= Just 2100 && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
       OAfterAns
         | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
@@ -479,6 +549,24 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         -- carrier is all that is still needed
         | allowed V21 && qualified V21 -> enter (if fskOnly then Connected V21 R1200 else OReply V21)
         | allowed Bell103 && qualified Bell103 -> enter (if fskOnly then Connected Bell103 R1200 else OReply Bell103)
+      -- Te, the silence before CM: at least 0.5 s, and a full second
+      -- when network echo cancellers are to be disabled (8.1.1)
+      OV8Wait
+        | inPhase >= 1.0 -> enter OV8CM
+      OV8CM
+        | Just peer <- v8Confirmed -> (enter OV8CJ) { hsV8Peer = Just peer, hsV8Mod = v8Pick peer }
+        | inPhase >= 4 -> enter OAfterAns          -- no JM: back to the ladder
+      OV8CJ
+        -- three octets at 300 bit/s
+        | inPhase >= 0.1 -> enter OV8Gap
+      OV8Gap
+        | inPhase >= 0.075 -> case hsV8Mod st of
+            -- V.8 does not separate V.22 from V.22bis: the answerer now
+            -- sends unscrambled binary 1 and the rate is settled by the
+            -- usual S1 exchange
+            Just MV22 -> enter OAfterAns
+            Just MV21 -> enter (OReply V21)
+            _ -> enter V8NoMode
       OReply s
         | inPhase >= hcQualify cfg && qualified s -> enter (Connected s R1200)
         | inPhase >= 5 -> enter OListen
@@ -521,6 +609,11 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       O8Tone -> TxMark v21Channel2
       O8SendCL -> if hsPhaseAt st'' == t then TxBits v21Channel2 clBits else TxMark v21Channel2
       O8WaitMS -> TxSilence
+      AV8Ansam -> TxAnsam
+      AV8JM -> case hsV8Peer st'' of
+        Just peer | hsPhaseAt st'' == t -> TxBits v21Channel2 (v8Repeat (sequenceBits SeqJM (v8Reply peer)))
+        _ -> TxMark v21Channel2
+      AV8Gap -> TxSilence
       AAns -> TxTone 2100
       AGap -> TxSilence
       AProbe V22 -> TxV22 HighChannel R1200 TxU11
@@ -531,6 +624,11 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       AV22Ones2400 -> TxV22 HighChannel R2400 TxScrambledOnes
       OListen -> TxSilence
       OAnsEnding -> TxSilence
+      OV8Wait -> TxSilence
+      OV8CM -> if hsPhaseAt st'' == t then TxBits v21Channel1 (v8Repeat (sequenceBits SeqCM v8Offer))
+                                      else TxMark v21Channel1
+      OV8CJ -> if hsPhaseAt st'' == t then TxBits v21Channel1 cjBits else TxMark v21Channel1
+      OV8Gap -> TxSilence
       OAfterAns -> if fskOnly then TxMark (fskTx role preferredFsk) else TxSilence
       OReply s -> TxMark (fskTx Originate s)
       OV22Wait -> TxSilence
@@ -544,8 +642,20 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         FskLink {} -> TxSilence
       Connected s _ -> TxData (fskTx (hsRole st'') s)
       Done -> TxSilence
+      V8NoMode -> TxSilence
     -- where to listen for V.8bis messages: the answering (initiating) station
     -- receives on V.21 channel 2, the calling (responding) station on channel 1
+    v8Pick peer = commonModulation v8Offer peer
+    -- CM and JM repeat until answered; queue enough to cover the wait
+    -- rather than re-arming the transmitter every hop
+    v8Repeat bs = concat (replicate 12 bs)
+    v8Listen = case hsPhase st'' of
+      OV8Wait -> Just v21Channel2
+      OV8CM -> Just v21Channel2
+      AV8Ansam -> Just v21Channel1
+      AV8JM -> Just v21Channel1
+      _ -> Nothing
+    v8MenuOut = if hsV8Peer st'' /= hsV8Peer st then hsV8Peer st'' else Nothing
     hdlcListen = case hsPhase st'' of
       A8Wait -> Just v21Channel2
       A8Tone -> Just v21Channel2
@@ -563,10 +673,11 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     status = case (hsPhase st, hsPhase st'') of
       (Connected _ _, Done) -> HsDropped
       (_, Done) -> HsFailed "timeout"
+      (_, V8NoMode) -> HsFailed "V.8: no modulation in common"
       (_, Connected s r) | isV22Family s -> HsConnected s (v22LinkAt (hsRole st'') r)
       (_, Connected s _) -> HsConnected s (linkFor (hsRole st'') s)
       _ -> HsBusy
 
 -- | The handshake as a stage over tone frames (no V.22 receiver).
 handshakeStage :: HsConfig -> Stage ToneFrame HsOut
-handshakeStage cfg = Stage (initialHandshake cfg) (\s fr -> handshakeStep cfg s fr Nothing [])
+handshakeStage cfg = Stage (initialHandshake cfg) (\s fr -> handshakeStep cfg s fr Nothing noHsIn)

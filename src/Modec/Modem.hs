@@ -33,6 +33,7 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.Hdlc
+import Modec.V8
 
 data ModemConfig = ModemConfig
   { mcRate      :: Double
@@ -62,6 +63,7 @@ data ModemEvent
   = EvConnected Standard Link
   | EvDropped
   | EvFailed String
+  | EvV8Menu V8Menu        -- ^ the far end's V.8 capabilities
   deriving (Eq, Show)
 
 -- | Streaming transmitter: phase-continuous tones, FSK with a byte
@@ -97,6 +99,19 @@ txBlock fs amp fr guard cmd n st = case cmd of
         w2 = 2 * pi * f2 / fs
         sig = VS.generate n (\i -> 0.5 * amp * g * (sin (txPhase st + w1 * fromIntegral i) + sin (txPhase2 st + w2 * fromIntegral i)))
     in (st { txPhase = wrap (txPhase st + w1 * fromIntegral n), txPhase2 = wrap (txPhase2 st + w2 * fromIntegral n), txFir = Nothing }, sig)
+  -- ANSam: 2100 Hz with a 15 Hz envelope between 0.8 and 1.2 of average
+  -- (7.2/V.8).  No phase reversals: those exist only to disable network
+  -- echo cancellers, and the Recommendation says not to send them when
+  -- that is not wanted.
+  TxAnsam ->
+    let w = 2 * pi * 2100 / fs
+        wm = 2 * pi * 15 / fs
+        sig = VS.generate n (\i ->
+          let k = fromIntegral i
+          in amp * (1 + 0.2 * sin (txPhase2 st + wm * k)) * sin (txPhase st + w * k))
+    in (st { txPhase = wrap (txPhase st + w * fromIntegral n)
+           , txPhase2 = wrap (txPhase2 st + wm * fromIntegral n)
+           , txFir = Nothing }, sig)
   TxV22 ch rate mode ->
     let (bytes, st1) = case mode of
           TxScrambledData -> (txQueue st, st { txQueue = [] })
@@ -158,6 +173,8 @@ data ModemState = ModemState
   , msV22Rx   :: Maybe (V22Channel, V22RxState)   -- ^ receiver on the remote's V.22 channel
   , msRole    :: Role        -- ^ effective role the V.22 receiver channel follows
   , msHdlc    :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], HdlcRx)
+  , msV8      :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], V8Rx)
+  , msAnsam   :: Ansam
   , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
   , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
@@ -176,7 +193,7 @@ modemInit cfg
     fs = mcRate cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing R1200 0 0 0 HsBusy
+             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200 0 0 0 HsBusy
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -229,6 +246,18 @@ modemStep cfg st0 rxBlock newBytes =
                   (sync', bits) = stepStage sync d
                   (hrx', fsOut) = hdlcRxBits hrx bits
               in (Just (spec, disc', sync', hrx'), fsOut)
+          -- the same arrangement for V.8's CM, JM and CJ, which are
+          -- async octets rather than HDLC frames
+          (v8rx', v8Evs) = case msV8 st of
+            Nothing -> (Nothing, [])
+            Just (spec, disc, sync, vrx) ->
+              let (disc', d) = stepStage disc rxBlock
+                  (sync', bits) = stepStage sync d
+                  (vrx', evs) = v8RxBits vrx bits
+              in (Just (spec, disc', sync', vrx'), evs)
+          -- ANSam runs on the raw block: it is the envelope of the answer
+          -- tone, which a tone bank cannot see
+          (ansam', ansamHit) = ansamBlock (msAnsam st) rxBlock
           -- V.22 receiver on the remote channel, reported to the handshake
           (v22', report, zeros') = case msV22Rx st of
             Nothing -> (Nothing, Nothing, 0)
@@ -236,10 +265,12 @@ modemStep cfg st0 rxBlock newBytes =
               let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
                   z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
               in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
-          (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr report (if i == 0 then hdlcFrames else []) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
+          (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr report (if i == 0 then HsIn hdlcFrames v8Evs ansamHit else noHsIn) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
           (cmd, status, rxRate, role', hdlcWant) =
             if null outs then (msTxCmd st, HsBusy, msRxRate st, msRole st, fmap (\(s, _, _, _) -> s) (msHdlc st))
             else let o = last outs in (hoTx o, hoStatus o, hoRxRate o, hoRole o, hoHdlc o)
+          v8Want = if null outs then fmap (\(s, _, _, _) -> s) (msV8 st) else hoV8 (last outs)
+          v8Menus = [ EvV8Menu m | o <- outs, Just m <- [hoV8Menu o] ]
           -- switch the receiver's decision rate when the handshake says so
           v22a = if rxRate /= msRxRate st then fmap (\(c, r) -> (c, v22RxSetRate rxRate r)) v22' else v22'
           -- a V.8bis mode select reverses the roles: listen on the other channel
@@ -250,7 +281,11 @@ modemStep cfg st0 rxBlock newBytes =
             (Nothing, _) -> Nothing
             (Just spec, Just cur@(s, _, _, _)) | fskName s == fskName spec -> Just cur
             (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), hdlcRxInit)
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msHdlc = hdlc'', msRxRate = rxRate, msZeros = zeros' }
+          v8'' = case (v8Want, v8rx') of
+            (Nothing, _) -> Nothing
+            (Just spec, Just cur@(sp, _, _, _)) | fskName sp == fskName spec -> Just cur
+            (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), v8RxInit)
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msHdlc = hdlc'', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros' }
       in case status of
            HsConnected s link ->
              let mode = case link of
@@ -258,14 +293,14 @@ modemStep cfg st0 rxBlock newBytes =
                    V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
                  st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0 }
                  (txSt, audio) = transmit (markCmd link) st2
-             in (st2 { msTx = txSt }, audio, [], [EvConnected s link])
+             in (st2 { msTx = txSt }, audio, [], v8Menus ++ [EvConnected s link])
            HsFailed why ->
-             (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], [EvFailed why])
+             (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], v8Menus ++ [EvFailed why])
            HsDropped ->
-             (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], [EvDropped])
+             (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], v8Menus ++ [EvDropped])
            HsBusy ->
              let (txSt, audio) = transmit cmd st1
-             in (st1 { msTx = txSt }, audio, [], [])
+             in (st1 { msTx = txSt }, audio, [], v8Menus)
     DataFsk s tx rx disc framer ->
       let (disc', d) = stepStage disc rxBlock
           (framer', bytes) = stepStage framer d

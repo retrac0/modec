@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Dial a list of BBS numbers with modec and record each call.
+
+One call at a time.  For every call baresip is started fresh and killed
+again afterwards, so a call cannot outlive the driver's own timer no
+matter how the modem side behaves: the hard cap on connected time is
+enforced by killing the user agent, not by asking it nicely.
+
+baresip is started first because modec connects to its control port at
+startup; the PipeWire loopback nodes modec then creates are in place well
+before any call needs them, since baresip's audio module only opens the
+device when media comes up.
+"""
+import os, re, signal, struct, subprocess, sys, time, datetime, json
+import math
+
+ROOT = "/home/joel/modec"
+REC = os.path.join(ROOT, "recordings")
+DOMAIN = "toronto.voip.ms"
+CTRL = 4444
+# The trunk answers our INVITE straight away and plays ringback as early
+# media, so "call established" is not "the BBS picked up".  Occupancy of
+# the BBS's own line starts at its answer tone, and that is what the 20 s
+# budget is spent on; the tone is picked out of the recording as it is
+# written.  Ringing costs the far end nothing, so it is not counted, but
+# it is still bounded.
+ANSWER_CAP = 20.0       # seconds on the line once the far end answers
+RING_CAP = 32.0         # give up if no answer tone by then
+TOTAL_CAP = 60.0        # backstop on the whole call
+MODES = {"2400": "v22bis", "300": "v21,bell103", "v8": None}
+# extra modec arguments per rate label
+EXTRA = {"v8": ["--v8"]}
+
+def log(msg):
+    print("%s  %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+def killall(names):
+    for n in names:
+        subprocess.run(["pkill", "-x", n], capture_output=True)
+
+class AnswerWatch:
+    """Spot the far end answering by the tone it sends.
+
+    Reads the growing RX recording and looks for the V.25 answer tone
+    (2100 Hz) or the Bell one (2225 Hz) standing well above everything
+    else.  Ringback is around 400-500 Hz and fails the test, which is the
+    whole point: a ringing line is not an occupied one.
+    """
+    FREQS = (2100.0, 2225.0)
+    FS = 8000
+    FRAME = 320                       # 40 ms
+    NEEDED = 8                        # 0.32 s of tone
+
+    def __init__(self, path):
+        self.path = path
+        self.pos = 0
+        self.run = 0
+        self.tail = b""
+
+    def answered(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos if self.pos else 44)
+                d = f.read()
+                self.pos = f.tell()
+        except OSError:
+            return False
+        d = self.tail + d
+        n = len(d) // 2
+        use = (n // self.FRAME) * self.FRAME
+        self.tail = d[use * 2:]
+        if not use:
+            return False
+        xs = struct.unpack("<%dh" % use, d[:use * 2])
+        for i in range(0, use, self.FRAME):
+            fr = xs[i:i + self.FRAME]
+            total = sum(v * v for v in fr) / self.FRAME
+            if total < (0.02 * 32768) ** 2:       # too quiet to judge
+                self.run = 0
+                continue
+            best = 0.0
+            for f0 in self.FREQS:
+                w = 2 * math.cos(2 * math.pi * f0 / self.FS)
+                s1 = s2 = 0.0
+                for v in fr:
+                    s0 = v + w * s1 - s2
+                    s2, s1 = s1, s0
+                p = (s1 * s1 + s2 * s2 - w * s1 * s2) / (self.FRAME ** 2 / 4)
+                best = max(best, p)
+            self.run = self.run + 1 if best > 0.35 * total else 0
+            if self.run >= self.NEEDED:
+                return True
+        return False
+
+
+def place_call(binpath, number, label, rate, outdir):
+    """Returns a dict describing what happened."""
+    killall(["baresip", "modec", "pw-loopback", "pw-cat"])
+    time.sleep(1.0)
+    ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", label).strip("-").lower()
+    wav = os.path.join(outdir, "%s-%s-%s.wav" % (ts, safe, rate))
+    res = {"bbs": label, "number": number, "rate": rate, "wav": os.path.basename(wav),
+           "started": ts, "connected": False, "standard": None, "text": "",
+           "outcome": "no answer", "call_seconds": 0.0, "ring_seconds": 0.0,
+           "v8": None}
+
+    baresip = subprocess.Popen(["baresip"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    time.sleep(3.5)                            # let it register
+    modec = subprocess.Popen(
+        [binpath, "modem", "--sip", "127.0.0.1:%d" % CTRL, "--sip-domain", DOMAIN,
+         "--audio-sip-loop", "modec"]
+        + (["--modes", MODES[rate]] if MODES[rate] else [])
+        + EXTRA.get(rate, [])
+        + ["--record-rx", wav, "--data-stdio"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=ROOT, bufsize=0)
+    os.set_blocking(modec.stdout.fileno(), False)
+    os.set_blocking(modec.stderr.fileno(), False)
+    out, err = b"", b""
+
+    def pump():
+        nonlocal out, err
+        for src, which in ((modec.stdout, "o"), (modec.stderr, "e")):
+            try:
+                d = src.read()
+            except Exception:
+                d = None
+            if d:
+                if which == "o": out += d
+                else: err += d
+
+    try:
+        # wait for the loopback nodes, then bring up the user agent
+        t0 = time.time()
+        while time.time() - t0 < 10 and b"Hayes command mode" not in err:
+            pump(); time.sleep(0.1)
+        if b"Hayes command mode" not in err:
+            res["outcome"] = "modec did not start"
+            return res, err.decode(errors="replace")
+
+        modec.stdin.write(b"ATDT%s\r" % number.encode())
+        modec.stdin.flush()
+        log("  dialled %s" % number)
+
+        # ringing: wait for the far end's answer tone, not the trunk's
+        # early media
+        dialled = time.time(); watch = AnswerWatch(wav); up = None
+        while time.time() - dialled < RING_CAP:
+            pump()
+            if b"NO CARRIER" in out or b"BUSY" in out:
+                res["outcome"] = "busy or rejected"; break
+            if watch.answered() or re.search(rb"CONNECT \d+", out):
+                up = time.time(); break
+            time.sleep(0.1)
+        if up is None:
+            res["ring_seconds"] = round(time.time() - dialled, 1)
+            if res["outcome"] == "no answer":
+                log("  no answer tone after %.0f s" % res["ring_seconds"])
+            return res, err.decode(errors="replace")
+        res["ring_seconds"] = round(up - dialled, 1)
+        log("  far end answered after %.1f s, holding %.0f s" % (res["ring_seconds"], ANSWER_CAP))
+        while time.time() - up < ANSWER_CAP and time.time() - dialled < TOTAL_CAP:
+            pump()
+            if not res["connected"]:
+                m = re.search(rb"CONNECT (\d+)", out)
+                if m:
+                    res["connected"] = True
+                    sm = re.search(rb"CONNECT ([A-Za-z0-9]+) ", err)
+                    res["standard"] = sm.group(1).decode() if sm else None
+                    log("  CONNECT %s" % m.group(1).decode())
+                    # a little traffic so the far end sees us
+                    try:
+                        modec.stdin.write(b"\r"); modec.stdin.flush()
+                    except Exception:
+                        pass
+            if b"NO CARRIER" in out and res["connected"]:
+                break
+            time.sleep(0.1)
+        res["call_seconds"] = round(time.time() - up, 1)
+        pump()
+        try:
+            modec.stdin.write(b"+++"); modec.stdin.flush(); time.sleep(1.2)
+            modec.stdin.write(b"ATH\r"); modec.stdin.flush(); time.sleep(0.8)
+        except Exception:
+            pass
+        pump()
+    finally:
+        if baresip:
+            baresip.send_signal(signal.SIGTERM)
+            try: baresip.wait(3)
+            except subprocess.TimeoutExpired: baresip.kill()
+        modec.send_signal(signal.SIGTERM)
+        try: modec.wait(4)
+        except subprocess.TimeoutExpired: modec.kill()
+        killall(["baresip", "modec", "pw-loopback", "pw-cat"])
+        pump()
+
+    # printable text the far end sent
+    txt = re.sub(rb"\xff[\xfa-\xfe].", b"", out)
+    txt = bytes(c for c in txt if 32 <= c < 127 or c in (10, 13))
+    res["text"] = txt.decode(errors="replace").strip()
+    if res["connected"]:
+        res["outcome"] = "connected"
+    elif res["outcome"] == "no answer":
+        res["outcome"] = "answered, no carrier"
+    if res["standard"] is None:
+        sm = re.search(rb"CONNECT ([A-Za-z0-9]+) ", err)
+        if sm:
+            res["standard"] = sm.group(1).decode()
+    vm = re.search(rb"V\.8 far end offers: (.+)", err)
+    if vm:
+        res["v8"] = vm.group(1).decode(errors="replace").strip()
+    return res, err.decode(errors="replace")
+
+if __name__ == "__main__":
+    binpath = subprocess.run(["cabal", "list-bin", "exe:modec"], cwd=ROOT,
+                             capture_output=True, text=True).stdout.strip()
+    targets = json.load(open(sys.argv[1]))
+    rates = sys.argv[2].split(",") if len(sys.argv) > 2 else ["2400", "300"]
+    results = []
+    outjson = sys.argv[3] if len(sys.argv) > 3 else "/dev/null"
+    for t in targets:
+        for rate in rates:
+            log("%s  %s  @%s" % (t["name"], t["number"], rate))
+            r, errlog = place_call(binpath, t["number"], t["name"], rate, REC)
+            log("  -> %s%s" % (r["outcome"], (" " + r["standard"]) if r["standard"] else ""))
+            if r["v8"]:
+                log("  V.8: %s" % r["v8"])
+            if r["text"]:
+                log("  text: %r" % r["text"][:200])
+            results.append(r)
+            json.dump(results, open(outjson, "w"), indent=1)
+    log("done, %d calls" % len(results))

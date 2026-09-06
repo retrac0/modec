@@ -67,6 +67,7 @@ cmdP = hsubparser
            <|> pure H.allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
+      <*> switch (long "v8" <> help "V.8: answer with ANSam and exchange CM/JM capability menus")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
       <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")

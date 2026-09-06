@@ -24,6 +24,7 @@ import Modec.Telnet
 import Modec.Async
 import Modec.V22
 import Modec.Hdlc
+import Modec.V8
 import Modec.V8bis
 import Modec.Hayes
 import Modec.Dtmf
@@ -200,7 +201,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
       case sdBank s of
        Stage bst bstep ->
         let (bst', frames) = bstep bst audio
-            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing [] in (h', acc ++ [(hoTx o, hoStatus o)])) (sdHs s, []) frames
+            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing noHsIn in (h', acc ++ [(hoTx o, hoStatus o)])) (sdHs s, []) frames
             s' = s { sdBank = Stage bst' bstep, sdHs = hs' }
         in case outs of
              [] -> s'
@@ -619,4 +620,94 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests, pipewireTests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+
+v8Tests :: TestTree
+v8Tests = testGroup "V.8 menus and ANSam"
+  [ testCase "a CM carries the preamble, call function and modulation octets" $ do
+      let bits = sequenceBits SeqCM ourMenu
+      assertEqual "ten ONEs then the CM sync" (map (== '1') "11111111110000001111") (take 20 bits)
+      -- four octets: call function and three modulation octets, each
+      -- with a start and a stop bit
+      assertEqual "length" (20 + 4 * 10) (length bits)
+      assertEqual "every octet framed" (replicate 4 (False, True))
+        [ (o !! 0, o !! 9) | i <- [0 .. 3], let o = take 10 (drop (20 + 10 * i) bits) ]
+  , testCase "CM round-trips through the receiver" $ do
+      -- a sequence is emitted when its framing stops holding, which on
+      -- the line is the ten ONEs opening whatever comes next
+      let (_, evs) = v8RxBits v8RxInit
+            (sequenceBits SeqCM ourMenu ++ sequenceBits SeqCM ourMenu ++ replicate 10 True)
+      case evs of
+        [V8Sequence SeqCM a, V8Sequence SeqCM b] -> do
+          assertEqual "call function" (Just CfData) (v8Call a)
+          assertEqual "modulations" [MV22, MV21] (v8Mods a)
+          assertEqual "three modulation octets" 3 (v8ModOctets a)
+          assertEqual "both alike" a b
+        _ -> assertFailure ("expected two CM sequences, got " ++ show (length evs))
+  , testCase "a menu with every option set survives the round trip" $ do
+      let full = emptyMenu { v8Call = Just CfFaxFromCaller
+                           , v8Mods = [MV34Duplex, MV32, MV22, MV27ter, MV23Duplex, MV21]
+                           , v8Lapm = True
+                           , v8Pcm = Just (True, False, False)
+                           , v8Access = Just (False, False, True) }
+          (_, evs) = v8RxBits v8RxInit (sequenceBits SeqCM full ++ replicate 10 True)
+      case evs of
+        [V8Sequence _ m] -> do
+          assertEqual "call function" (Just CfFaxFromCaller) (v8Call m)
+          assertEqual "modulations" [MV34Duplex, MV32, MV22, MV27ter, MV23Duplex, MV21] (v8Mods m)
+          assertEqual "LAPM" True (v8Lapm m)
+          assertEqual "PCM" (Just (True, False, False)) (v8Pcm m)
+          assertEqual "access" (Just (False, False, True)) (v8Access m)
+        _ -> assertFailure ("expected one sequence, got " ++ show evs)
+  , testCase "no HDLC flag can appear in a signal" $ do
+      -- the fixed bits in 5.1 and 5.2 exist so that a T.30 receiver on
+      -- the same V.21 channel never mistakes JM for a frame
+      let menus = [ emptyMenu { v8Call = Just cf, v8Mods = ms }
+                  | cf <- [minBound .. maxBound]
+                  , ms <- [[], [MV21], [MV22, MV21], [minBound .. maxBound]] ]
+          flag = map (== '1') "01111110"
+          hasFlag bs = any (\i -> take 8 (drop i bs) == flag) [0 .. length bs - 8]
+      assertEqual "flags" [] [ describeMenu m | m <- menus, hasFlag (sequenceBits SeqCM m) ]
+  , testCase "CJ is three zero octets and is recognised" $ do
+      assertEqual "30 bits" 30 (length cjBits)
+      let (_, evs) = v8RxBits v8RxInit (sequenceBits SeqCM ourMenu ++ cjBits)
+      assertBool "CJ seen" (V8CJ `elem` evs)
+  , testCase "the lowest item number wins" $ do
+      -- 7.4: of the modes in common, the one with the lowest item number
+      let far = emptyMenu { v8Mods = [MV34Duplex, MV32, MV22, MV21] }
+      assertEqual "V.22 beats V.21" (Just MV22) (commonModulation ourMenu far)
+      assertEqual "only V.21 in common" (Just MV21)
+        (commonModulation ourMenu far { v8Mods = [MV34Duplex, MV21] })
+      assertEqual "nothing in common" Nothing
+        (commonModulation ourMenu far { v8Mods = [MV34Duplex, MV32] })
+      assertEqual "item order" [1, 3, 4, 12] (map modItem [MV34Duplex, MV32, MV22, MV21])
+  , testCase "a JM saying nothing in common still matches the CM octet count" $ do
+      -- 8.2.3: same number of modulation octets, all zeros
+      let jm = emptyMenu { v8Call = Just CfData, v8ModOctets = 3 }
+          (_, evs) = v8RxBits v8RxInit (sequenceBits SeqJM jm ++ replicate 10 True)
+      case evs of
+        [V8Sequence _ m] -> do
+          assertEqual "no modulations" [] (v8Mods m)
+          assertEqual "three octets all the same" 3 (v8ModOctets m)
+        _ -> assertFailure "expected one sequence"
+  , testCase "ANSam is told apart from a plain answer tone" $ do
+      let fs = 8000 :: Double
+          tone f = VS.generate (round (fs * 3)) (\i -> 0.2 * sin (2 * pi * f * fromIntegral i / fs))
+          saw x = snd (ansamBlock (ansamInit fs) x)
+      assertBool "ANSam" (saw (ansamSignal fs 0.2 3 False))
+      assertBool "ANSam with phase reversals" (saw (ansamSignal fs 0.2 3 True))
+      assertBool "plain ANS is not ANSam" (not (saw (tone 2100)))
+      assertBool "the Bell answer tone is not ANSam" (not (saw (tone 2225)))
+      assertBool "silence is not ANSam" (not (saw (VS.replicate (round (fs * 3)) 0)))
+  , testCase "a modem carrier does not read as ANSam" $ do
+      -- any fluctuating envelope has some 15 Hz in it, so the detector
+      -- has to insist that 2100 Hz is actually what is on the line
+      let fs = 8000 :: Double
+          noisy = VS.generate (round (fs * 3)) (\i ->
+            let t = fromIntegral i / fs
+            in 0.2 * sin (2 * pi * 1200 * t) * (1 + 0.3 * sin (2 * pi * 15 * t)))
+      assertBool "1200 Hz carrier" (not (snd (ansamBlock (ansamInit fs) noisy)))
+  ]
+  where
+    -- what modec can offer: V.8 has no codepoint for the Bell modes
+    ourMenu = emptyMenu { v8Call = Just CfData, v8Mods = [MV22, MV21] }
