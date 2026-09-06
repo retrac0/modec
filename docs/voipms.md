@@ -169,6 +169,25 @@ answering modem**, whose banner and prompts decoded perfectly.
 
 Four things had to be fixed to get there, all of them worth knowing:
 
+**Junk characters echoed back by the far end -- `þ` (0xFE) at 300 bit/s,
+random bytes at 2400 -- while what it sends reads perfectly** are holes
+in our transmitted audio, not line noise. Each hole is a moment of
+silence in our carrier that the far end's framer takes for a start bit.
+modec keeps 100 ms of audio ahead of its playback stream for exactly
+this reason; `MODEC_TX_LEAD_MS=200` widens it and `MODEC_PW_LATENCY=50ms`
+changes the quantum both pw-cat streams run on, if a machine needs
+different figures.
+
+To measure it, run the modem on the loopback with no call up
+(`modec modem --audio-sip-loop modec --originate --data-stdio`) and
+watch `pw-top`: the `ERR` column on `modec-tx` counts the playback
+stream's underruns, and it should not move once the first few seconds
+are past. Ignore the burst at startup -- the stream connects before
+capture delivers anything -- and ignore the column entirely during a
+call: the sound card becomes the graph driver then, at a 5 ms cycle, and
+the count climbs by the hundred on a stream that is delivering every
+sample. The echo the far end gives you is the judge during a call.
+
 **Do not set `medianat=stun` on the account.** baresip then sends a
 re-INVITE once STUN resolves the media address, and voip.ms answers
 `481 Call/Transaction Does Not Exist`, tearing the call down in the middle

@@ -146,9 +146,34 @@ runModem o = do
     withData (moData o) $ \recvBytes sendBytes -> do
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
       blockRef <- newIORef (0 :: Int)
-      -- output leads input by one block: two modems joined by pipes would
-      -- otherwise each wait for the other's first block
+      -- Output leads input.  One block was enough for two modems joined
+      -- by pipes, which would otherwise each wait for the other's first
+      -- block, and one block is not enough for PipeWire.  Both pw-cat
+      -- streams run on a 100 ms quantum: capture hands over 100 ms at a
+      -- time, and playback asks for 100 ms at a time, on two clocks that
+      -- have no reason to agree.  Feeding playback exactly what capture
+      -- delivered leaves it one block ahead on a good cycle and short on
+      -- a bad one, and every short cycle is an xrun: pw-top counted one a
+      -- second on modec-tx, and each one is a hole in our carrier that the
+      -- far end reads as a start bit -- 0xFE at 300 bit/s, a scrambled
+      -- byte at 2400.  Measured on this machine, 50 ms of cushion laid
+      -- down at the right moment is already enough for pw-top to count
+      -- no xruns at all over a call; 100 ms is that with margin, at a
+      -- cost on our transmit that no handshake timer here notices.
+      -- MODEC_TX_LEAD_MS overrides it.
+      -- The cushion has to be laid down once capture is actually
+      -- flowing.  Playback connects before capture does, and anything
+      -- written before the first block arrives is drained by those
+      -- first empty cycles while we are still blocked on the read; a
+      -- cushion written then is gone before the call starts, and the
+      -- rest of the call runs with none.  One block goes out now, so two
+      -- modems joined by pipes do not each wait for the other's first
+      -- block; the cushion follows the first block in.
+      leadMs <- maybe 100 read <$> lookupEnv "MODEC_TX_LEAD_MS"
+      let leadBlocks = max 1 ((leadMs + moBlockMs o - 1) `div` moBlockMs o) :: Int
+          lead = encodeS16 (VS.replicate (blockN * leadBlocks) 0)
       aiWrite ai (encodeS16 (VS.replicate blockN 0))
+      primed <- newIORef False
       restarts <- newIORef (0 :: Int)
       -- optional session recordings, useful for checking what a VoIP trunk
       -- does to modem tones (modec detect / probe read them back)
@@ -181,6 +206,10 @@ runModem o = do
                 writeIORef callRef Nothing
       let readBlock = do
             bs <- aiRead ai (2 * blockN)
+            p <- readIORef primed
+            unless p $ do
+              writeIORef primed True
+              aiWrite ai lead
             mapM_ (\w -> wavAppendRaw w bs) recRx
             mc <- readIORef callRef
             mapM_ (\c -> callRecWrite c bs) mc
@@ -205,6 +234,7 @@ runModem o = do
                     writeIORef restarts (n + 1)
                     logMsg ("audio restarted (attempt " ++ show (n + 1) ++ ")")
                     aiWrite ai (encodeS16 (VS.replicate blockN 0))
+                    writeIORef primed False
                     return True
                   else return False
       let lineNode = case moAudio o of
@@ -611,7 +641,10 @@ resolveOpt (Just spec) want = do
 
 -- | Open the audio interface.
 withAudio :: AudioIO -> Int -> Role -> (AudioIf -> IO a) -> IO a
-withAudio aio rate role body = case aio of
+withAudio aio rate role body = lookupEnv "MODEC_PW_LATENCY" >>= \pwLatencyEnv -> withAudio' aio rate role body pwLatencyEnv
+
+withAudio' :: AudioIO -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> IO a
+withAudio' aio rate role body pwLatencyEnv = case aio of
   AudioStdio -> body (handleIf stdin stdout)
   AudioFiles i o -> do
     -- Blocking POSIX opens (GHC's openFile opens FIFOs non-blocking and
@@ -674,7 +707,10 @@ withAudio aio rate role body = case aio of
             ++ ", out: " ++ nodeLabel outN ++ ", " ++ show rate ++ " Hz")
     withPwCatPair recArgs playArgs (withGainCheck ["modec-rx", "modec-tx"] body)
   where
-    common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
+    common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", pwLatency]
+    -- The quantum both pw-cat streams run on.  Overridable while the
+    -- right figure is being found: MODEC_PW_LATENCY=50ms.
+    pwLatency = maybe "100ms" id pwLatencyEnv
     -- WirePlumber restores per-application volumes from its
     -- stream-properties state, and every pw-cat stream on the machine
     -- shares the application name "pw-cat".  A single slider drag in a
