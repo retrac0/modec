@@ -321,6 +321,12 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       Just (g, since) | g == f -> t - since
       _ -> 0
     quiet = t - lastTone
+    -- how long a tone other than the ITU answer tone has been dominant;
+    -- an answering modem that steps straight from the answer tone to the
+    -- next rung of its fallback ladder leaves no silence between them
+    sinceOtherTone = case toneSince of
+      Just (f, since) | f /= 2100 -> t - since
+      _ -> 0
     st' = st { hsToneSince = toneSince, hsLastTone = lastTone, hsT = t
              , hsPairRun = pairRun', hsPairSeen = if sig /= Nothing then Nothing else pairSeen'', hsSig = sig, hsLastRsp = rspPair }
     inPhase = t - hsPhaseAt st
@@ -335,6 +341,15 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     -- scrambled DPSK marks answering our 2225 Hz mean a 1200 bit/s link;
     -- V.22 modems do this too (V.22 §6.3.1.1 note), so accept either name
     bellDpsk = [ s | s <- [Bell212A, V22], allowed s ]
+    -- With no V.22-family mode configured there is nothing to disturb by
+    -- transmitting early, so follow V.25 and put our carrier up as soon as
+    -- the answer tone ends rather than waiting to hear the answerer's.
+    -- An answering modem that steps through a fallback ladder may hold
+    -- each rung open for only a second or two.
+    fskOnly = not v22Allowed && (allowed V21 || allowed Bell103)
+    preferredFsk = case [ s | s <- modes, s `elem` [V21, Bell103] ] of
+      (s : _) -> s
+      [] -> V21
     -- which Bell mode a 2225 Hz answer tone should be answered with
     bellChoice = case [ s | s <- modes, s `elem` [Bell212A, Bell103], not (s == Bell212A && hsTried212 st) ] of
       (s : _) -> Just s
@@ -457,11 +472,13 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         | bellChoice == Just Bell103 && qualified Bell103 -> enter (OReply Bell103)
         | heardFor 2100 >= hcQualify cfg -> enter OAnsEnding
       OAnsEnding
-        | dom /= Just 2100 && quiet >= 0.04 -> enter OAfterAns
+        | dom /= Just 2100 && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
       OAfterAns
         | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
-        | allowed V21 && qualified V21 -> enter (OReply V21)
-        | allowed Bell103 && qualified Bell103 -> enter (OReply Bell103)
+        -- our carrier is already up in FSK-only mode, so the answerer's
+        -- carrier is all that is still needed
+        | allowed V21 && qualified V21 -> enter (if fskOnly then Connected V21 R1200 else OReply V21)
+        | allowed Bell103 && qualified Bell103 -> enter (if fskOnly then Connected Bell103 R1200 else OReply Bell103)
       OReply s
         | inPhase >= hcQualify cfg && qualified s -> enter (Connected s R1200)
         | inPhase >= 5 -> enter OListen
@@ -514,7 +531,7 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       AV22Ones2400 -> TxV22 HighChannel R2400 TxScrambledOnes
       OListen -> TxSilence
       OAnsEnding -> TxSilence
-      OAfterAns -> TxSilence
+      OAfterAns -> if fskOnly then TxMark (fskTx role preferredFsk) else TxSilence
       OReply s -> TxMark (fskTx Originate s)
       OV22Wait -> TxSilence
       OV22S1 -> TxV22 LowChannel R1200 TxS1
