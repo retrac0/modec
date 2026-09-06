@@ -3,3 +3,7 @@ dist-newstyle/
 *.o
 pw
 *.wav.tmp
+
+# Call recordings: kept on disk, too bulky for git.  The handful
+# already tracked stay tracked; sweeps add tens of megabytes a run.
+recordings/*.wav

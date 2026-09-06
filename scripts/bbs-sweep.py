@@ -16,6 +16,7 @@ import math
 
 ROOT = "/home/joel/modec"
 REC = os.path.join(ROOT, "recordings")
+LOGS = os.environ.get("BBS_LOGS", "/tmp/bbs-logs")
 DOMAIN = "toronto.voip.ms"
 CTRL = 4444
 # The trunk answers our INVITE straight away and plays ringback as early
@@ -24,12 +25,28 @@ CTRL = 4444
 # budget is spent on; the tone is picked out of the recording as it is
 # written.  Ringing costs the far end nothing, so it is not counted, but
 # it is still bounded.
-ANSWER_CAP = 20.0       # seconds on the line once the far end answers
+ANSWER_CAP = float(os.environ.get("BBS_HOLD", "20"))   # seconds on the line once answered
+NUDGE = 4.0             # seconds between bare returns once connected
 RING_CAP = 32.0         # give up if no answer tone by then
-TOTAL_CAP = 60.0        # backstop on the whole call
-MODES = {"2400": "v22bis", "300": "v21,bell103", "v8": None}
-# extra modec arguments per rate label
-EXTRA = {"v8": ["--v8"]}
+TOTAL_CAP = ANSWER_CAP + RING_CAP + 10        # backstop on the whole call
+# Each configuration names the modec arguments to negotiate with.  V.8
+# has codepoints only for ITU modes, so a Bell-only configuration cannot
+# use it and falls back to the classic ladder on its own.
+CONFIGS = {
+    "2400":        ["--modes", "v22bis"],
+    "300":         ["--modes", "v21,bell103"],
+    "v8":          ["--v8"],
+    "v8all":       ["--v8-offer-all"],
+    "v22bis":      ["--modes", "v22bis"],
+    "v22bis-v8":   ["--modes", "v22bis", "--v8"],
+    "v22":         ["--modes", "v22"],
+    "bell212a":    ["--modes", "bell212a"],
+    "v21":         ["--modes", "v21"],
+    "v21-v8":      ["--modes", "v21", "--v8"],
+    "bell103":     ["--modes", "bell103"],
+    "auto":        [],
+    "auto-v8":     ["--v8"],
+}
 
 def log(msg):
     print("%s  %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
@@ -93,6 +110,13 @@ class AnswerWatch:
         return False
 
 
+def send(proc, data):
+    try:
+        proc.stdin.write(data); proc.stdin.flush()
+    except Exception:
+        pass
+
+
 def place_call(binpath, number, label, rate, outdir):
     """Returns a dict describing what happened."""
     killall(["baresip", "modec", "pw-loopback", "pw-cat"])
@@ -103,7 +127,7 @@ def place_call(binpath, number, label, rate, outdir):
     res = {"bbs": label, "number": number, "rate": rate, "wav": os.path.basename(wav),
            "started": ts, "connected": False, "standard": None, "text": "",
            "outcome": "no answer", "call_seconds": 0.0, "ring_seconds": 0.0,
-           "v8": None}
+           "connect_seconds": None, "v8": None}
 
     baresip = subprocess.Popen(["baresip"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
@@ -111,8 +135,7 @@ def place_call(binpath, number, label, rate, outdir):
     modec = subprocess.Popen(
         [binpath, "modem", "--sip", "127.0.0.1:%d" % CTRL, "--sip-domain", DOMAIN,
          "--audio-sip-loop", "modec"]
-        + (["--modes", MODES[rate]] if MODES[rate] else [])
-        + EXTRA.get(rate, [])
+        + CONFIGS[rate]
         + ["--record-rx", wav, "--data-stdio"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd=ROOT, bufsize=0)
@@ -161,20 +184,24 @@ def place_call(binpath, number, label, rate, outdir):
             return res, err.decode(errors="replace")
         res["ring_seconds"] = round(up - dialled, 1)
         log("  far end answered after %.1f s, holding %.0f s" % (res["ring_seconds"], ANSWER_CAP))
+        nudged = 0.0
         while time.time() - up < ANSWER_CAP and time.time() - dialled < TOTAL_CAP:
             pump()
             if not res["connected"]:
                 m = re.search(rb"CONNECT (\d+)", out)
                 if m:
                     res["connected"] = True
+                    res["connect_seconds"] = round(time.time() - up, 1)
                     sm = re.search(rb"CONNECT ([A-Za-z0-9]+) ", err)
                     res["standard"] = sm.group(1).decode() if sm else None
-                    log("  CONNECT %s" % m.group(1).decode())
-                    # a little traffic so the far end sees us
-                    try:
-                        modec.stdin.write(b"\r"); modec.stdin.flush()
-                    except Exception:
-                        pass
+                    log("  CONNECT %s after %.1f s" % (m.group(1).decode(), res["connect_seconds"]))
+                    nudged = time.time()
+                    send(modec, b"\r")
+            elif time.time() - nudged >= NUDGE:
+                # a BBS waits at a prompt; a bare return is enough to walk
+                # a banner into a menu without answering anything for real
+                nudged = time.time()
+                send(modec, b"\r")
             if b"NO CARRIER" in out and res["connected"]:
                 break
             time.sleep(0.1)
@@ -215,14 +242,22 @@ def place_call(binpath, number, label, rate, outdir):
     return res, err.decode(errors="replace")
 
 if __name__ == "__main__":
+    os.makedirs(LOGS, exist_ok=True)
     binpath = subprocess.run(["cabal", "list-bin", "exe:modec"], cwd=ROOT,
                              capture_output=True, text=True).stdout.strip()
     targets = json.load(open(sys.argv[1]))
     rates = sys.argv[2].split(",") if len(sys.argv) > 2 else ["2400", "300"]
     results = []
     outjson = sys.argv[3] if len(sys.argv) > 3 else "/dev/null"
-    for t in targets:
-        for rate in rates:
+    # Rotating pairs each BBS with a different configuration instead of
+    # running the whole cross product: it covers every configuration
+    # across the population without calling one BBS a dozen times over.
+    rotate = os.environ.get("BBS_ROTATE") == "1"
+    offset = int(os.environ.get("BBS_OFFSET", "0"))
+    plan = ([(t, rates[(i + offset) % len(rates)]) for i, t in enumerate(targets)]
+            if rotate else [(t, r) for t in targets for r in rates])
+    for t, rate in plan:
+        if True:
             log("%s  %s  @%s" % (t["name"], t["number"], rate))
             r, errlog = place_call(binpath, t["number"], t["name"], rate, REC)
             log("  -> %s%s" % (r["outcome"], (" " + r["standard"]) if r["standard"] else ""))
@@ -230,6 +265,8 @@ if __name__ == "__main__":
                 log("  V.8: %s" % r["v8"])
             if r["text"]:
                 log("  text: %r" % r["text"][:200])
+            with open(os.path.join(LOGS, os.path.basename(r["wav"]) + ".log"), "w") as f:
+                f.write(errlog)
             results.append(r)
             json.dump(results, open(outjson, "w"), indent=1)
     log("done, %d calls" % len(results))

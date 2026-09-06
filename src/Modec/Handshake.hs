@@ -150,6 +150,7 @@ data HsConfig = HsConfig
   , hcTimeout     :: Double           -- ^ give up after this long
   , hcV8bis       :: Bool             -- ^ try a V.8bis capabilities exchange before the modem start-up
   , hcV8          :: Bool             -- ^ answer with ANSam and exchange V.8 CM/JM menus
+  , hcV8OfferAll  :: Bool             -- ^ advertise every V.8 modulation, to read back a full menu
   } deriving (Show)
 
 defaultHsConfig :: Role -> HsConfig
@@ -157,7 +158,7 @@ defaultHsConfig role = HsConfig
   { hcRole = role, hcModes = allStandards, hcBank = defaultToneBank
   , hcSquelch = 3e-3, hcDomRatio = 1.5
   , hcBilling = 2.0, hcAnsDuration = 3.0, hcAnsGap = 0.075, hcProbe = 1.5
-  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True, hcV8 = False }
+  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True, hcV8 = False, hcV8OfferAll = False }
 
 -- | What the transmitter should be doing right now.
 data TxCmd
@@ -353,7 +354,18 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     ansamSeen = hsAnsam st || hiAnsam inp
     -- only ITU modes have codepoints in Table 4, so a Bell-only
     -- configuration has nothing it can offer here
-    ourV8Mods = [ MV22 | any (`elem` modes) [V22, V22bis] ] ++ [ MV21 | V21 `elem` modes ]
+    ourV8Mods
+      -- JM is the intersection of CM with what the answerer has, so a
+      -- CM listing only what we can run tells us only whether the far
+      -- end has that.  Offering everything is how you get it to name its
+      -- whole menu; nothing it then selects will be runnable, which is
+      -- the price of asking.
+      | hcV8OfferAll cfg = [minBound .. maxBound]
+      | otherwise = [ MV22 | any (`elem` modes) [V22, V22bis] ] ++ [ MV21 | V21 `elem` modes ]
+    canRun m = case m of
+      MV22 -> any (`elem` modes) [V22, V22bis]
+      MV21 -> V21 `elem` modes
+      _ -> False
     v8Offer = emptyMenu { v8Call = Just CfData, v8Mods = ourV8Mods }
     -- JM lists what both have, and keeps the CM's octet count even when
     -- that is nothing at all (8.2.3)
@@ -484,8 +496,8 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
         | inPhase >= 3 -> enter AV8Gap
       AV8Gap
         | inPhase >= 0.075 -> case hsV8Mod st of
-            Just MV22 -> enter (AProbe V22)
-            Just MV21 -> enter (AProbe V21)
+            Just MV22 | canRun MV22 -> enter (AProbe V22)
+            Just MV21 | canRun MV21 -> enter (AProbe V21)
             _ -> enter V8NoMode
       AAns
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
@@ -564,8 +576,8 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
             -- V.8 does not separate V.22 from V.22bis: the answerer now
             -- sends unscrambled binary 1 and the rate is settled by the
             -- usual S1 exchange
-            Just MV22 -> enter OAfterAns
-            Just MV21 -> enter (OReply V21)
+            Just MV22 | canRun MV22 -> enter OAfterAns
+            Just MV21 | canRun MV21 -> enter (OReply V21)
             _ -> enter V8NoMode
       OReply s
         | inPhase >= hcQualify cfg && qualified s -> enter (Connected s R1200)
@@ -673,7 +685,9 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
     status = case (hsPhase st, hsPhase st'') of
       (Connected _ _, Done) -> HsDropped
       (_, Done) -> HsFailed "timeout"
-      (_, V8NoMode) -> HsFailed "V.8: no modulation in common"
+      (_, V8NoMode) -> HsFailed (case hsV8Mod st'' of
+        Just m -> "V.8: far end selected " ++ modName m ++ ", which this modem does not run"
+        Nothing -> "V.8: no modulation in common")
       (_, Connected s r) | isV22Family s -> HsConnected s (v22LinkAt (hsRole st'') r)
       (_, Connected s _) -> HsConnected s (linkFor (hsRole st'') s)
       _ -> HsBusy
