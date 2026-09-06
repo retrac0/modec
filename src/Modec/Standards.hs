@@ -7,6 +7,8 @@ module Modec.Standards
   , v21Channel2
   , v23Forward
   , v23Backward
+  , tdd45
+  , tdd50
   , fskStandards
   , answerToneItu
   , answerToneBell
@@ -49,6 +51,25 @@ v23Forward = FskSpec "v23-forward" 1300 2100 1200
 v23Backward :: FskSpec
 v23Backward = FskSpec "v23-backward" 390 450 75
 
+-- | The 5-bit text telephone (TTY/TDD) line, ITU-T V.18 Annex A, whose
+-- normative definition is ANSI/TIA-825.  Mark is the lower tone and the
+-- tolerance on both is +/-5 %.
+--
+-- One tone pair serves both directions, so the mode is half duplex and
+-- a station hears its own transmitter through the hybrid; and no
+-- carrier at all is present between characters, so this is the only
+-- line here whose receiver cannot hunt for a start bit in idle mark.
+-- Both facts are the receiver's problem, not the spec's: see
+-- 'Modec.FSK.fskBurstDeframer'.
+tdd45 :: FskSpec
+tdd45 = FskSpec "tdd-45" 1400 1800 45.45
+
+-- | The same line at 50 baud, as sold outside North America.  It is a
+-- separate mode rather than a tolerance: 50 into a 45.45 receiver is a
+-- 10 % clock error, and this family of receivers gives up around 3 %.
+tdd50 :: FskSpec
+tdd50 = FskSpec "tdd-50" 1400 1800 50
+
 -- | The channels an offline classifier can tell apart by their tones.
 --
 -- 'v23Forward' is deliberately absent.  A tone bank integrates over a
@@ -57,9 +78,15 @@ v23Backward = FskSpec "v23-backward" 390 450 75
 -- of bits, across which a continuous-phase carrier does not add up.  The
 -- forward channel is identified by demodulating it, not by looking at
 -- it; the backward channel at 75 bit/s has no such problem.
+--
+-- 'tdd50' is absent for the opposite reason: it is not that its tones
+-- cannot be measured but that they are the same two tones as 'tdd45'.
+-- Nothing in a tone bank separates two modes that differ only in baud,
+-- so the classifier names the tone pair and the rate is settled by
+-- demodulating at each and seeing which one frames characters.
 fskStandards :: [FskSpec]
 fskStandards =
-  [bell103Originate, bell103Answer, v21Channel1, v21Channel2, v23Backward]
+  [bell103Originate, bell103Answer, v21Channel1, v21Channel2, v23Backward, tdd45]
 
 -- | V.25 answer tone.
 answerToneItu :: Double

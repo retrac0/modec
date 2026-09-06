@@ -39,6 +39,52 @@ with an annotated timeline.
   channel but not the forward one: at 1200 bit/s no analysis window can
   both separate 1300 Hz from the Bell 103 mark 30 Hz away and stay short
   enough for a continuous-phase carrier to add up over it.
+- Text telephone, 5-bit Baudot (`--tty45` / `--tty50`, `Modec.Baudot`):
+  the TTY/TDD line deaf and hard-of-hearing users have had on the PSTN
+  since 1964, ITU-T V.18 Annex A and normatively ANSI/TIA-825. 1400 Hz
+  mark, 1800 Hz space, 45.45 baud (50 outside North America), one start
+  bit, five data bits and at least one and a half stop bits. Offline
+  `encode`/`decode` carry text, not bytes: `Modec.Baudot` holds V.18
+  Table A.1 and the ASCII folding of Table A.2, tracks the LTRS/FIGS
+  shift, opens with LTRS and re-sends the shift every 72 characters, and
+  deliberately does *not* unshift on space -- that is the RTTY
+  convention, and minimodem's `tdd` mode applies it by default, so a
+  cross-check against minimodem needs `-u 0`.
+  Text is exact through the telephone channel from 30 dB SNR down to
+  4 dB at both rates. The 45.45 and 50 baud lines are separate modes,
+  not a tolerance: 10 % apart, where this family of receivers gives up
+  around 3 %.
+  Validated against minimodem 0.24 in both directions at both rates:
+  its `tdd` preset on its own defaults reads 35 of 35 characters from
+  our transmitter with the clock 0.0 % fast, and we read its transmitter
+  byte for byte including CR and LF. Two findings came out of that.
+  We were sending V.18's *minimum* of 1.5 stop bits, which minimodem's
+  preset requires 2.0 of -- it lost 3 characters in 35 and read the
+  clock 3.9 % fast -- so the transmitter now sends 2 and the receiver
+  still asks for no more than a mark stop bit, since a far end sending
+  1.5 is correct. And minimodem 0.24 applies unshift-on-space
+  unconditionally (the `-u` switch does not exist in that release), so
+  after a space it stops re-sending FIGS: `HELLO GA 50 BAUD SK` comes
+  back from it as `HELLO GA 50 ?-7$ (`, which is precisely the figures
+  column. V.18, TIA-825, Asterisk and spandsp all agree there is no
+  unshift-on-space, and real TDD traffic depends on it -- `GA 555 1212`
+  has to stay in figures across its spaces -- so this is one to know
+  about rather than one to match.
+- The carrierless receiver (`fskBurstDeframer`): a text telephone sends
+  no carrier at all between characters, so a burst can begin with the
+  start bit itself and there is no idle mark to hunt in. `fskDeframer`
+  loses a third of the characters of a clean burst on that alone, so
+  this is a sibling rather than a flag on it, which also keeps five
+  measured and tuned modes out of the blast radius. It acquires on a
+  silence-to-space onset as well as on a mark-to-space crossing, and it
+  decides carrier on whether the band holds a *tone* -- the mean of
+  |decide| is one half on noise whatever the noise power, and one on a
+  tone -- rather than on energy against a threshold, which cannot be
+  made to work: every version of a tracked noise floor either latches on
+  after one spike or seeds itself shut. Energy still decides whether a
+  character already under way has a line to run on, because |decide|
+  dips at every bit transition. Getting those two roles the wrong way
+  round turned 30 characters into 55.
 - Call establishment (`Modec.Handshake`): V.25 answer sequence with
   Bell 103, V.21, V.23, Bell 212A, V.22 and V.22bis on both sides, verified by
   duplex simulations in the test suite. `--mode` chooses which of them
@@ -150,6 +196,9 @@ printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
 cabal run modec -- devices                                        # PipeWire audio devices
 cabal run modec -- probe recording.wav                            # tone energies
 cabal run modec -- detect recording.wav                           # which standard, tone runs
+# 5-bit text telephone (TTY/TDD): text in, text out, not bytes
+printf 'HELLO GA SK' | cabal run modec -- encode --tty45 -o tty.wav
+cabal run modec -- decode --tty45 tty.wav                         # --tty50 for the 50 baud line
 cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep (also v21, v22low/high, v22bislow/high)
 
 # live modem: answer calls arriving on the default PipeWire source, serve telnet on 2323

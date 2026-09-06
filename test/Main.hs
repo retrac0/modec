@@ -30,6 +30,7 @@ import Modec.V8
 import Modec.V8bis
 import Modec.Hayes
 import Modec.Dtmf
+import Modec.Baudot
 import Modec.Baresip
 import Modec.Json
 import Modec.Pipewire
@@ -1360,7 +1361,7 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
@@ -1451,3 +1452,94 @@ v8Tests = testGroup "V.8 menus and ANSam"
   where
     -- what modec can offer: V.8 has no codepoint for the Bell modes
     ourMenu = emptyMenu { v8Call = Just CfData, v8Mods = [MV22, MV21] }
+
+-- | The 5-bit text telephone: the character code, and the carrierless
+-- line it runs on.
+ttyTests :: TestTree
+ttyTests = testGroup "text telephone (5-bit)"
+  [ testCase "text survives the character code" $
+      assertEqual "round trip" ttyText (ttyCodec ttyText)
+
+  , testCase "lower case and unrepresentable characters are folded, not dropped" $
+      assertEqual "folded" "HELLO, WORLD! $1 100/" (ttyCodec "hello, world! #1 100%")
+
+  , testCase "LTRS opens the call and is re-sent every 72 characters" $ do
+      let (_, codes) = baudotEncode baudotTxInit (replicate 80 (ascii 'A'))
+      assertEqual "shift positions" [0, 73] [ i | (i, c) <- zip [0 :: Int ..] codes, c == ltrsCode ]
+
+  , testCase "a space does not unshift: figures carry across it" $
+      -- the RTTY convention would give "12 CD" here, and minimodem's
+      -- tdd mode applies it by default; V.18 and TIA-825 do not
+      assertEqual "figures held" "12 34" (ttyCodec "12 34")
+
+  , testCase "the four positions where V.18 differs from US teleprinter code" $ do
+      -- a decoder ported from an RTTY program gets exactly these wrong
+      assertEqual "S has no figure" Nothing (baudotChar Figs 0x05)
+      assertEqual "G is plus"  (Just '+') (baudotChar Figs 0x1A)
+      assertEqual "H is equals" (Just '=') (baudotChar Figs 0x14)
+      assertEqual "0 is backspace in both" (Just '\b', Just '\b')
+        (baudotChar Ltrs 0x00, baudotChar Figs 0x00)
+
+  , testCase "DEL from the keyboard puts the far end back into letters" $
+      assertEqual "resync" [figsCode, 0x17, ltrsCode, figsCode, 0x17]
+        (snd (baudotEncode baudotTxInit (map ascii "1\DEL1")))
+
+  , testCase "a character is one start bit, five data bits and two stop bits" $
+      -- V.18 asks for a minimum of 1.5; we send 2, which is what
+      -- minimodem's tdd preset requires and what every receiver accepts
+      assertEqual "bit times" 8
+        (sum [ d | (_, d) <- frameKeyed tddFraming 1 [0] ])
+
+  , testCase "text through the 45.45 baud line, 20 dB" $
+      assertEqual "decoded" ttyText (ttyLine tdd45 20)
+  , testCase "text through the 45.45 baud line, 4 dB" $
+      assertEqual "decoded" ttyText (ttyLine tdd45 4)
+  , testCase "text through the 50 baud line, 4 dB" $
+      assertEqual "decoded" ttyText (ttyLine tdd50 4)
+
+  , testCase "a burst that opens with the start bit itself still frames" $ do
+      -- no lead-in mark at all, which is what the continuous-carrier
+      -- framer cannot acquire: it wants half a bit of carried mark first
+      let codes = snd (baudotEncode baudotTxInit (map ascii "GA SK"))
+          sig = ttyAudio tdd45 (Burst 0 0.3) codes
+      assertEqual "decoded" "GA SK" (ttyDecodeText tdd45 sig)
+
+  , testCase "silence between bursts frames nothing" $ do
+      -- one burst per character with 120 ms of noise between them: an
+      -- absolute squelch alone turns that noise into characters
+      let codes = snd (baudotEncode baudotTxInit (map ascii "GA SK"))
+          sig = VS.concat [ VS.concat [ VS.replicate 960 0, ttyAudio tdd45 defaultBurst [c] ]
+                          | c <- codes ]
+      assertEqual "no junk" codes
+        (ttyDecode tdd45 (applyChannel 8000 (telephoneChannel 20) sig))
+
+  , testCase "45.45 and 50 baud are different modes, not a tolerance" $ do
+      -- 10 % apart, and this family of receivers gives up around 3 %
+      let sig = ttyAudio tdd50 defaultBurst (snd (baudotEncode baudotTxInit (map ascii ttyText)))
+      assertBool "not interchangeable" (ttyDecodeText tdd45 sig /= ttyText)
+  ]
+  where
+    ascii = fromIntegral . fromEnum
+    ttyText = "HELLO GA THIS IS A TEST 1234567890 SK"
+    ttyCodec t = map (toEnum . fromIntegral)
+                     (snd (baudotDecode baudotRxInit (snd (baudotEncode baudotTxInit (map ascii t)))))
+    ttyLine spec snr = ttyDecodeText spec
+      (applyChannel 8000 (telephoneChannel snr)
+        (ttyAudio spec defaultBurst (snd (baudotEncode baudotTxInit (map ascii ttyText)))))
+
+
+-- | 5-bit codes to audio, keyed the way a text telephone keys the line.
+ttyAudio :: FskSpec -> Burst -> [Word8] -> Signal
+ttyAudio spec burst codes =
+  txFilter 8000 spec (VS.map (* 0.5) (modulateKeyed 8000 spec keyed))
+  where keyed = (Off, 0.2) : keyedBurst tddFraming (fskBaud spec) burst codes ++ [(Off, 0.3)]
+
+ttyDecode :: FskSpec -> Signal -> [Word8]
+ttyDecode spec x =
+  concatStage (fskDiscriminator 8000 spec defaultDemodParams
+               >>> fskBurstDeframer 8000 spec tddFraming defaultDemodParams defaultBurstParams)
+              [x, flushSilence 8000 spec]
+
+ttyDecodeText :: FskSpec -> Signal -> String
+ttyDecodeText spec =
+  map (toEnum . fromIntegral) . snd . baudotDecode baudotRxInit . ttyDecode spec

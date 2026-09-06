@@ -121,8 +121,16 @@ detectFsk fs x = sortBy (comparing (Down . snd)) [ (s, score s) | s <- fskStanda
     -- Bell 103 originate mark at 1270 Hz.  Thirty Hz is inside a 40 ms
     -- window's bin, so the window is doubled here; 12.5 Hz bins tell them
     -- apart, at the cost of a resolution in time no report needs.
+    --
+    -- It also needs the text telephone pair, and that pair is why the
+    -- doubled window is not optional: 1800 Hz sits two bins from the
+    -- V.21 channel 2 space at 1850 and 1400 Hz two bins from the V.8bis
+    -- CRe tone at 1375, and at a 40 ms window neither is separable at
+    -- all -- a 45 baud recording measured on the handshake's bank comes
+    -- back as V.21 channel 2.
     cfg = defaultToneBank
-      { tbFreqs = fskMark v23Backward : fskSpace v23Backward : tbFreqs defaultToneBank
+      { tbFreqs = fskMark v23Backward : fskSpace v23Backward
+                : fskMark tdd45 : fskSpace tdd45 : tbFreqs defaultToneBank
       , tbWindowSec = 0.08 }
     frames = toneFrames fs cfg x
     n = max 1 (length frames)
@@ -152,9 +160,15 @@ data ToneRun = ToneRun
 -- Bell answer tone is worse than useless: it reads as evidence that a
 -- far end offers Bell modes when it never did.  Doubling the window
 -- halves the bin width and separates them.
+--
+-- The text telephone pair is here for the same reason.  Without it a
+-- 45 baud recording reports its 1400 Hz mark as the 1375 Hz V.8bis CRe
+-- tone, which reads as a far end offering a capabilities exchange that
+-- was never there; the two are 25 Hz apart and only the doubled window
+-- tells them apart.
 diagnosticToneBank :: ToneBankConfig
 diagnosticToneBank = defaultToneBank
-  { tbFreqs = 2250 : tbFreqs defaultToneBank
+  { tbFreqs = 2250 : fskMark tdd45 : fskSpace tdd45 : tbFreqs defaultToneBank
   , tbWindowSec = 0.08
   }
 

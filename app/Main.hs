@@ -15,10 +15,12 @@ import qualified Modec.Handshake as H
 import Modem
 import Modec.FSK
 import Modec.Standards
+import Modec.Baudot
+import Modec.Stream
 import Modec.Wav
 
 data Channel = Originate | Answer | Auto deriving (Eq, Show)
-data Std = Bell103 | V21 | V23 deriving (Eq, Show)
+data Std = Bell103 | V21 | V23 | Tty45 | Tty50 deriving (Eq, Show)
 
 data Cmd
   = Decode Std Channel Double FilePath
@@ -39,6 +41,8 @@ stdP :: Parser Std
 stdP =
       flag' V21 (long "v21" <> help "use V.21 tones instead of Bell 103")
   <|> flag' V23 (long "v23" <> help "V.23 duplex: --answer is the 1200 bit/s forward channel, --originate the 75 bit/s backward one")
+  <|> flag' Tty45 (long "tty45" <> help "5-bit text telephone (TTY/TDD), 1400/1800 Hz at 45.45 baud: Baudot text, not bytes. --originate and --answer do not apply, the two directions share one tone pair")
+  <|> flag' Tty50 (long "tty50" <> help "the same at 50 baud, as sold outside North America")
   <|> pure Bell103
 
 cmdP :: Parser Cmd
@@ -190,6 +194,15 @@ specFor V21 Originate    = v21Channel1
 specFor V21 _            = v21Channel2
 specFor V23 Originate    = v23Backward
 specFor V23 _            = v23Forward
+specFor Tty45 _          = tdd45
+specFor Tty50 _          = tdd50
+
+-- | The 5-bit text telephone modes, which are a different pipeline and
+-- not merely different tones: a carrierless line, a 5-bit character at
+-- 1.5 stop bits, and Baudot text rather than transparent bytes.
+isTty :: Std -> Bool
+isTty s = s == Tty45 || s == Tty50
+
 
 -- | Mean tone energy for a spec over the whole file, used to pick a channel.
 bandEnergy :: Double -> FskSpec -> Signal -> Double
@@ -206,20 +219,32 @@ main = do
       let fs = fromIntegral (wavRate w)
           x = wavSamples w
           spec = case ch of
+            _ | isTty std -> specFor std Originate     -- one pair, both directions
             Auto ->
               let o = specFor std Originate
                   a = specFor std Answer
               in if bandEnergy fs o x >= bandEnergy fs a x then o else a
             _ -> specFor std ch
-      when (ch == Auto) $ hPutStrLn stderr ("auto-selected " ++ fskName spec)
+      when (ch == Auto && not (isTty std)) $ hPutStrLn stderr ("auto-selected " ++ fskName spec)
       hSetBinaryMode stdout True
-      B.hPut stdout (B.pack (demodulate fs spec framing8N1 defaultDemodParams { dpSquelch = squelch } x))
+      if isTty std
+        then do
+          let codes = concatStage (fskDiscriminator fs spec defaultDemodParams { dpSquelch = squelch }
+                                   >>> fskBurstDeframer fs spec tddFraming
+                                         defaultDemodParams { dpSquelch = squelch } defaultBurstParams)
+                                  [x, flushSilence fs spec]
+          B.hPut stdout (B.pack (snd (baudotDecode baudotRxInit codes)))
+        else B.hPut stdout (B.pack (demodulate fs spec framing8N1 defaultDemodParams { dpSquelch = squelch } x))
     Encode std ch rate amp out -> do
       hSetBinaryMode stdin True
       bytes <- B.getContents
       let spec = specFor std (if ch == Auto then Originate else ch)
           fs = fromIntegral rate
-      writeWav16Mono out rate (encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes))
+          codes = snd (baudotEncode baudotTxInit (B.unpack bytes))
+          burst = (Off, 0.2) : keyedBurst tddFraming (fskBaud spec) defaultBurst codes ++ [(Off, 0.3)]
+      writeWav16Mono out rate $ if isTty std
+        then txFilter fs spec (VS.map (* amp) (modulateKeyed fs spec burst))
+        else encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes)
     ListDevices -> do
       ns <- pwAudioNodes
       if null ns
@@ -246,6 +271,8 @@ main = do
                   , ("bell103 ans space", 2025), ("bell103 ans mark", 2225)
                   , ("v21 ch1 mark", 980), ("v21 ch1 space", 1180)
                   , ("v21 ch2 mark", 1650), ("v21 ch2 space", 1850)
+                  , ("v23 back mark", 390), ("v23 back space", 450), ("v23 fwd mark", 1300)
+                  , ("tty mark", 1400), ("tty space", 1800)
                   , ("v25 answer tone", 2100), ("v22 low carrier", 1200), ("v22 high carrier", 2400) ]
       printf "%s: %d Hz, %d channels, %.2f s, rms %.4f\n" path (wavRate w) (wavChannels w)
         (fromIntegral n / fs :: Double) (rms x)
