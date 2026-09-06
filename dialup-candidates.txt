@@ -1,0 +1,118 @@
+Dial-up targets found online
+============================
+
+Survey of what still answers a modem in 2026, beyond the twenty BBSes in
+bbslist.txt.
+
+
+1. Numbers from the Telnet BBS Guide not yet dialled
+----------------------------------------------------
+
+The guide's brief and detail listings agree on twenty-six systems, all of
+which were called. These alternate lines were not:
+
+    Heights BBS            +18002584660   toll-free
+    Heights BBS            +15204620111   third line
+    Diamond Mine Online    +18334735400   toll-free
+    TuxedoCat Lounge       +18442274979   toll-free
+
+Toll-free numbers may route differently over a VoIP trunk than the
+geographic ones, so they are worth a call as a transport comparison
+rather than as new systems.
+
+Never answered on any attempt: ARDA-BBS (+19373150002), Level 29
+(+19169651701), Moe's Tavern (+15028758938), Neo-Vintage BBS
+(+19709601970), Wizard's Rainbow (+13234365249).
+
+
+2. NIST Automated Computer Time Service (ACTS)
+-----------------------------------------------
+
+    +13034944774    NIST Boulder, Colorado
+
+Still operating: the NIST page was updated February 2026. Up to 9600
+baud, 8 data bits, no parity, 1 stop bit; at least 1200 baud is needed to
+receive the full time code.
+
+This is the most useful target on the list, and not because of what it
+is. Every other system here sends a banner nobody can predict, so a
+decode can only be judged by whether it looks like English. ACTS sends a
+documented, fixed-format ASCII time code, once a second, forever. That
+makes it an oracle: the expected bytes are known in advance, so bit error
+rate can be measured against them rather than guessed at. It is also a
+public service whose entire purpose is to be dialled by a computer.
+
+Called once. It answered after 8.7 s and modec connected at V.22
+1200 bit/s in 3.8 s -- and then delivered this:
+
+    L3hbljrY>jS8vrTEMe"56c@Fx5"B|BoPV,zN5FRf<Ak?vG"{}OO#'Zk+"4#%AVwS...
+    UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
+    NO CARRIER
+
+Not a time code. That string starts with hbljrY>jS8vrTEMe, the same
+sequence five BBSes returned, which is this end's descrambler running on
+an idle carrier: the framer arms and starts delivering bytes before the
+far end has begun sending. The run of U characters is the descrambler
+settling on a constant.
+
+This is what the oracle is for. Against a BBS the same failure is only a
+suspicion -- the banner might genuinely look like that. Against ACTS
+there is no doubt at all: the bytes were supposed to be a date and a
+time, and they were not. The bug is reproducible on demand, on a service
+that never changes, without needing anyone's BBS.
+
+
+3. Dial-up ISP points of presence
+-----------------------------------
+
+HIS.com publishes its legacy dial-up numbers, all V.90:
+
+    Washington DC    202-266-0055, 202-454-9995, 202-756-0827
+    Bethesda MD      240-333-0002, 240-333-9995, 301-692-2906
+    Gaithersburg MD  240-364-0005, 240-364-9995
+    Hyattsville MD   240-737-0002, 240-737-9995
+    Kensington MD    301-946-0437, 301-946-4400, 301-946-6048
+    Laurel MD        240-646-0012, 240-646-9995
+    Rockville MD     240-864-0043, 240-864-9995
+    Silver Spring MD 240-494-0004, 240-494-9995
+    Arlington VA     703-797-0093, 703-797-9995
+    Herndon VA       703-506-0744, 703-834-1905, 703-871-0004, 703-871-9995
+    McLean VA        703-770-9995, 703-970-0000, 703-245-0309
+    Vienna VA        703-654-9996, 703-788-0006
+
+These answer with a modem and negotiate, then expect PPP. They are worth
+at most one call to see what a commercial V.90 access server offers in
+its V.8 menu, which should be the fullest menu available anywhere --
+including the PCM modem availability category none of the BBSes sent.
+They are a paying customer's lines, not a hobby system: probe one, not
+thirty, and do not sweep them.
+
+NetZero, Juno and MSN also still sell dial-up; their access numbers are
+behind a signup and were not collected.
+
+
+4. FidoNet nodelist
+--------------------
+
+The weekly nodelist carries the phone number, location and modem
+capability flags of every node in the network, which makes it the largest
+structured source of dial-up numbers that still exists. It could not be
+downloaded from here: filegate.net does not respond, and
+nodelist.fidonet.cc is behind a security interstitial. nodehist.fidonet.org.ua
+is reachable and holds nodelists up to 2026-09-06 but exposes them only
+through a per-node search form.
+
+Worth noting before spending effort on it: most surviving FidoNet nodes
+are IP-only, and the ones with real phone numbers are private mail
+systems rather than public-access services. Their modems answer, but
+nobody invited us.
+
+
+5. Dead ends
+-------------
+
+The textfiles.com BBS list is an archive of numbers from the 1980s and
+90s, preserved for the area codes rather than for dialling.
+
+817-844-6611 (Fort Worth time and temperature) and similar time lines are
+voice announcers, not modems.

@@ -1,0 +1,77 @@
+BBSes that answered
+===================
+
+Dialled from the dial-up list at telnetbbsguide.com through a
+voip.ms trunk (G.711) with modec. Twenty-five numbers were called;
+these twenty answered. The other five -- ARDA-BBS, Level 29, Moe's
+Tavern, Neo-Vintage BBS and Wizard's Rainbow -- never picked up.
+
+Connected  = modulations modec actually established with.
+V.8 menu   = what the far end listed in its joint menu when offered
+             every modulation in Table 4/V.8. Blank means it never
+             completed a CM/JM exchange.
+
+BBS                     Number        Connected
+--------------------------------------------------------------
+A-Net Online            +14042820600  V22bis, Bell103
+Basement BBS            +15032455416  V22bis
+C64 Pub                 +19296431173  V22bis, V22
+Dark Realms             +16478472083  V22, Bell103
+Diamond Mine Online     +15403692900  V22
+Digital Distortion      +19719104722  V22bis
+Empire of the Dragon    +13036790161  V22, Bell103
+End Of The Line         +14692003550  V22, Bell103
+ENiAC 2.0               +13852022120  V22, Bell103
+Heights BBS             +15203037894  V22
+KEEP BBS                +15038523170  V22
+Kludge BBS              +13125002600  V22
+Last Telegraph Office   +19172591391  answered, no carrier
+Never Never Land        +15673044098  V22, Bell103
+Northern BBS            +19028931022  V22
+Particles BBS           +14795538122  V22
+Phoenix BBS             +18604466118  V22
+Reign of Fire           +14235418271  V22
+Sursum Corda            +12568954786  V22
+TuxedoCat Lounge        +13412214808  V22bis, V22, Bell103
+
+V.8 capability menus
+--------------------
+
+A-Net Online:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22
+Basement BBS:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.23 duplex, V.21
+Diamond Mine Online:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22
+Digital Distortion:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.23 duplex, V.21
+Empire of the Dragon:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22
+End Of The Line:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.23 duplex, V.21
+ENiAC 2.0:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.23 duplex, V.21
+Heights BBS:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22
+Kludge BBS:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.23 duplex, V.21
+Northern BBS:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22
+Phoenix BBS:
+    data, V.34 duplex, V.34 half-duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.29 half-duplex, V.27ter, V.26ter, V.26bis, V.23 duplex, V.23 half-duplex, V.21
+Reign of Fire:
+    data, V.34 duplex, V.32bis/V.32, V.22bis/V.22, V.17, V.23 duplex, V.21
+
+Menus below came back under a restricted offer (only the modes modec
+can run were advertised), so they say what the far end has in common
+with modec, not everything it has:
+
+KEEP BBS:
+    data, V.22bis/V.22
+
+No V.8 menu at all: C64 Pub, Dark Realms, Last Telegraph Office, Never Never Land, Particles BBS, Sursum Corda, TuxedoCat Lounge.
+
+Bell 212A was attempted against twelve of these and connected with
+none. Their fallback ladder runs ANSam, then V.22's 2250 Hz
+unscrambled binary 1, with a Bell 103 rung below it on some; the
+Bell 212A answer sequence is not offered at all.

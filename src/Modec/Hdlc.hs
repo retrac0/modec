@@ -6,6 +6,7 @@
 module Modec.Hdlc
   ( fcs16
   , fcsResidual
+  , hdlcFlagBits
   , hdlcFrameBits
   , HdlcRx
   , hdlcRxInit
@@ -37,8 +38,14 @@ octetBits o = [ testBit o i | i <- [0 .. 7] ]
 bitsToOctet :: [Bool] -> Word8
 bitsToOctet bs = foldr (\(i, b) acc -> if b then acc .|. (1 `shiftL` i) else acc) 0 (zip [0 .. 7] bs)
 
+-- | The flag, 01111110, in transmission order.  Also the interframe fill:
+-- ISO 3309 sends contiguous flags between frames, which is what a
+-- synchronous MNP transmitter idles on (see "Modec.MnpFrame").
+hdlcFlagBits :: [Bool]
+hdlcFlagBits = [False, True, True, True, True, True, True, False]
+
 flagBits :: [Bool]
-flagBits = [False, True, True, True, True, True, True, False]
+flagBits = hdlcFlagBits
 
 -- | Bit-stuff a payload (insert a zero after five consecutive ones).
 stuff :: [Bool] -> [Bool]

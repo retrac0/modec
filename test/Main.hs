@@ -24,6 +24,7 @@ import Modec.Telnet
 import Modec.Async
 import Modec.V22
 import Modec.Hdlc
+import Modec.MnpFrame
 import Modec.V8
 import Modec.V8bis
 import Modec.Hayes
@@ -482,6 +483,134 @@ hdlcTests = testGroup "HDLC and V.8bis messages"
   where
     bitsToWord bs = sum [ if b then 2 ^ i else 0 | (i, b) <- zip [0 .. 7 :: Int] bs ] :: Int
 
+mnpFrameTests :: TestTree
+mnpFrameTests = testGroup "MNP frame structure (V.42 Annex A)"
+  [ testCase "CRC-16/ARC check value" $
+      -- the published check value, and deliberately unlike the 0x906E of
+      -- the X.25 FCS above: different polynomial, preset and bit order
+      assertEqual "0xBB3D" 0xBB3D (crc16arc (map (fromIntegral . fromEnum) "123456789"))
+  , testCase "the reference initiator LR (A.6.4.1)" $
+      assertEqual "21 golden octets" lrOctets (encodeFrame False (FrLR defaultLr))
+  , testCase "framing mode 2 round trip" $ do
+      let bodies = [[0x01], [0x14, 0x01, 0x02], [0, 255, 128], replicate 64 0xAA]
+      forM_ bodies $ \b ->
+        assertEqual ("body " ++ show b) [Right b] (snd (mode2RxOctets mode2RxInit (mode2Encode b)))
+  , testCase "a DLE in the payload is stuffed and recovered" $ do
+      forM_ [[0x10], [0x10, 0x10], [1, 2, 0x10], [0x10, 3, 4]] $ \b ->
+        assertEqual ("body " ++ show b) [Right b] (snd (mode2RxOctets mode2RxInit (mode2Encode b)))
+  , testCase "a DLE ETX pair inside the body does not end the frame" $ do
+      -- the closing flag is DLE ETX; the same pair as data must survive
+      let b = [1, 0x10, 0x03, 2]
+      -- the payload's lone DLE is doubled, so the DLE ETX it forms with
+      -- the next octet cannot be read as the closing flag
+      assertEqual "payload is stuffed" [0x01, 0x10, 0x10, 0x03, 0x02] (take 5 (drop 4 (mode2Encode b)))
+      assertEqual "body" [Right b] (snd (mode2RxOctets mode2RxInit (mode2Encode b)))
+  , testCase "an FCS octet equal to DLE is not unstuffed" $ do
+      -- the check sequence follows the closing flag and is never stuffed,
+      -- so a receiver must take two raw octets there.  Body [0xC0] has
+      -- FCS 0x0110, whose low octet is exactly DLE.
+      let dleFcs = [ [k] | k <- [0 .. 255], crc16arc [k, 0x03] `mod` 256 == 0x10 ]
+      assertBool "a witness exists" (not (null dleFcs))
+      forM_ dleFcs $ \b -> do
+        let wire = mode2Encode b
+        assertEqual ("wire for " ++ show b) 0x10 (wire !! (length wire - 2))
+        assertEqual ("body " ++ show b) [Right b] (snd (mode2RxOctets mode2RxInit wire))
+  , testCase "a corrupted frame is reported, not delivered" $ do
+      let wire = mode2Encode [1, 2, 3, 4]
+          bad = take 5 wire ++ [0xFF] ++ drop 6 wire
+      assertEqual "bad FCS" [Left BadFcs] (snd (mode2RxOctets mode2RxInit bad))
+  , testCase "a truncated frame resynchronises on the next one" $ do
+      let good = mode2Encode [9, 9]
+          wire = take 6 (mode2Encode [1, 2, 3, 4]) ++ good
+          (_, out) = mode2RxOctets mode2RxInit wire
+      assertBool ("out " ++ show out) (Right [9, 9] `elem` out)
+  , testCase "octets outside a frame are kept, then cleared by a good frame" $ do
+      let (st1, o1) = mode2RxOctets mode2RxInit (map (fromIntegral . fromEnum) "Welcome to")
+      assertEqual "nothing framed" [] o1
+      assertEqual "junk kept" "Welcome to" (map (toEnum . fromIntegral) (mode2Junk st1))
+      let (st2, _) = mode2RxOctets st1 (mode2Encode [1])
+      assertEqual "cleared by a frame" [] (mode2Junk st2)
+  , testCase "chunk invariance: a frame split across reads still decodes" $ do
+      let wire = mode2Encode [1, 0x10, 3]
+          feed st [] = ([], st)
+          feed st (c : cs) = let (st', o) = mode2RxOctets st c
+                                 (rest, st'') = feed st' cs
+                             in (o ++ rest, st'')
+          chunks = map (: []) wire
+      assertEqual "one octet at a time" [Right [1, 0x10, 3]] (fst (feed mode2RxInit chunks))
+  , testCase "every frame type round trips, in both optimizations" $ do
+      let frames = [ FrLR defaultLr
+                   , FrLR defaultLr { lrFraming = 3, lrK = 4, lrN401 = 256, lrDpo = 3 }
+                   , FrLD 4 Nothing
+                   , FrLD 255 (Just 7)
+                   , FrLT 1 [65, 66, 67]
+                   , FrLT 255 [0]
+                   , FrLA 0 8
+                   , FrLA 255 0
+                   , FrLN 3 2
+                   , FrLNA 3
+                   ]
+      forM_ frames $ \f -> forM_ [False, True] $ \dpo ->
+        assertEqual (show (f, dpo)) (Right f) (decodeFrame (encodeFrame dpo f))
+  , testCase "LT and LA decode without knowing the negotiated optimization" $ do
+      -- the length indication tells the two forms apart on sight, so the
+      -- two ends can never fall out of step over the latch
+      assertEqual "long LT" (Right (FrLT 5 [1, 2, 3])) (decodeFrame (encodeFrame False (FrLT 5 [1, 2, 3])))
+      assertEqual "short LT" (Right (FrLT 5 [1, 2, 3])) (decodeFrame (encodeFrame True (FrLT 5 [1, 2, 3])))
+      assertEqual "long LA" (Right (FrLA 4 8)) (decodeFrame (encodeFrame False (FrLA 4 8)))
+      assertEqual "short LA" (Right (FrLA 4 8)) (decodeFrame (encodeFrame True (FrLA 4 8)))
+      assertEqual "LT header 5 octets" 5 (length (encodeFrame False (FrLT 5 [1])) - 1)
+      assertEqual "optimized LT header 3 octets" 3 (length (encodeFrame True (FrLT 5 [1])) - 1)
+      assertEqual "LA 8 octets" 8 (length (encodeFrame False (FrLA 4 8)))
+      assertEqual "optimized LA 4 octets" 4 (length (encodeFrame True (FrLA 4 8)))
+  , testCase "an LT may not carry an empty information field" $
+      assertBool "rejected" (either (const True) (const False) (decodeFrame (encodeFrame False (FrLT 1 []))))
+  , testCase "an unknown frame type is kept whole rather than aborting the link" $
+      assertEqual "kept" (Right (FrOther 9 [1, 2])) (decodeFrame [3, 9, 1, 2])
+  , testCase "unrecognised LR parameters are preserved" $ do
+      let lr = defaultLr { lrOther = [(9, [1, 2])] }
+      assertEqual "round trip" (Right (FrLR lr)) (decodeFrame (encodeFrame False (FrLR lr)))
+  , testProperty "the length indication counts the header from the type octet" $
+      \n info dpo ->
+        let f = FrLT n (if null info then [1] else take 200 info)
+            o = encodeFrame dpo f
+            hdr = if dpo then 2 else 4
+        in fromIntegral (head o) == (hdr :: Int)
+  , testProperty "any body survives framing mode 2" $ withMaxSuccess 200 $
+      \body ->
+        let b = take 300 body
+        in not (null b) ==> snd (mode2RxOctets mode2RxInit (mode2Encode b)) == [Right b]
+  , testCase "framing mode 3 carries the same frames through HDLC" $ do
+      -- a payload with a flag and a run of six ones, so zero insertion is
+      -- actually exercised
+      let body = encodeFrame False (FrLT 7 [0x7E, 0xFF, 0x7E, 0x3F])
+          line = replicate 16 True ++ mode3Encode body ++ replicate 16 True
+          (_, frames) = hdlcRxBits hdlcRxInit line
+      assertEqual "frames" [body] frames
+      assertEqual "decoded" (Right (FrLT 7 [0x7E, 0xFF, 0x7E, 0x3F])) (decodeFrame body)
+  , testCase "negotiation takes the smaller of each value" $ do
+      let ours = defaultLr { lrFraming = 3, lrK = 8, lrN401 = 256, lrDpo = 3 }
+          theirs = defaultLr { lrFraming = 2, lrK = 4, lrN401 = 64, lrDpo = 1 }
+      case negotiateLr ours theirs of
+        Left r -> assertFailure ("refused with reason " ++ show r)
+        Right n -> do
+          assertEqual "framing" 2 (lrFraming n)
+          assertEqual "k" 4 (lrK n)
+          assertEqual "N401" 64 (lrN401 n)
+          assertEqual "optimization is the intersection" 1 (lrDpo n)
+  , testCase "negotiation refuses an unknown protocol level" $
+      assertEqual "reason 2" (Left 2) (negotiateLr defaultLr defaultLr { lrConst1 = 3 })
+  , testCase "negotiation refuses impossible parameters" $ do
+      assertEqual "framing 0" (Left 3) (negotiateLr defaultLr defaultLr { lrFraming = 0 })
+      assertEqual "k 0" (Left 3) (negotiateLr defaultLr defaultLr { lrK = 0 })
+  , testCase "a station that cannot go synchronous settles on mode 2" $ do
+      -- no special rejection is needed: an FSK link offers mode 2 and the
+      -- minimum does the rest
+      let fsk = defaultLr { lrFraming = 2 }
+          sync = defaultLr { lrFraming = 3 }
+      assertEqual "settles at 2" (Right 2) (fmap lrFraming (negotiateLr fsk sync))
+  ]
+
 hayesTests :: TestTree
 hayesTests = testGroup "Hayes AT interpreter"
   [ testCase "AT, ATE0, ATI, S0" $ do
@@ -629,7 +758,7 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, hayesTests, baresipTests, pipewireTests, v8Tests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"

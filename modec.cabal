@@ -25,6 +25,7 @@ library
                       Modec.Async
                       Modec.V22
                       Modec.Hdlc
+                      Modec.MnpFrame
                       Modec.V8
                       Modec.V8bis
                       Modec.Hayes
