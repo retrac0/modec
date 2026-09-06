@@ -64,9 +64,8 @@ data ModemOpts = ModemOpts
   { moRate     :: Int
   , moBlockMs  :: Int
   , moRole     :: Role
-  , moStandard :: Maybe Standard
+  , moModes    :: [Standard]        -- ^ modes to negotiate, best first
   , moNoHandshake :: Bool
-  , moMax1200  :: Bool
   , moNoV8bis  :: Bool
   , moHayes    :: Bool
   , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
@@ -85,10 +84,13 @@ runModem o = do
   hSetBinaryMode stdout True
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
-      cfg0 = defaultModemConfig fs (moRole o) (moStandard o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcAllow2400 = not (moMax1200 o), hcV8bis = not (moNoV8bis o) } }
-  when (moNoHandshake o && moStandard o == Nothing) $ do
-    logMsg "--no-handshake needs --standard bell103 or v21"
+      cfg0 = defaultModemConfig fs (moRole o) (moModes o)
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o) } }
+  when (moNoHandshake o && length (moModes o) /= 1) $ do
+    logMsg "--no-handshake needs exactly one mode, e.g. --standard v22"
+    exitFailure
+  when (null (moModes o)) $ do
+    logMsg "no modes enabled"
     exitFailure
   -- connect to the softphone control port before the audio and the DTE,
   -- so that control is up whatever order the peers start in
@@ -123,9 +125,9 @@ runModem o = do
                     aiWrite ai (encodeS16 (VS.replicate blockN 0))
                     return True
                   else return False
-      let cfgFor role = let c0 = defaultModemConfig fs role (moStandard o)
+      let cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
-                              , mcHandshake = (mcHandshake c0) { hcAllow2400 = not (moMax1200 o), hcV8bis = not (moNoV8bis o) } }
+                              , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o) } }
           traceStep st st' = when trace $ do
             k <- readIORef blockRef
             writeIORef blockRef (k + 1)

@@ -142,6 +142,6 @@ nodes by name (`--target`), which works for nodes that have ports; bare
   2100 Hz tone and Bell 103 idle mark, record what comes back, run
   `modec detect` on it.
 - Dial a well-known 2400 bit/s BBS (several are listed at telnetbbsguide
-  with dial-up numbers) with `--standard v22`, then automode.
+  with dial-up numbers) with `--modes v22`, then automode.
 - Expect 300 and 1200 to work first; 2400 depends on the trunk's jitter.
   Keep `MODEC_TRACE=1` logs and the EVM figures for tuning.

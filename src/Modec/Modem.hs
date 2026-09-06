@@ -45,10 +45,11 @@ data ModemConfig = ModemConfig
   , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
   } deriving (Show)
 
-defaultModemConfig :: Double -> Role -> Maybe Standard -> ModemConfig
-defaultModemConfig fs role std = ModemConfig
+-- | @modes@ lists the standards the modem may negotiate, best first.
+defaultModemConfig :: Double -> Role -> [Standard] -> ModemConfig
+defaultModemConfig fs role modes = ModemConfig
   { mcRate = fs
-  , mcHandshake = (defaultHsConfig role) { hcStandard = std }
+  , mcHandshake = (defaultHsConfig role) { hcModes = modes }
   , mcNoHandshake = False
   , mcDemod = defaultDemodParams
   , mcFraming = framing8N1
@@ -166,7 +167,7 @@ data ModemState = ModemState
 
 modemInit :: ModemConfig -> ModemState
 modemInit cfg
-  | mcNoHandshake cfg, Just s <- hcStandard hs =
+  | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link }
   | otherwise = base

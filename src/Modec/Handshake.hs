@@ -1,4 +1,17 @@
--- | Call establishment for Bell 103, V.21 and V.22.
+-- | Call establishment for Bell 103, V.21, Bell 212A, V.22 and V.22bis.
+--
+-- Which of those the modem will negotiate is configured with 'hcModes',
+-- an ordered list (best first).  It decides what V.8bis advertises, which
+-- signals the answering side probes with, and which of Bell 103 and
+-- Bell 212A a 2225 Hz answer tone is answered with.
+--
+-- Bell 212A is the V.22 data pump and the V.22 handshake timings
+-- (456 ms, 270 ms, 765 ms) with the 2225 Hz Bell answer tone in place of
+-- unscrambled binary 1, no guard tone and no 2400 bit/s rate; V.22
+-- §6.3.1.1 notes exactly this substitution.  Because the Bell answer tone
+-- is also the Bell 103 answer mark, one probe serves both and the
+-- caller's reply decides: an FSK originate carrier means Bell 103,
+-- scrambled DPSK marks on the low channel mean Bell 212A.
 --
 -- Both state machines are pure and tick-driven: feed them one
 -- 'ToneFrame' per hop (20 ms by default), plus the latest report from
@@ -56,6 +69,8 @@
 -- exact 270 degree steps, 2225 Hz gives steps 15 degrees off.
 module Modec.Handshake
   ( Standard (..)
+  , allStandards
+  , isV22Family
   , Role (..)
   , Link (..)
   , HsConfig (..)
@@ -81,7 +96,20 @@ import Modec.V22 (Rate (..), TxMode (..), V22Channel (..))
 import Modec.V8bis
 import Data.Word (Word8)
 
-data Standard = Bell103 | V21 | V22 deriving (Eq, Show)
+-- | A modulation the modem can negotiate.  'Bell212A' is the North
+-- American 1200 bit/s DPSK standard: the same 600 baud data pump and
+-- handshake timings as V.22, but announced with the 2225 Hz Bell answer
+-- tone instead of unscrambled binary 1, without guard tones, and with no
+-- 2400 bit/s rate.  'V22bis' is V.22 that negotiated 2400 bit/s.
+data Standard = Bell103 | V21 | Bell212A | V22 | V22bis deriving (Eq, Show, Enum, Bounded)
+
+-- | Every mode, best first; the default configuration.
+allStandards :: [Standard]
+allStandards = [V22bis, V22, Bell212A, V21, Bell103]
+
+-- | Modes that use the V.22 data pump.
+isV22Family :: Standard -> Bool
+isV22Family s = s `elem` [Bell212A, V22, V22bis]
 
 data Role = Originate | Answer deriving (Eq, Show)
 
@@ -92,14 +120,13 @@ data Link
   | V22Link V22Channel V22Channel Rate
   deriving (Eq, Show)
 
--- | The link for a standard at its base rate (V.22 at 1200 bit/s).
+-- | The link a standard runs on, at its own rate.
 linkFor :: Role -> Standard -> Link
 linkFor Originate Bell103 = FskLink bell103Originate bell103Answer
 linkFor Answer Bell103 = FskLink bell103Answer bell103Originate
 linkFor Originate V21 = FskLink v21Channel1 v21Channel2
 linkFor Answer V21 = FskLink v21Channel2 v21Channel1
-linkFor Originate V22 = V22Link LowChannel HighChannel R1200
-linkFor Answer V22 = V22Link HighChannel LowChannel R1200
+linkFor role s = v22LinkAt role (if s == V22bis then R2400 else R1200)
 
 v22LinkAt :: Role -> Rate -> Link
 v22LinkAt Originate r = V22Link LowChannel HighChannel r
@@ -107,7 +134,7 @@ v22LinkAt Answer r = V22Link HighChannel LowChannel r
 
 data HsConfig = HsConfig
   { hcRole        :: Role
-  , hcStandard    :: Maybe Standard   -- ^ Nothing = automode
+  , hcModes       :: [Standard]       -- ^ modes we will negotiate, best first
   , hcBank        :: ToneBankConfig
   , hcSquelch     :: Double           -- ^ minimum tone amplitude
   , hcDomRatio    :: Double           -- ^ dominant tone must exceed others by this factor
@@ -118,16 +145,15 @@ data HsConfig = HsConfig
   , hcQualify     :: Double           -- ^ FSK carrier must persist this long to count
   , hcDrop        :: Double           -- ^ carrier loss for this long drops the connection
   , hcTimeout     :: Double           -- ^ give up after this long
-  , hcAllow2400   :: Bool             -- ^ V.22bis: negotiate 2400 bit/s with S1
   , hcV8bis       :: Bool             -- ^ try a V.8bis capabilities exchange before the modem start-up
   } deriving (Show)
 
 defaultHsConfig :: Role -> HsConfig
 defaultHsConfig role = HsConfig
-  { hcRole = role, hcStandard = Nothing, hcBank = defaultToneBank
+  { hcRole = role, hcModes = allStandards, hcBank = defaultToneBank
   , hcSquelch = 3e-3, hcDomRatio = 1.5
   , hcBilling = 2.0, hcAnsDuration = 3.0, hcAnsGap = 0.075, hcProbe = 1.5
-  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcAllow2400 = True, hcV8bis = True }
+  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8bis = True }
 
 -- | What the transmitter should be doing right now.
 data TxCmd
@@ -207,7 +233,8 @@ data HsState = HsState
   , hsSig       :: !(Maybe Signal8)    -- ^ V.8bis signal detected this hop
   , hsLastRsp   :: !Bool     -- ^ the responding pair was on in the previous frame
   , hsPendingMs :: !(Maybe DataMode)   -- ^ mode select to transmit
-  , hsAllow2400Sel :: !Bool  -- ^ 2400 bit/s allowed by the V.8bis selection
+  , hsFamily    :: !Standard  -- ^ which V.22-family standard is being negotiated
+  , hsTried212  :: !Bool     -- ^ a Bell 212A attempt already failed; prefer Bell 103
   , hsPhaseAt   :: !Double   -- ^ time the phase was entered
   , hs112At     :: !Double   -- ^ time circuit 112 went ON (S1 exchanged)
   , hsToneSince :: !(Maybe (Double, Double))  -- ^ current dominant tone and when it started
@@ -216,7 +243,7 @@ data HsState = HsState
   }
 
 initialHandshake :: HsConfig -> HsState
-initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) Nothing 0 Nothing Nothing False Nothing True 0 0 Nothing (-1) 0
+initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) Nothing 0 Nothing Nothing False Nothing V22 False 0 0 Nothing (-1) 0
 
 fskTx, fskRx :: Role -> Standard -> FskSpec
 fskTx role s = case linkFor role s of
@@ -274,15 +301,15 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     msgs = map decodeMessage frames
     clOffered = [ ms | CL ms <- msgs ]
     msSelected = [ m | MS m <- msgs ]
-    modeToStandard m = case m of { ModeV21 -> V21; ModeV22 -> V22; ModeV22bis -> V22 }
-    ourModes = [ m | m <- [ModeV21, ModeV22, ModeV22bis], allowedMode m ]
-    allowedMode m = case (m, hcStandard cfg) of
-      (_, Nothing) -> m /= ModeV22bis || hcAllow2400 cfg
-      (ModeV21, Just V21) -> True
-      (ModeV22, Just V22) -> True
-      (ModeV22bis, Just V22) -> hcAllow2400 cfg
-      _ -> False
-    pickMode offered = case [ m | m <- [ModeV22bis, ModeV22, ModeV21], m `elem` offered, m `elem` ourModes ] of
+    -- V.8bis can only advertise ITU modes; Bell 212A has no codepoint
+    modeToStandard m = case m of { ModeV21 -> V21; ModeV22 -> V22; ModeV22bis -> V22bis }
+    standardToMode s = case s of
+      V21 -> Just ModeV21
+      V22 -> Just ModeV22
+      V22bis -> Just ModeV22bis
+      _ -> Nothing
+    ourModes = [ m | s <- modes, Just m <- [standardToMode s] ]
+    pickMode offered = case [ m | m <- ourModes, m `elem` offered ] of
       (m : _) -> Just m
       [] -> Nothing
     toneSince = case (dom, hsToneSince st) of
@@ -297,7 +324,21 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     st' = st { hsToneSince = toneSince, hsLastTone = lastTone, hsT = t
              , hsPairRun = pairRun', hsPairSeen = if sig /= Nothing then Nothing else pairSeen'', hsSig = sig, hsLastRsp = rspPair }
     inPhase = t - hsPhaseAt st
-    allowed s = maybe True (== s) (case hsSelected st of { Just sel -> Just sel; Nothing -> hcStandard cfg })
+    -- the configured modes, narrowed to one by a V.8bis mode select
+    modes = case hsSelected st of
+      Just sel -> [sel]
+      Nothing -> hcModes cfg
+    allowed s = s `elem` modes
+    v22Allowed = any (`elem` modes) [V22, V22bis]
+    allow2400 = V22bis `elem` modes
+    ituAllowed = any (`elem` modes) [V21, V22, V22bis]
+    -- scrambled DPSK marks answering our 2225 Hz mean a 1200 bit/s link;
+    -- V.22 modems do this too (V.22 §6.3.1.1 note), so accept either name
+    bellDpsk = [ s | s <- [Bell212A, V22], allowed s ]
+    -- which Bell mode a 2225 Hz answer tone should be answered with
+    bellChoice = case [ s | s <- modes, s `elem` [Bell212A, Bell103], not (s == Bell212A && hsTried212 st) ] of
+      (s : _) -> Just s
+      [] -> Nothing
     enter p = st' { hsPhase = p, hsPhaseAt = t }
     justEntered = hsPhaseAt st == t
     -- V.22 signal detectors
@@ -310,7 +351,7 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     scrambledAnySeen = case v22 of
       Just r -> vrOnesRun r >= scrambledBits || vrZerosRun r >= scrambledBits
       Nothing -> False
-    s1Seen = hcAllow2400 cfg && hsAllow2400Sel st && case v22 of
+    s1Seen = allow2400 && hsFamily st /= Bell212A && case v22 of
       Just r -> vrS1Run r >= s1Symbols
       Nothing -> False
     ones2400Seen = case v22 of
@@ -320,32 +361,37 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
     enter112 p = (enter p) { hs112At = t }
     -- an FSK carrier counts once it has persisted; the Bell 103 answer
     -- mark must not be V.22 unscrambled ones in disguise
-    qualified V22 = False   -- V.22 is qualified through the V.22 receiver, not tones
+    qualified s | isV22Family s = False   -- qualified through the V.22 receiver, not tones
     qualified s = heardFor (fskMark (fskRx role s)) >= hcQualify cfg && not (s == Bell103 && role == Originate && u11Seen)
+    -- V.22 §6.3.1.1 note: some answering modems emit 2225 Hz where the
+    -- Recommendation has unscrambled binary 1; that is a Bell 212A answerer
+    bell212Trigger = heardFor 2225 >= 0.155 && not u11Seen
     remoteAlive s = case linkFor role s of
       FskLink _ rx -> t - lastToneOf rx <= hcDrop cfg
       V22Link {} -> True
       where lastToneOf spec = case toneSince of
               Just (g, _) | g == fskMark spec || g == fskSpace spec -> t
               _ -> hsLastTone st
-    probeOrder = [V22, V21, Bell103]
-    rotating = hcStandard cfg == Nothing && hsSelected st == Nothing
+    -- one probe per family, in the traditional order, skipping families
+    -- this modem is not configured for
+    probeOrder = [ p | (p, needed) <- [ (V22, v22Allowed), (V21, allowed V21)
+                                      , (Bell103, allowed Bell103 || allowed Bell212A) ], needed ]
+    rotating = length probeOrder > 1
     nextProbe s = case dropWhile (/= s) probeOrder of
       (_ : n : _) -> n
       _ -> head probeOrder
-    firstProbe = case hsSelected st of
-      Just s -> s
-      Nothing -> case hcStandard cfg of
-        Just s -> s
-        Nothing -> head probeOrder
+    firstProbe = case probeOrder of
+      (p : _) -> p
+      [] -> Bell103
 
     st'' = case hsPhase st of
       _ | t > hcTimeout cfg && not (isConnected (hsPhase st)) && hsPhase st /= Done -> enter Done
       -- answering side
       ABilling
         | inPhase >= hcBilling cfg ->
-            if hcV8bis cfg then enter A8Dual
-            else if hcStandard cfg == Just Bell103 then enter (AProbe Bell103) else enter AAns
+            if hcV8bis cfg && ituAllowed then enter A8Dual
+            -- a Bell-only modem answers with 2225 Hz, never with the ITU tone
+            else if ituAllowed then enter AAns else enter (AProbe Bell103)
       -- V.8bis, answering station initiating with CRe (transaction 2, no ACK requested)
       A8Dual
         | inPhase >= 0.4 -> enter A8Tone
@@ -366,21 +412,31 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         | inPhase >= hcAnsGap cfg -> enter (AProbe firstProbe)
       AProbe V22
         | s1Seen -> enter112 AV22S1
-        | scrambledAnySeen -> enter AV22Ones
+        | scrambledAnySeen -> (enter AV22Ones) { hsFamily = V22 }
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
         | rotating && inPhase >= hcProbe cfg -> enter (AProbe (nextProbe V22))
         | otherwise -> st'
+      -- the Bell probe transmits 2225 Hz, which serves Bell 103 and
+      -- Bell 212A alike; the caller's reply says which it wanted
+      AProbe Bell103
+        | scrambledAnySeen, (fam : _) <- bellDpsk -> (enter AV22Ones) { hsFamily = fam }
+        | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
+        | rotating && inPhase >= hcProbe cfg -> enter (AProbe (nextProbe Bell103))
+        | otherwise -> st'
       AProbe s
         | qualified s -> enter (Connected s R1200)
+        -- a Bell 103 caller transmits continuously, so accept it whatever
+        -- we happen to be probing with
+        | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
         | rotating && inPhase >= hcProbe cfg -> enter (AProbe (nextProbe s))
       AV22Ones
-        | inPhase >= 0.765 -> enter (Connected V22 R1200)
+        | inPhase >= 0.765 -> enter (Connected (hsFamily st) R1200)
       AV22S1
         | inPhase >= 0.1 -> enter AV22Ones1200
       AV22Ones1200
         | since112 >= 0.6 -> enter AV22Ones2400
       AV22Ones2400
-        | inPhase >= 0.2 && ones2400Seen -> enter (Connected V22 R2400)
+        | inPhase >= 0.2 && ones2400Seen -> enter (Connected V22bis R2400)
         | inPhase >= 6 -> enter Done
       -- V.8bis, calling station responding to CRe
       O8Dual
@@ -391,38 +447,40 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
         | inPhase >= 0.6 -> enter O8WaitMS
       O8WaitMS
         | (m : _) <- msSelected, m `elem` ourModes ->
-            (enter AAns) { hsRole = Answer, hsSelected = Just (modeToStandard m), hsAllow2400Sel = m == ModeV22bis }
+            (enter AAns) { hsRole = Answer, hsSelected = Just (modeToStandard m) }
         | inPhase >= 3 -> enter OListen
       -- calling side
       OListen
-        | hcV8bis cfg && sig == Just CRe && role == Originate -> enter O8Dual
-        | allowed V22 && u11Seen -> enter OV22Wait
-        | allowed Bell103 && qualified Bell103 -> enter (OReply Bell103)
+        | hcV8bis cfg && ituAllowed && sig == Just CRe && role == Originate -> enter O8Dual
+        | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
+        | bellChoice == Just Bell212A && bell212Trigger -> (enter OV22Wait) { hsFamily = Bell212A }
+        | bellChoice == Just Bell103 && qualified Bell103 -> enter (OReply Bell103)
         | heardFor 2100 >= hcQualify cfg -> enter OAnsEnding
       OAnsEnding
         | dom /= Just 2100 && quiet >= 0.04 -> enter OAfterAns
       OAfterAns
-        | allowed V22 && u11Seen -> enter OV22Wait
+        | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
         | allowed V21 && qualified V21 -> enter (OReply V21)
         | allowed Bell103 && qualified Bell103 -> enter (OReply Bell103)
       OReply s
         | inPhase >= hcQualify cfg && qualified s -> enter (Connected s R1200)
         | inPhase >= 5 -> enter OListen
       OV22Wait
-        | inPhase >= 0.456 -> enter (if hcAllow2400 cfg && hsAllow2400Sel st then OV22S1 else OV22Ones)
+        | inPhase >= 0.456 -> enter (if allow2400 && hsFamily st /= Bell212A then OV22S1 else OV22Ones)
       OV22S1
         | inPhase >= 0.1 -> enter OV22Ones
       OV22Ones
         | s1Seen -> enter112 OV22Ones1200
         | scrambledOnesSeen -> enter OV22Settle
-        | inPhase >= 6 -> enter OListen
+        -- the far end did not take it up: fall back to the other Bell mode
+        | inPhase >= 6 -> (enter OListen) { hsTried212 = hsTried212 st || hsFamily st == Bell212A }
       OV22Settle
         | s1Seen -> enter112 OV22Ones1200
-        | inPhase >= 0.765 -> enter (Connected V22 R1200)
+        | inPhase >= 0.765 -> enter (Connected (hsFamily st) R1200)
       OV22Ones1200
         | since112 >= 0.6 -> enter OV22Ones2400
       OV22Ones2400
-        | inPhase >= 0.2 && ones2400Seen -> enter (Connected V22 R2400)
+        | inPhase >= 0.2 && ones2400Seen -> enter (Connected V22bis R2400)
         | inPhase >= 6 -> enter Done
       Connected s _
         | not (remoteAlive s) -> enter Done
@@ -464,7 +522,7 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       OV22Settle -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Ones1200 -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Ones2400 -> TxV22 LowChannel R2400 TxScrambledOnes
-      Connected V22 r -> case v22LinkAt (hsRole st'') r of
+      Connected s r | isV22Family s -> case v22LinkAt (hsRole st'') r of
         V22Link txc _ _ -> TxV22 txc r TxScrambledData
         FskLink {} -> TxSilence
       Connected s _ -> TxData (fskTx (hsRole st'') s)
@@ -483,12 +541,12 @@ handshakeStep cfg st fr v22 frames = (st'', HsOut tx status rxRate (hsRole st'')
       AV22Ones2400 -> R2400
       OV22Ones1200 | since112 >= 0.45 -> R2400
       OV22Ones2400 -> R2400
-      Connected V22 R2400 -> R2400
+      Connected _ R2400 -> R2400
       _ -> R1200
     status = case (hsPhase st, hsPhase st'') of
       (Connected _ _, Done) -> HsDropped
       (_, Done) -> HsFailed "timeout"
-      (_, Connected V22 r) -> HsConnected V22 (v22LinkAt (hsRole st'') r)
+      (_, Connected s r) | isV22Family s -> HsConnected s (v22LinkAt (hsRole st'') r)
       (_, Connected s _) -> HsConnected s (linkFor (hsRole st'') s)
       _ -> HsBusy
 

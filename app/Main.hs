@@ -59,9 +59,13 @@ cmdP = hsubparser
       <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
       <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
-      <*> option (maybeReader stdReader) (long "standard" <> value Nothing <> help "auto (default) | bell103 | v21 | v22")
+      <*> (option (maybeReader modesReader)
+             (long "modes" <> metavar "LIST"
+              <> help "comma-separated modes to negotiate, best first: bell103,v21,bell212a,v22,v22bis (default: all)")
+           <|> option (maybeReader (fmap (: []) . modeReader))
+                 (long "standard" <> metavar "MODE" <> help "shorthand for --modes with a single mode")
+           <|> pure H.allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
-      <*> switch (long "max-1200" <> help "V.22 only: do not negotiate 2400 bit/s")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
       <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
@@ -69,12 +73,21 @@ cmdP = hsubparser
       <*> audioP
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude"))
-    stdReader s = case s of
-      "auto" -> Just Nothing
-      "bell103" -> Just (Just H.Bell103)
-      "v21" -> Just (Just H.V21)
-      "v22" -> Just (Just H.V22)
+    modesReader s = case s of
+      "auto" -> Just H.allStandards
+      "all" -> Just H.allStandards
+      _ -> mapM modeReader (splitOn ',' s)
+    modeReader m = case m of
+      "bell103" -> Just H.Bell103
+      "v21" -> Just H.V21
+      "bell212a" -> Just H.Bell212A
+      "bell212" -> Just H.Bell212A
+      "v22" -> Just H.V22
+      "v22bis" -> Just H.V22bis
       _ -> Nothing
+    splitOn c s = case break (== c) s of
+      (a, []) -> [a]
+      (a, _ : rest) -> a : splitOn c rest
     audioP =
           flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> pipewireP
       <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")

@@ -7,9 +7,10 @@ establishment.
 
 See [SURVEY.md](SURVEY.md) for the survey of existing work and the design
 plan, [docs/line-interface.md](docs/line-interface.md) for hooking a real
-modem to a sound card, [docs/sip-options.md](docs/sip-options.md) for the
-VoIP/SIP plan, and [docs/recordings/](docs/recordings/) for recorded
-handshakes with an annotated timeline.
+modem to a sound card, [docs/negotiation.md](docs/negotiation.md) for how modes are detected and
+negotiated, [docs/sip-options.md](docs/sip-options.md) for the VoIP/SIP
+plan, and [docs/recordings/](docs/recordings/) for recorded handshakes
+with an annotated timeline.
 
 ## Status
 
@@ -30,14 +31,22 @@ handshakes with an annotated timeline.
   dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
 - Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
   dominant-tone runs, offline FSK standard/channel identification.
-- Call establishment (`Modec.Handshake`): V.25 answer sequence, Bell 103,
-  V.21 and V.22 originate/answer state machines with automode on both
-  ends, verified by duplex simulations in the test suite.
+- Call establishment (`Modec.Handshake`): V.25 answer sequence with
+  Bell 103, V.21, Bell 212A, V.22 and V.22bis on both sides, verified by
+  duplex simulations in the test suite. `--modes` chooses which of them
+  the modem will negotiate, in order of preference; see
+  [docs/negotiation.md](docs/negotiation.md) for the decision tree and a
+  walkthrough of what happens when each kind of modem calls in.
 - Live modem (`Modec.Modem`, `modec modem`): audio in and out through
   PipeWire (`pw-cat`) or raw 8 kHz s16le pipes, data through a telnet
   server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
   escaped) or stdio. Automode on both ends. `scripts/smoke-loopback.sh`
   cross-connects two instances through FIFOs and pushes text both ways.
+- Bell 212A: the V.22 data pump and handshake timings announced with the
+  2225 Hz Bell answer tone instead of unscrambled binary 1, no guard tone
+  and no 2400 bit/s rate, exactly the substitution V.22 §6.3.1.1 notes. It
+  shares the Bell 103 probe tone, and the caller's reply tells the two
+  apart.
 - V.22 / V.22bis data pump (`Modec.V22`): 600 Bd on 1200/2400 Hz, RRC
   75 % shaping, 1 + x^-14 + x^-17 scrambler, Gardner timing recovery.
   1200 bit/s uses differential 4-PSK decisions; 2400 bit/s adds a coherent
@@ -55,7 +64,7 @@ handshakes with an annotated timeline.
   600/450 ms rate switch and the 32-ones completion) in the handshake and
   the live modem. Automode probes V.22 first, then V.21, then Bell 103,
   accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
-  with a V.22-only peer. `--max-1200` disables 2400 on our side.
+  with a V.22-only peer. `--modes v22` disables 2400 on our side.
 - V.8bis capabilities exchange (`Modec.V8bis`, `Modec.Hdlc`): after the
   billing delay the answerer sends CRe (dual tone 1375 + 2002 Hz, then
   400 Hz), a V.8bis caller replies with ESr and a CL message over V.21
@@ -112,7 +121,9 @@ cabal run modec -- modem --answer --audio-pipewire --listen 2323
 # call out: audio through PipeWire, bytes to a telnet host
 cabal run modec -- modem --originate --audio-pipewire --connect bbs.example.org --port 23
 # pick the PipeWire node explicitly, force Bell 103, skip the handshake
-cabal run modec -- modem --answer --audio-pipewire --pw-target alsa_input.usb-... --standard bell103 --no-handshake --listen 2323
+cabal run modec -- modem --answer --audio-pipewire --pw-in usb --standard bell103 --no-handshake --listen 2323
+# only the North American modes, best first
+cabal run modec -- modem --hayes --audio-pipewire --modes bell212a,bell103 --listen 2323
 # loop two instances through FIFOs with no sound card
 scripts/smoke-loopback.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
