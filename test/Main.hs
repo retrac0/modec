@@ -12,7 +12,7 @@ import System.FilePath (replaceExtension, (</>))
 import Test.QuickCheck
 import Test.Tasty
 import Test.Tasty.HUnit
-import Test.Tasty.QuickCheck (testProperty)
+import Test.Tasty.QuickCheck (testProperty, withMaxSuccess)
 
 import Modec.Channel
 import Modec.Detect
@@ -79,8 +79,17 @@ propertyTests = testGroup "self round trips"
   [ testProperty "bell103 answer 8 kHz clean" $ \(Payload bs) -> roundTrip 8000 bell103Answer 0 1 bs
   , testProperty "bell103 originate 8 kHz clean" $ \(Payload bs) -> roundTrip 8000 bell103Originate 0 2 bs
   , testProperty "v21 ch2 8 kHz clean" $ \(Payload bs) -> roundTrip 8000 v21Channel2 0 3 bs
-  , testProperty "bell103 answer 48 kHz clean" $ \(Payload bs) -> roundTrip 48000 bell103Answer 0 4 bs
-  , testProperty "bell103 answer 11025 Hz clean" $ \(Payload bs) -> roundTrip 11025 bell103Answer 0 5 bs
+  -- The prefilter has 2*round(fs/25)+1 taps, so its length grows with the
+  -- sample rate and so does the number of samples to push through it:
+  -- the front end costs O(fs^2), and 48 kHz is 35 times the work of
+  -- 8 kHz.  These two cases exist to show the demodulator is
+  -- rate-independent, which a handful of payloads settles; the payload
+  -- space itself is covered at 8 kHz above, at a thirty-fifth of the
+  -- price.  Left at the default this one test was 73% of the suite.
+  , testProperty "bell103 answer 48 kHz clean" $ withMaxSuccess 8 $
+      \(Payload bs) -> roundTrip 48000 bell103Answer 0 4 bs
+  , testProperty "bell103 answer 11025 Hz clean" $ withMaxSuccess 25 $
+      \(Payload bs) -> roundTrip 11025 bell103Answer 0 5 bs
   -- amplitude 0.5 tone vs sigma 0.2 white noise at 8 kHz is about 5 dB SNR in the
   -- full band and Eb/N0 of roughly 16 dB, where non-coherent FSK has a BER
   -- near 1e-9, so this must pass every time.

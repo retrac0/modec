@@ -156,7 +156,7 @@ main = do
       putStrLn "FSK channel scores (fraction of frames dominated by the channel's tones):"
       forM_ (detectFsk fs x) $ \(s, sc) -> printf "  %-18s %.3f\n" (fskName s) sc
       putStrLn "Tone runs longer than 100 ms:"
-      forM_ [ r | r <- toneRuns fs x, trEnd r - trStart r >= 0.1 ] $ \r ->
+      forM_ [ r | r <- toneRunsWith diagnosticToneBank fs x, trEnd r - trStart r >= 0.1 ] $ \r ->
         printf "  %7.3f - %7.3f s  %s\n" (trStart r) (trEnd r) (maybe "silence / no dominant tone" (\f -> printf "%.0f Hz" f) (trTone r) :: String)
     Probe path -> do
       w <- readWav path

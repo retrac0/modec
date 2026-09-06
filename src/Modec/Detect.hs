@@ -6,6 +6,7 @@ module Modec.Detect
   ( ToneFrame (..)
   , ToneBankConfig (..)
   , defaultToneBank
+  , diagnosticToneBank
   , toneBank
   , toneFrames
   , dominant
@@ -13,6 +14,7 @@ module Modec.Detect
   , detectFsk
   , ToneRun (..)
   , toneRuns
+  , toneRunsWith
   ) where
 
 import Data.List (sortBy)
@@ -129,12 +131,33 @@ data ToneRun = ToneRun
   , trEnd   :: !Double
   } deriving (Show, Eq)
 
+-- | The bank for reading a recording rather than running a handshake.
+--
+-- It adds 2250 Hz, the unscrambled binary 1 an answering V.22 modem
+-- sends.  The handshake's bank leaves it out on purpose: at a 40 ms
+-- window the bins are 25 Hz wide, so 2250 and the 2225 Hz Bell answer
+-- tone sit one bin apart and neither would dominate the other, and the
+-- handshake would stop recognising the Bell tone.  It does not need the
+-- frequency anyway -- it tells the two apart by the quality of the phase
+-- steps.  A report has no such fallback, and calling V.22's carrier a
+-- Bell answer tone is worse than useless: it reads as evidence that a
+-- far end offers Bell modes when it never did.  Doubling the window
+-- halves the bin width and separates them.
+diagnosticToneBank :: ToneBankConfig
+diagnosticToneBank = defaultToneBank
+  { tbFreqs = 2250 : tbFreqs defaultToneBank
+  , tbWindowSec = 0.08
+  }
+
 -- | Collapse frames into runs of dominant tones, e.g. to find a 2100 Hz
 -- answer tone lasting 2.6-4 s followed by 75 ms of silence.
 toneRuns :: Double -> Signal -> [ToneRun]
-toneRuns fs x = go (map (\fr -> (dominant cfg 3e-3 1.5 fr, tfTime fr)) frames)
+toneRuns = toneRunsWith defaultToneBank
+
+-- | 'toneRuns' with a bank of your choosing.
+toneRunsWith :: ToneBankConfig -> Double -> Signal -> [ToneRun]
+toneRunsWith cfg fs x = go (map (\fr -> (dominant cfg 3e-3 1.5 fr, tfTime fr)) frames)
   where
-    cfg = defaultToneBank
     frames = toneFrames fs cfg x
     go [] = []
     go ((t, time) : rest) =
