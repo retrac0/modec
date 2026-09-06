@@ -25,6 +25,7 @@ import Modec.Async
 import Modec.V22
 import Modec.Hdlc
 import Modec.MnpFrame
+import Modec.Mnp
 import Modec.V8
 import Modec.V8bis
 import Modec.Hayes
@@ -611,6 +612,248 @@ mnpFrameTests = testGroup "MNP frame structure (V.42 Annex A)"
       assertEqual "settles at 2" (Right 2) (fmap lrFraming (negotiateLr fsk sync))
   ]
 
+-- | Two protocol machines cross connected through a line the impairment
+-- may damage, stepped in 20 ms ticks.  Each side is offered @perTick@
+-- octets of its text per tick, so the window and the timers see a
+-- continuous stream rather than one burst.  No audio: these run in
+-- milliseconds, and octets can be dropped or duplicated on purpose.
+mnpPair :: MnpConfig -> MnpConfig
+        -> (Int -> MnpLineOut -> MnpLineOut)
+        -> Int -> [Word8] -> [Word8] -> Int
+        -> ([Word8], [Word8], [MnpEvent], [MnpEvent])
+mnpPair cfgI cfgR damage perTick textI textR ticks =
+  go 0 (mnpInit cfgI MnpInitiator) (mnpInit cfgR MnpResponder)
+       (OutOctets []) (OutOctets []) textI textR [] [] [] []
+  where
+    dt = 0.02
+    go i si sr toI toR bufI bufR rxI rxR evI evR
+      | i >= ticks = (reverse rxI, reverse rxR, reverse evI, reverse evR)
+      | otherwise =
+          let (feedI, bufI') = splitAt perTick bufI
+              (feedR, bufR') = splitAt perTick bufR
+              (si', oi) = mnpStep cfgI si (MnpIn dt (asIn toI) feedI 0 maxBound)
+              (sr', orr) = mnpStep cfgR sr (MnpIn dt (asIn toR) feedR 0 maxBound)
+          in go (i + 1) si' sr' (damage i (moLine orr)) (damage i (moLine oi))
+                bufI' bufR'
+                (reverse (moDte oi) ++ rxI) (reverse (moDte orr) ++ rxR)
+                (reverse (moEvents oi) ++ evI) (reverse (moEvents orr) ++ evR)
+    asIn = lineIn
+
+-- | The far end's output, seen as this end's input.
+lineIn :: MnpLineOut -> MnpLineIn
+lineIn (OutOctets os) = LineOctets os
+lineIn (OutBits bs) = LineBits bs
+
+-- | A line that passes everything through untouched.
+clean :: Int -> MnpLineOut -> MnpLineOut
+clean _ = id
+
+-- | Lose every @n@th block that carries anything: a dropout long enough
+-- to swallow whole frames, which is what go-back-N exists for.
+dropEvery :: Int -> Int -> MnpLineOut -> MnpLineOut
+dropEvery n i (OutOctets os)
+  | not (null os) && i `mod` n == 0 = OutOctets []
+dropEvery _ _ l = l
+
+-- | Corrupt a burst of three octets in the middle of every @n@th block,
+-- leaving the octet clock alone: a line hit, which the check sequence has
+-- to catch.
+--
+-- Note that inverting a whole block instead would /not/ be a fair test.
+-- CRC-16\/ARC is preset to zero and not complemented, so it is linear:
+-- inverting every octet of a long stream is a constant offset that can
+-- synthesise a frame boundary satisfying the check, which no line does.
+burstEvery :: Int -> Int -> MnpLineOut -> MnpLineOut
+burstEvery n i (OutOctets os)
+  | not (null os) && i `mod` n == 0 =
+      OutOctets [ if j >= mid && j < mid + 3 then o `xor` 0x5A else o
+                | (j, o) <- zip [0 :: Int ..] os ]
+  where mid = length os `div` 2
+burstEvery _ _ l = l
+
+mnpTests :: TestTree
+mnpTests = testGroup "MNP protocol (V.42 Annex A)"
+  [ testCase "the retransmission timer matches Table A.9" $ do
+      let c1200 = defaultMnpConfig 1200 False
+          c2400 = defaultMnpConfig 2400 False
+      -- 1200 bit/s, k = 8, N401 = 64, no optimization: about six seconds
+      assertBool "1200 near 6 s" (abs (mnpT401 c1200 FramingOctet False 8 64 - 6) < 1)
+      assertBool "2400 near 4 s" (abs (mnpT401 c2400 FramingOctet False 8 64 - 4) < 1)
+      -- bit framing carries eight bits per octet instead of ten, so it is
+      -- strictly quicker for the same payload
+      assertBool "bit framing is faster"
+        (mnpT401 c1200 FramingBit False 8 64 < mnpT401 c1200 FramingOctet False 8 64)
+  , testCase "a link comes up and carries text both ways" $ do
+      let c = defaultMnpConfig 1200 False
+          (rxI, rxR, evI, evR) = mnpPair c c clean 4 textO textA 200
+      assertBool ("initiator events " ++ show evI) (any isUp evI)
+      assertBool ("responder events " ++ show evR) (any isUp evR)
+      assertEqual "responder to initiator" textA rxI
+      assertEqual "initiator to responder" textO rxR
+  , testCase "what is negotiated is the responder's answer" $ do
+      let ci = (defaultMnpConfig 1200 False) { mnK = 8, mnN401 = 256 }
+          cr = (defaultMnpConfig 1200 False) { mnK = 4, mnN401 = 64, mnClass = 2 }
+          (_, _, evI, _) = mnpPair ci cr clean 4 textO textA 120
+      case [ e | e@(MnpUp {}) <- evI ] of
+        (MnpUp cls k n : _) -> do
+          assertEqual "class falls to 2" 2 cls
+          assertEqual "k is the smaller" 4 k
+          assertEqual "N401 is the smaller" 64 n
+        _ -> assertFailure ("no link: " ++ show evI)
+  , testCase "dropouts that swallow whole frames lose nothing" $ do
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 32 }
+          payload = map (fromIntegral . (`mod` 251)) [1 .. 400 :: Int]
+          (rxI, rxR, _, _) = mnpPair c c (dropEvery 11) 6 payload payload 1500
+      assertEqual "responder to initiator" payload rxI
+      assertEqual "initiator to responder" payload rxR
+  , testCase "line hits are caught and the frames come back correct" $ do
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 32 }
+          payload = map (fromIntegral . (`mod` 251)) [1 .. 400 :: Int]
+          (rxI, rxR, _, _) = mnpPair c c (burstEvery 11) 6 payload payload 1500
+      assertEqual "responder to initiator" payload rxI
+      assertEqual "initiator to responder" payload rxR
+  , testCase "sequence numbers wrap through 255 without losing anything" $ do
+      -- one octet per frame forces the sequence number all the way round
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 1, mnK = 4 }
+          payload = map fromIntegral [1 .. 300 :: Int]
+          (rxI, _, _, _) = mnpPair c c clean 4 [] payload 2000
+      assertEqual "300 frames past the wrap" payload rxI
+  , testCase "no protocol at the far end falls through without a disconnect" $ do
+      -- the responder never answers, and never says anything either
+      let c = defaultMnpConfig 1200 False
+          st0 = mnpInit c MnpInitiator
+          step (s, outs) _ =
+            let (s', o) = mnpStep c s (MnpIn 0.02 (LineOctets []) [] 0 maxBound)
+            in (s', outs ++ [o])
+          (stEnd, os) = foldl step (st0, []) [1 .. 500 :: Int]
+          sent = concat [ o | OutOctets o <- map moLine os ]
+      assertEqual "falls through" MnpTransparent (mnpPhase stEnd)
+      assertBool "reported" (any (== MnpTransparentFallback) (concatMap moEvents os))
+      -- link requests were tried, but no disconnect was ever transmitted
+      assertBool "a link request was sent" (not (null sent))
+      assertBool "no LD on the wire"
+        (null [ () | Right b <- snd (mode2RxOctets mode2RxInit sent)
+                   , Right (FrLD _ _) <- [decodeFrame b] ])
+  , testCase "a far end that only sends data is detected at once" $ do
+      let c = defaultMnpConfig 1200 False
+          banner = map (fromIntegral . fromEnum) "\r\nWelcome to the board\r\n"
+          st0 = mnpInit c MnpInitiator
+          step (s, outs) k =
+            let line = if k == (3 :: Int) then LineOctets banner else LineOctets []
+                (s', o) = mnpStep c s (MnpIn 0.02 line [] 0 maxBound)
+            in (s', outs ++ [o])
+          (stEnd, os) = foldl step (st0, []) [1 .. 20]
+      assertEqual "transparent" MnpTransparent (mnpPhase stEnd)
+      assertEqual "the banner reaches the terminal" banner (concatMap moDte os)
+  , testCase "an unrecognised protocol level is refused with reason 2" $ do
+      let c = defaultMnpConfig 1200 False
+          st0 = mnpInit c MnpResponder
+          bad = mode2Encode (encodeFrame False (FrLR defaultLr { lrConst1 = 3 }))
+          (st1, o1) = mnpStep c st0 (MnpIn 0.02 (LineOctets bad) [] 0 maxBound)
+      assertEqual "closed" MnpClosed (mnpPhase st1)
+      let sent = case moLine o1 of { OutOctets os -> os; _ -> [] }
+      assertEqual "an LD with reason 2"
+        [FrLD 2 Nothing]
+        [ f | Right b <- snd (mode2RxOctets mode2RxInit sent), Right f <- [decodeFrame b] ]
+  , testCase "an attention is acknowledged rather than stalling the link" $ do
+      let c = defaultMnpConfig 1200 False
+          -- bring a pair up, then inject an LN at the initiator
+          (si, _) = bringUp c
+          (_, o) = mnpStep c si (MnpIn 0.02 (LineOctets (mode2Encode (encodeFrame False (FrLN 3 2)))) [] 0 maxBound)
+          sent = case moLine o of { OutOctets os -> os; _ -> [] }
+      assertBool "an LNA went back"
+        (FrLNA 3 `elem` [ f | Right b <- snd (mode2RxOctets mode2RxInit sent), Right f <- [decodeFrame b] ])
+  , testCase "framing mode 3 is negotiated and carries the data" $ do
+      let c = defaultMnpConfig 1200 True
+          (rxI, rxR, evI, _) = mnpPair c c clean 4 textO textA 300
+      case [ e | e@(MnpUp {}) <- evI ] of
+        (MnpUp cls _ _ : _) -> assertEqual "class 4 over bit framing" 4 cls
+        _ -> assertFailure ("no link: " ++ show evI)
+      assertEqual "responder to initiator" textA rxI
+      assertEqual "initiator to responder" textO rxR
+  , testCase "the first repeat of the last frame draws no acknowledgement" $ do
+      -- A.7.3.2.2.  Answering a duplicate is what turns one lost
+      -- acknowledgement into an exchange that never settles.
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 16 }
+          (si, _) = bringUp c
+          (si1, out1, dte1) = stepFrames c si [FrLT 1 [65, 66]] [] maxBound
+          (si2, out2, _) = stepFrames c si1 [FrLT 1 [65, 66]] [] maxBound
+          (_, out3, _) = stepFrames c si2 [FrLT 1 [65, 66]] [] maxBound
+      assertEqual "the frame is taken" [65, 66] dte1
+      assertBool ("acknowledged " ++ show out1) (any isLa out1)
+      assertBool ("the first repeat is ignored " ++ show out2) (not (any isLa out2))
+      assertBool ("the second repeat is answered " ++ show out3) (any isLa out3)
+  , testCase "an acknowledgement repeating N(R) forces a retransmission" $ do
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 4 }
+          (si, _) = bringUp c
+          -- give it something to send, and let it go out
+          (si1, out1, _) = stepFrames c si [] [1, 2, 3, 4] maxBound
+          -- N(R) = 0 acknowledges nothing, since sequence numbers start at 1
+          (si2, out2, _) = stepFrames c si1 [FrLA 0 8] [] maxBound
+          (_, out3, _) = stepFrames c si2 [FrLA 0 8] [] maxBound
+      assertBool ("a frame went out " ++ show out1) (any isLt out1)
+      assertBool ("the first acknowledgement is not a loss report " ++ show out2)
+        (not (any isLt out2))
+      assertBool ("the repeat retransmits " ++ show out3) (any isLt out3)
+  , testCase "credit falls to zero and is restored without being asked" $ do
+      -- the deadlock this guards against: with no credit the far end sends
+      -- nothing, so nothing arrives to prompt the acknowledgement that
+      -- would give the credit back
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 16, mnRxWindow = 2 }
+          (si, _) = bringUp c
+          -- the terminal takes nothing, so the receive buffer fills
+          (si1, _, _) = stepFrames c si [FrLT 1 (replicate 16 65)] [] 0
+          (si2, out2, _) = stepFrames c si1 [FrLT 2 (replicate 16 66)] [] 0
+          credits = [ k | FrLA _ k <- out2 ]
+          -- now the terminal drains, with nothing new arriving at all
+          (_, out3, dte3) = stepFrames c si2 [] [] maxBound
+      assertBool ("credit reaches zero " ++ show credits) (0 `elem` credits)
+      assertEqual "the buffer drains to the terminal" 32 (length dte3)
+      assertBool ("credit is offered again unprompted " ++ show out3)
+        (any (\f -> case f of { FrLA _ k -> k > 0; _ -> False }) out3)
+  , testCase "the retransmission limit disconnects with reason 4" $ do
+      -- nothing is ever acknowledged, so every attempt times out
+      let c = (defaultMnpConfig 1200 False) { mnN401 = 4, mnT401 = Just 0.1 }
+          (si, _) = bringUp c
+          go 0 st acc = (st, acc)
+          go n st acc =
+            let (st', out, _) = stepFrames c st [] (if null acc then [1, 2, 3, 4] else []) maxBound
+            in go (n - 1 :: Int) st' (acc ++ out)
+          (stEnd, outs) = go 400 si []
+      assertEqual "closed" MnpClosed (mnpPhase stEnd)
+      assertBool ("a disconnect with reason 4 " ++ show (filter isLd outs))
+        (FrLD 4 Nothing `elem` outs)
+      -- N400 is 12, so the frame is sent once and retried twelve times
+      assertBool ("retries bounded " ++ show (length (filter isLt outs)))
+        (length (filter isLt outs) <= 14)
+  ]
+  where
+    isUp e = case e of { MnpUp {} -> True; _ -> False }
+    isLa f = case f of { FrLA {} -> True; _ -> False }
+    isLt f = case f of { FrLT {} -> True; _ -> False }
+    isLd f = case f of { FrLD {} -> True; _ -> False }
+    -- one step with the given frames arriving, returning the frames that
+    -- went back.  Frames are written in the long form and read back
+    -- whatever form they come in, which is the point of the LI dispatch.
+    stepFrames c st fs dte ready =
+      let wire = concatMap (mode2Encode . encodeFrame False) fs
+          (st', o) = mnpStep c st (MnpIn 0.02 (LineOctets wire) dte 0 ready)
+          sent = case moLine o of { OutOctets os -> os; OutBits _ -> [] }
+      in ( st'
+         , [ f | Right b <- snd (mode2RxOctets mode2RxInit sent), Right f <- [decodeFrame b] ]
+         , moDte o )
+    textO = map (fromIntegral . fromEnum) "Hello from the caller, 0123456789 !\r\n"
+    textA = map (fromIntegral . fromEnum) "Answerer here; all bytes: \255\0\128 end\r\n"
+    -- run a clean pair far enough that both ends are in the data phase
+    bringUp c = go (30 :: Int) (mnpInit c MnpInitiator) (mnpInit c MnpResponder)
+                   (OutOctets []) (OutOctets [])
+      where
+        go 0 si sr _ _ = (si, sr)
+        go n si sr toI toR =
+          let (si', oi) = mnpStep c si (MnpIn 0.02 (lineIn toI) [] 0 maxBound)
+              (sr', orr) = mnpStep c sr (MnpIn 0.02 (lineIn toR) [] 0 maxBound)
+          in go (n - 1) si' sr' (moLine orr) (moLine oi)
+
 hayesTests :: TestTree
 hayesTests = testGroup "Hayes AT interpreter"
   [ testCase "AT, ATE0, ATI, S0" $ do
@@ -758,7 +1001,7 @@ pipewireTests = testGroup "PipeWire device discovery"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, hayesTests, baresipTests, pipewireTests, v8Tests])
+  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, hayesTests, baresipTests, pipewireTests, v8Tests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
