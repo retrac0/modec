@@ -885,7 +885,12 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
           step (s, outs) _ =
             let (s', o) = mnpStep c s (MnpIn 0.02 (LineOctets []) [] 0 maxBound)
             in (s', outs ++ [o])
-          (stEnd, os) = foldl step (st0, []) [1 .. 500 :: Int]
+          -- long enough for every link request the configuration will
+          -- send, plus a little: derived rather than hard coded, so
+          -- changing how persistently it probes cannot quietly turn this
+          -- into a test that passes for the wrong reason
+          ticks = ceiling ((mnT401Lr c * fromIntegral (mnLrTries c) + 2) / 0.02) :: Int
+          (stEnd, os) = foldl step (st0, []) [1 .. ticks]
           sent = concat [ o | OutOctets o <- map moLine os ]
       assertEqual "falls through" MnpTransparent (mnpPhase stEnd)
       assertBool "reported" (any (== MnpTransparentFallback) (concatMap moEvents os))

@@ -103,8 +103,15 @@ defaultMnpConfig bitRate syncable = MnpConfig
   , mnBitRate = bitRate
   , mnSyncable = syncable
   , mnT401 = Nothing
-  , mnT401Lr = 3
-  , mnLrTries = 2
+  -- Probe early and keep probing.  A far end running V.42's detection
+  -- phase gives up on it 750 ms into the data phase, so a link request
+  -- that arrives late finds a modem that has already settled for no error
+  -- correction; one whose error-control entity is not ready yet needs to
+  -- be asked again.  Six attempts 2.5 s apart cover both, and a far end
+  -- with nothing to say is still let go early, because text arriving
+  -- outside a frame ends the wait on its own.
+  , mnT401Lr = 2.5
+  , mnLrTries = 6
   , mnT403 = Nothing
   , mnRxWindow = 8
   , mnDataDetect = True

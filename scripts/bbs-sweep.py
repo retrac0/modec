@@ -46,6 +46,13 @@ CONFIGS = {
     "bell103":     ["--modes", "bell103"],
     "auto":        [],
     "auto-v8":     ["--v8"],
+    # MNP error correction.  Class 2 frames over the ordinary start-stop
+    # characters; class 4 adds synchronous framing, the shorter headers and
+    # adaptive frame sizing.  Both fall through to an unprotected
+    # connection if the far end does not answer a link request, so a board
+    # with no error correction still gets its banner through.
+    "mnp2":        ["--modes", "v22bis", "--mnp-class", "2"],
+    "mnp4":        ["--modes", "v22bis", "--mnp"],
 }
 
 def log(msg):
@@ -127,7 +134,8 @@ def place_call(binpath, number, label, rate, outdir):
     res = {"bbs": label, "number": number, "rate": rate, "wav": os.path.basename(wav),
            "started": ts, "connected": False, "standard": None, "text": "",
            "outcome": "no answer", "call_seconds": 0.0, "ring_seconds": 0.0,
-           "connect_seconds": None, "v8": None}
+           "connect_seconds": None, "v8": None,
+           "mnp": None, "mnp_seconds": None, "mnp_outcome": None}
 
     baresip = subprocess.Popen(["baresip"], stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
@@ -239,6 +247,16 @@ def place_call(binpath, number, label, rate, outdir):
     vm = re.search(rb"V\.8 far end offers: (.+)", err)
     if vm:
         res["v8"] = vm.group(1).decode(errors="replace").strip()
+    # what the error-correcting protocol did, if it was offered at all
+    mm = re.search(rb"MNP class (\d+), (\d+) outstanding frames, N401 (\d+)", err)
+    if mm:
+        res["mnp"] = "class %s, k=%s, N401=%s" % tuple(x.decode() for x in mm.groups())
+        res["mnp_outcome"] = "up"
+    elif re.search(rb"no error correction: the far end did not answer", err):
+        res["mnp_outcome"] = "far end did not answer a link request"
+    dm = re.search(rb"MNP link down: (.+)", err)
+    if dm:
+        res["mnp_outcome"] = "down: " + dm.group(1).decode(errors="replace").strip()
     return res, err.decode(errors="replace")
 
 if __name__ == "__main__":
@@ -263,6 +281,8 @@ if __name__ == "__main__":
             log("  -> %s%s" % (r["outcome"], (" " + r["standard"]) if r["standard"] else ""))
             if r["v8"]:
                 log("  V.8: %s" % r["v8"])
+            if r["mnp"] or r["mnp_outcome"]:
+                log("  MNP: %s" % (r["mnp"] or r["mnp_outcome"]))
             if r["text"]:
                 log("  text: %r" % r["text"][:200])
             with open(os.path.join(LOGS, os.path.basename(r["wav"]) + ".log"), "w") as f:
