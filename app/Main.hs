@@ -7,6 +7,7 @@ import Options.Applicative
 import System.IO
 import Text.Printf (printf)
 
+import Dial
 import Modec.Detect
 import Modec.Pipewire (describeNodes, pwAudioNodes)
 import Modec.DSP
@@ -25,6 +26,7 @@ data Cmd
   | Probe FilePath
   | Detect FilePath
   | RunModem ModemOpts
+  | DialOut DialOpts
   | ListDevices
 
 channelP :: Parser Channel
@@ -45,6 +47,7 @@ cmdP = hsubparser
   <> command "encode" (info encodeP (progDesc "Modulate stdin bytes to a WAV file"))
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
+  <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
   <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
   <> command "devices" (info (pure ListDevices) (progDesc "List the PipeWire audio devices usable with --pw-in / --pw-out"))
   )
@@ -84,13 +87,64 @@ cmdP = hsubparser
       <*> option auto (long "mnp-probe-interval" <> value 2.5 <> showDefault <> metavar "S"
                        <> help "seconds between those link requests. A far end running V.42's detection phase abandons it 750 ms into the data phase, so probing early matters as much as probing often")
       <*> switch (long "hayes" <> help "Hayes AT command mode on the data side (ATD, ATA, ATH, +++)")
-      <*> optional (strOption (long "sip" <> metavar "HOST:PORT" <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming"))
+      <*> optional (strOption (long "sip" <> metavar "HOST:PORT"
+                               <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming. `modec dial` sets this up for you"))
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")
       <*> audioP
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
-      <*> optional (strOption (long "record-rx" <> metavar "FILE.wav" <> help "record everything received to a WAV file"))
-      <*> optional (strOption (long "record-tx" <> metavar "FILE.wav" <> help "record everything transmitted to a WAV file")))
+      <*> optional (strOption (long "record-rx" <> metavar "FILE.wav" <> help "also record the whole session's received audio to one WAV, start to finish"))
+      <*> optional (strOption (long "record-tx" <> metavar "FILE.wav" <> help "as --record-rx, for transmitted audio"))
+      <*> recordDirP
+      <*> pure Nothing
+      <*> pure False)
+    -- Every call is recorded and logged under this directory, named for
+    -- when it was placed and what it dialled; --no-record is the way to
+    -- ask for a call that leaves nothing behind.
+    recordDirP =
+          flag' Nothing (long "no-record" <> help "do not record calls")
+      <|> (Just <$> strOption (long "record-dir" <> metavar "DIR" <> value "recordings" <> showDefault
+                               <> help "per-call recordings and logs go here, plus a calls.log index"))
+    dialP = DialOut <$> (DialOpts
+      <$> argument str (metavar "NUMBER" <> help "digits as you would dial them, or a full sip: URI")
+      <*> strOption (long "sip" <> metavar "HOST:PORT" <> value "127.0.0.1:4444" <> showDefault
+                     <> help "baresip's ctrl_tcp address")
+      <*> optional (strOption (long "sip-domain" <> metavar "DOMAIN"
+                               <> help "domain to dial into (default: the one in ~/.baresip/accounts)"))
+      <*> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> showDefault
+                     <> help "PipeWire loopback pair shared with the softphone")
+      <*> optional (option auto (long "listen" <> metavar "PORT"
+                                 <> help "put the modem on a telnet port instead of this terminal"))
+      <*> flag True False (long "no-launch" <> help "expect baresip to be running already")
+      <*> switch (long "stay" <> help "keep the AT prompt when the call ends, instead of exiting")
+      <*> modemP')
+    -- The modem's own settings, shared with `modec modem`: how to
+    -- negotiate, whether to error-correct, what to record.  Everything
+    -- about how the call is carried is decided by `dial` itself.
+    modemP' = mkDialModem
+      <$> modesP
+      <*> switch (long "v8" <> help "V.8: exchange CM/JM capability menus before the modem start-up")
+      <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full")
+      <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
+      <*> mnpP
+      <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
+                       <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this")
+      <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
+      <*> recordDirP
+    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir = defaultModemOpts
+      { moModes = modes, moV8 = v8, moV8All = v8all, moNoV8bis = noV8bis
+      , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir }
+    modesP =
+          option (maybeReader modesReader)
+            (long "modes" <> metavar "LIST"
+             <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis (default: all)")
+      <|> option (maybeReader (fmap (: []) . modeReader))
+            (long "standard" <> metavar "MODE" <> help "shorthand for --modes with a single mode")
+      <|> pure H.allStandards
+    mnpP =
+          flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A), classes 2 to 4")
+      <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, but offering only up to class N")
+      <|> pure Nothing
     modesReader s = case s of
       "auto" -> Just H.allStandards
       "all" -> Just H.allStandards
@@ -166,6 +220,7 @@ main = do
         then putStrLn "no PipeWire audio devices found (is pipewire running, and is pw-dump installed?)"
         else putStr (describeNodes ns)
     RunModem mo -> runModem mo
+    DialOut d -> runDial d
     Detect path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)

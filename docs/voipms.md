@@ -57,17 +57,59 @@ baresip
 
 Leave it running. It listens for modec on 127.0.0.1:4444.
 
-## 3. modec
+## 3. Placing a call
+
+```
+modec dial +14042820600
+```
+
+That is the whole thing. `dial` starts baresip if nothing is already
+listening on its control port, takes the domain from the account in
+`~/.baresip/accounts`, brings up the PipeWire loopback pair, dials, puts
+this terminal on the modem in raw mode, and records the call. When the
+call ends, so does modec; `--stay` keeps the AT prompt instead. `+++ATH`
+hangs up from the keyboard, ctrl-C leaves.
+
+Add `--listen 2323` to put the modem on a telnet port rather than the
+terminal, which is what you want for a terminal emulator with ANSI and
+file transfer.
+
+The long form is still there when you need to place the pieces yourself
+-- an existing baresip, a different audio path, the answering side:
 
 ```
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain toronto.voip.ms \
-  --audio-sip-loop modec --hayes --listen 2323
+  --audio-sip-loop modec --listen 2323
 ```
 
 Then point a terminal program at `localhost 2323` and type AT commands.
 modec creates the PipeWire loopback nodes baresip captures from and plays
 into; baresip's `audio_source` and `audio_player` in the supplied config
 already name them.
+
+## 3a. What every call leaves behind
+
+Each call, dialled or answered, writes three things under `recordings/`:
+
+```
+recordings/20260906T154925-+19719104722.wav   what came down the line
+recordings/20260906T154925-+19719104722.log   what the modem made of it
+recordings/calls.log                          one line per call
+```
+
+The log is stamped in seconds from the start of the call, so it reads
+alongside the recording:
+
+```
+# 2026-09-06 15:49:25 EDT  +19719104722
+   3.24  SIP call up, modem role Originate
+  15.31  CONNECT V21 300 bit/s, sending v21-ch1, hearing v21-ch2
+  28.08  call ended: connected V21 300 bit/s
+```
+
+`--record-dir DIR` moves them, `--no-record` turns them off. `--record-rx`
+and `--record-tx` are a different thing and still there: one file for the
+whole session rather than one per call, which is what a bench run wants.
 
 ## 4. Test ladder
 
@@ -82,11 +124,13 @@ record what comes back:
 
 ```
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain toronto.voip.ms \
-  --audio-sip-loop modec --hayes --listen 2323 \
+  --audio-sip-loop modec --listen 2323 \
   --modes bell103 --no-handshake --record-rx echo.wav --record-tx sent.wav
 ```
 
-`ATDT4443`, let it run ten seconds, then `+++` and `ATH`. The echo test
+The long form, because this test wants both directions in one file each
+rather than the per-call recording `dial` makes. `ATDT4443`, let it run
+ten seconds, then `+++` and `ATH`. The echo test
 returns your own audio, so `echo.wav` is your own carrier after a round
 trip through the trunk. Check it:
 
@@ -107,13 +151,14 @@ both ends, which is far easier to debug than a BBS.
 **d. A real BBS.** Start slow and work up:
 
 ```
-ATDT<number>          # with --modes bell103   (300 bit/s, most forgiving)
-ATDT<number>          # with --modes v22       (1200 bit/s)
-ATDT<number>          # with the default modes (2400 bit/s if both ends manage it)
+modec dial <number> --modes bell103    # 300 bit/s, most forgiving
+modec dial <number> --modes v22        # 1200 bit/s
+modec dial <number>                    # 2400 bit/s if both ends manage it
 ```
 
-Always record with `--record-rx`; when a connection fails, the recording
-plus `modec detect` shows exactly how far the handshake got.
+Every one of those is recorded without being asked; when a connection
+fails, `modec detect recordings/<the call>.wav` next to that call's log
+shows exactly how far the handshake got.
 
 ## Field notes from a real call
 

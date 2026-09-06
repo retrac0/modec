@@ -125,8 +125,8 @@ EOF
 sleep 0.5
 # --answer/--originate only fix the FIFO open order here; in SIP mode the
 # role of each call comes from who dialled
-"$BIN" modem --sip "127.0.0.1:$CA" --sip-domain test --answer --audio-in "$W/b2a" --audio-out "$W/a2b" --listen "$PA" 2> "$W/a.log" &
-"$BIN" modem --sip "127.0.0.1:$CB" --sip-domain test --originate --audio-in "$W/a2b" --audio-out "$W/b2a" --listen "$PB" 2> "$W/o.log" &
+"$BIN" modem --sip "127.0.0.1:$CA" --sip-domain test --answer --no-record --audio-in "$W/b2a" --audio-out "$W/a2b" --listen "$PA" 2> "$W/a.log" &
+"$BIN" modem --sip "127.0.0.1:$CB" --sip-domain test --originate --no-record --audio-in "$W/a2b" --audio-out "$W/b2a" --listen "$PB" 2> "$W/o.log" &
 wait %1 || echo "driver failed"
 echo "--- results"; cat "$W/result.txt" 2>/dev/null || echo "(no results)"
 echo "--- A log"; grep -vE "^modec: [0-9.]+ tx" "$W/a.log" | head -12

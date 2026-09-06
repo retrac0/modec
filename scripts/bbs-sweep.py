@@ -154,7 +154,7 @@ def place_call(binpath, number, label, rate, outdir):
         [binpath, "modem", "--sip", "127.0.0.1:%d" % CTRL, "--sip-domain", DOMAIN,
          "--audio-sip-loop", "modec"]
         + CONFIGS[rate]
-        + ["--record-rx", wav, "--data-stdio"],
+        + ["--record-rx", wav, "--no-record", "--data-stdio"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         cwd=ROOT, bufsize=0)
     os.set_blocking(modec.stdout.fileno(), False)

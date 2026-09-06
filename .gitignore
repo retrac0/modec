@@ -6,4 +6,7 @@ pw
 
 # Call recordings: kept on disk, too bulky for git.  The handful
 # already tracked stay tracked; sweeps add tens of megabytes a run.
+# The per-call logs and the index go the same way: they describe
+# recordings that are not in the repository either.
 recordings/*.wav
+recordings/*.log

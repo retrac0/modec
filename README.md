@@ -111,6 +111,15 @@ with an annotated timeline.
   [docs/mnp.md](docs/mnp.md), and
   [docs/mnp-bench.md](docs/mnp-bench.md) for what is confirmed against real
   hardware, what is not, and the order to test it in on the bench.
+- One command to place a call: `modec dial NUMBER` starts baresip if it
+  is not already up, finds the SIP domain in `~/.baresip/accounts`, dials,
+  and hands the call to the terminal in raw mode. `--listen PORT` puts it
+  on telnet instead, `--stay` keeps the AT prompt when the call ends.
+- Per-call recordings: every call, dialled or answered, writes
+  `recordings/<date>-<number>.wav` alongside a `.log` of what the modem
+  made of it, stamped in seconds from the start of the call, and a line
+  in `recordings/calls.log`. `--record-dir` moves them, `--no-record`
+  turns them off.
 - Session recording: `--record-rx` and `--record-tx` write everything
   heard and sent to WAV files, which `modec probe` and `modec detect` read
   back. The length fields are refreshed twice a second, so a recording is
@@ -157,7 +166,10 @@ scripts/smoke-loopback.sh
 cabal run modec -- modem --hayes --audio-pipewire --listen 2323
 scripts/smoke-hayes.sh
 
-# SIP: install baresip, copy docs/baresip to ~/.baresip and edit accounts, run baresip, then
+# SIP: install baresip and copy docs/baresip to ~/.baresip, edit accounts, then just
+cabal run modec -- dial +14042820600                              # starts baresip, dials, records
+cabal run modec -- dial +14042820600 --modes v21 --listen 2323    # on telnet instead of this terminal
+# the long form, for an existing baresip or the answering side
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example --audio-sip-loop modec --listen 2323
 # and from a terminal program: ATDT<number> dials the BBS, ATA answers an incoming SIP call
 scripts/smoke-sip.sh

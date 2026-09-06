@@ -7,6 +7,7 @@ module Modem
   ( AudioIO (..)
   , DataIO (..)
   , ModemOpts (..)
+  , defaultModemOpts
   , runModem
   ) where
 
@@ -16,6 +17,7 @@ import Control.Exception (IOException, bracket, finally, throwTo, try)
 import Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB
+import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.Int (Int16)
 import Data.IORef
@@ -29,12 +31,14 @@ import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 
+import CallLog
 import Modec.DSP (Signal, rms)
 import Modec.Handshake
 import Modec.Baresip
 import Modec.Dtmf
 import Modec.Hayes
 import Modec.Modem
+import Modec.Standards (fskBaud, fskName)
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
 import Modec.Pipewire
 import Modec.V8 (describeMenu)
@@ -87,7 +91,23 @@ data ModemOpts = ModemOpts
   , moAmp      :: Double
   , moRecordRx :: Maybe FilePath   -- ^ write everything received to this WAV
   , moRecordTx :: Maybe FilePath   -- ^ write everything transmitted to this WAV
+  , moRecordDir :: Maybe FilePath  -- ^ record each call separately here (see "CallLog")
+  , moDial     :: Maybe String     -- ^ dial this as soon as the line is ready
+  , moHangupExits :: Bool          -- ^ leave when the call does, rather than back to AT
   }
+
+-- | The settings a call is placed with when nothing says otherwise.
+-- Anything that builds a 'ModemOpts' starts here and overrides what it
+-- cares about, so a new option cannot be forgotten by a caller.
+defaultModemOpts :: ModemOpts
+defaultModemOpts = ModemOpts
+  { moRate = 8000, moBlockMs = 20, moRole = Originate, moModes = allStandards
+  , moNoHandshake = False, moNoV8bis = False, moV8 = False, moV8All = False
+  , moMaxEvm = 1.0, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
+  , moHayes = False, moSip = Nothing, moSipDomain = ""
+  , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
+  , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
+  , moDial = Nothing, moHangupExits = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -134,14 +154,41 @@ runModem o = do
       -- does to modem tones (modec detect / probe read them back)
       recRx <- mapM (\f -> logMsg ("recording received audio to " ++ f) >> openWav16Mono f (moRate o)) (moRecordRx o)
       recTx <- mapM (\f -> logMsg ("recording transmitted audio to " ++ f) >> openWav16Mono f (moRate o)) (moRecordTx o)
+      -- The session recordings above are one file for however long the
+      -- process runs.  This is the other kind: one recording and one log
+      -- per call, named for when it was placed and what it dialled.
+      callRef <- newIORef (Nothing :: Maybe CallRec)
+      outcomeRef <- newIORef "no answer"
+      let say msg = do
+            logMsg msg
+            mc <- readIORef callRef
+            mapM_ (\c -> callRecSay c msg) mc
+          beginCall number = case moRecordDir o of
+            Nothing -> return ()
+            Just dir -> do
+              endCall                      -- a redial without a hangup
+              mc <- callRecStart dir number (moRate o)
+              writeIORef callRef mc
+              writeIORef outcomeRef "no answer"
+              mapM_ (\c -> logMsg ("recording this call to " ++ crStem c ++ ".wav")) mc
+          endCall = do
+            mc <- readIORef callRef
+            case mc of
+              Nothing -> return ()
+              Just c -> do
+                outcome <- readIORef outcomeRef
+                callRecEnd c outcome
+                writeIORef callRef Nothing
       let readBlock = do
             bs <- aiRead ai (2 * blockN)
             mapM_ (\w -> wavAppendRaw w bs) recRx
+            mc <- readIORef callRef
+            mapM_ (\c -> callRecWrite c bs) mc
             return bs
           writeBlock bs = do
             mapM_ (\w -> wavAppendRaw w bs) recTx
             aiWrite ai bs
-          closeRecordings = mapM_ closeWav recRx >> mapM_ closeWav recTx
+          closeRecordings = endCall >> mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
           -- the peer closed a FIFO).  Try to put it back a few times
           -- before giving up, so a glitching USB interface does not end
@@ -173,14 +220,17 @@ runModem o = do
             when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
               logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
           report ev = case ev of
-            EvConnected s link -> logMsg ("CONNECT " ++ show s ++ " " ++ show link)
-            EvDropped -> logMsg "NO CARRIER"
-            EvFailed why -> logMsg ("connection failed: " ++ why)
-            EvV8Menu m -> logMsg ("V.8 far end offers: " ++ describeMenu m)
+            EvConnected st link -> do
+              writeIORef outcomeRef ("connected " ++ show st ++ " " ++ describeRate link)
+              say ("CONNECT " ++ show st ++ " " ++ describeRate link ++ ", " ++ describeChannels link)
+              when trace (logMsg (show link))
+            EvDropped -> writeIORef outcomeRef "carrier lost" >> say "NO CARRIER"
+            EvFailed why -> writeIORef outcomeRef ("failed: " ++ why) >> say ("connection failed: " ++ why)
+            EvV8Menu m -> say ("V.8 far end offers: " ++ describeMenu m)
             EvMnp (MnpUp cls k n401) ->
-              logMsg ("MNP class " ++ show cls ++ ", " ++ show k ++ " outstanding frames, N401 " ++ show n401)
-            EvMnp MnpTransparentFallback -> logMsg "no error correction: the far end did not answer"
-            EvMnp (MnpDown why) -> logMsg ("MNP link down: " ++ why)
+              say ("MNP class " ++ show cls ++ ", " ++ show k ++ " outstanding frames, N401 " ++ show n401)
+            EvMnp MnpTransparentFallback -> say "no error correction: the far end did not answer"
+            EvMnp (MnpDown why) -> say ("MNP link down: " ++ why)
       if not (moHayes o) && sip == Nothing
         then do
           -- plain mode: one call in the configured role, then exit
@@ -205,6 +255,14 @@ runModem o = do
           -- Hayes mode: an AT command interpreter controls calls on the line
           hayesRef <- newIORef hayesInit
           lineRef <- newIORef LineIdle
+          -- A number given on the command line is typed in for the user,
+          -- once the line has had a moment to settle; from there on it is
+          -- an ordinary Hayes call and everything else behaves the same.
+          dialRef <- newIORef (moDial o)
+          -- commands the modem types on the DTE's behalf, in the same
+          -- stream as anything the DTE types itself
+          injectRef <- newIORef B.empty
+          doneRef <- newIORef False
           energyRef <- newIORef (0 :: Int)
           sipLineRef <- newIORef (sipLineInit (moSipDomain o))
           logMsg (case sip of
@@ -217,6 +275,19 @@ runModem o = do
                 FskLink {} -> 300
                 V22Link _ _ R1200 -> 1200
                 V22Link _ _ R2400 -> 2400 :: Int
+              carrierGone = do
+                modemEvent EvNoCarrier
+                writeIORef lineRef LineIdle
+                -- over SIP the call itself is still up until baresip says
+                -- otherwise, and hanging up is what ends the recording
+                if sip == Nothing
+                  then do
+                    endCall
+                    when (moHangupExits o) (writeIORef doneRef True)
+                  -- the trunk holds the call open after the modem tones
+                  -- stop, so leaving means hanging up first
+                  else when (moHangupExits o) $
+                         modifyIORef' injectRef (<> BC.pack "ATH\r")
               modemEvent ev = do
                 hs <- readIORef hayesRef
                 let (hs', out) = hayesEvent hs ev
@@ -236,13 +307,27 @@ runModem o = do
                   else do
                     t <- tNow
                     modifyIORef' blockRef (+ 0)
-                    pending <- recvBytes
+                    typed <- recvBytes
+                    toDial <- readIORef dialRef
+                    injected <- atomicModifyIORef' injectRef (\b -> (B.empty, b))
+                    pending <- case toDial of
+                      Just n | t >= 1.0 -> do
+                        writeIORef dialRef Nothing
+                        return (injected <> BC.pack ("ATDT" ++ n ++ "\r") <> typed)
+                      _ -> return (injected <> typed)
                     hs0 <- readIORef hayesRef
                     let (hs1, back, fwd, acts) = hayesInput t hs0 pending
                         (hs2, tickOut) = hayesTick t hs1
                     writeIORef hayesRef hs2
                     unless (B.null back) $ sendBytes back
                     unless (B.null tickOut) $ sendBytes tickOut
+                    -- Every call gets its own recording, whether it was
+                    -- dialled here or answered from the line, and whether
+                    -- it goes out over SIP or over the audio device.
+                    forM_ acts $ \a -> case a of
+                      ActDial n -> beginCall (dialledNumber n)
+                      ActAnswer -> beginCall "incoming"
+                      _ -> return ()
                     -- SIP: Hayes actions and baresip events go through the line controller
                     sipActs <- case sip of
                       Nothing -> return []
@@ -257,7 +342,7 @@ runModem o = do
                     forM_ sipActs $ \sa -> case sa of
                       SipCommand c params -> maybe (return ()) (\cl -> sipSend cl c params) sip
                       SipStartModem role -> do
-                        logMsg ("SIP call up, modem role " ++ show role)
+                        say ("SIP call up, modem role " ++ show role)
                         -- PipeWire may have linked the default microphone into
                         -- the softphone's capture alongside our line, which
                         -- would put room noise on the wire; take it out now and
@@ -268,20 +353,27 @@ runModem o = do
                           forM_ stray $ \l ->
                             logMsg ("removed stray audio link into " ++ plDst l ++ " from " ++ plSrc l)
                         writeIORef lineRef (LineCall (modemInit (cfgFor role)) (cfgFor role))
-                      SipStopModem -> writeIORef lineRef LineIdle
+                      SipStopModem -> do
+                        writeIORef lineRef LineIdle
+                        endCall
+                        when (moHangupExits o) (writeIORef doneRef True)
                       SipToDte ev -> modemEvent ev
                     forM_ (if sip == Nothing then acts else []) $ \a -> do
                       line <- readIORef lineRef
                       case a of
                         ActDial s -> do
-                          logMsg ("dialling " ++ s)
+                          say ("dialling " ++ s)
                           writeIORef lineRef (LineDialing (dtmfDialSignal fs (0.5 * moAmp o) (map toUpperC s)))
                         ActAnswer -> do
-                          logMsg "answering"
+                          say "answering"
                           writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
                         ActHangup -> case line of
                           LineIdle -> return ()
-                          _ -> logMsg "on hook" >> writeIORef lineRef LineIdle
+                          _ -> do
+                            say "on hook"
+                            writeIORef lineRef LineIdle
+                            endCall
+                            when (moHangupExits o) (writeIORef doneRef True)
                         ActOnline -> return ()
                     line <- readIORef lineRef
                     let rxBlock = decodeS16 raw
@@ -316,8 +408,8 @@ runModem o = do
                           report ev
                           case ev of
                             EvConnected _ link -> modemEvent (EvConnect (rateOf link))
-                            EvDropped -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
-                            EvFailed _ -> modemEvent EvNoCarrier >> writeIORef lineRef LineIdle
+                            EvDropped -> carrierGone
+                            EvFailed _ -> carrierGone
                             -- reported to the log by `report`; the DTE
                             -- has no Hayes result code for a V.8 menu,
                             -- and none for the error-correcting protocol
@@ -327,13 +419,29 @@ runModem o = do
                               modemEvent (EvProtocol ("MNP CLASS " ++ show cls))
                             EvMnp _ -> return ()
                     modifyIORef' blockRef (+ 1)
-                    loop
+                    done <- readIORef doneRef
+                    unless done loop
           loop `finally` closeRecordings
   where
+    -- What the index line calls the speed.  An asymmetric link has two,
+    -- and naming only one of them would be a lie by omission.
+    describeRate link = case link of
+      FskLink tx rx | fskBaud tx == fskBaud rx -> show (round (fskBaud tx) :: Int) ++ " bit/s"
+                    | otherwise -> show (round (fskBaud rx) :: Int) ++ "/" ++ show (round (fskBaud tx) :: Int) ++ " bit/s"
+      V22Link _ _ R1200 -> "1200 bit/s"
+      V22Link _ _ R2400 -> "2400 bit/s"
+    -- which way round the link runs, in the terms the standard uses
+    describeChannels link = case link of
+      FskLink tx rx -> "sending " ++ fskName tx ++ ", hearing " ++ fskName rx
+      V22Link tx rx _ -> "sending " ++ show tx ++ ", hearing " ++ show rx
     isFinal EvDropped = True
     isFinal (EvFailed _) = True
     isFinal _ = False
     toUpperC ch = if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch
+    -- ATDT4695551212 reaches here as "T4695551212": the dial string keeps
+    -- the tone/pulse/wait modifiers, and a recording should be named
+    -- after the number, not after how the dialler was told to send it
+    dialledNumber = dropWhile (`elem` " ,TPWtpw")
 
 -- | Connection to baresip's ctrl_tcp module: a reader thread decodes
 -- netstring-framed JSON into a queue; commands go out with tokens.

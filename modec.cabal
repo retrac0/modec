@@ -45,6 +45,8 @@ executable modec
     import:           warnings
     main-is:          Main.hs
     other-modules:    Modem
+                      CallLog
+                      Dial
     ghc-options:      -threaded
     build-depends:    base ^>=4.18,
                       modec,
@@ -53,7 +55,10 @@ executable modec
                       optparse-applicative,
                       network,
                       process,
-                      unix
+                      unix,
+                      directory,
+                      filepath,
+                      time
     hs-source-dirs:   app
     default-language: Haskell2010
 
