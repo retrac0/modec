@@ -28,6 +28,10 @@ module Modec.Pipewire
   , pwLinks
   , pwUnlink
   , pruneCompetingInputs
+    -- * Volumes
+  , nodeGains
+  , parseGains
+  , attenuatedNodes
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -36,6 +40,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit, toLower)
 import Data.List (isInfixOf)
+import Data.Maybe (mapMaybe)
 import System.Exit (ExitCode (..))
 import System.Process (readProcess, readProcessWithExitCode)
 
@@ -197,3 +202,47 @@ describeNodes ns = unlines
       PwSink -> "output"
       PwSource -> "input"
       PwOther s -> s
+
+-- | The volume WirePlumber has actually applied to a node, as
+-- @(name, loudest channel, muted)@.
+--
+-- This is worth checking because WirePlumber restores per-application
+-- volumes from @stream-properties@, keyed by @application.name@ among
+-- other things.  Every @pw-cat@ stream on a machine shares that name, so
+-- one stray slider drag in a mixer silently attenuates the modem's
+-- transmit for good, on a control no modem operator would think to look
+-- at.  A modem's send level is part of the protocol, not a listening
+-- preference, so the streams are created with restore disabled and this
+-- confirms it took.
+parseGains :: B.ByteString -> [(String, Double, Bool)]
+parseGains bs = case jsonParse bs of
+  Just (JArr objs) -> mapMaybe gains objs
+  _ -> []
+  where
+    gains o = do
+      info <- jsonLookup "info" o
+      name <- case jsonString "node.name" <$> jsonLookup "props" info of
+        Just n | not (null n) -> Just n
+        _ -> Nothing
+      JArr props <- jsonLookup "params" info >>= jsonLookup "Props"
+      let vols = [ v | p <- props
+                     , Just (JArr cs) <- [jsonLookup "channelVolumes" p]
+                     , JNum v <- cs ]
+          muted = or [ True | p <- props, Just (JBool True) <- [jsonLookup "mute" p] ]
+      if null vols then Nothing else Just (name, maximum vols, muted)
+
+-- | 'parseGains' over a live @pw-dump@.
+nodeGains :: IO [(String, Double, Bool)]
+nodeGains = do
+  r <- try (readProcess "pw-dump" [] "") :: IO (Either IOException String)
+  return $ case r of
+    Left _ -> []
+    Right out -> parseGains (BC.pack out)
+
+-- | Of the named nodes, those a mixer would be quietening: muted, or more
+-- than a quarter of a decibel down.  Nodes that are absent or carry no
+-- volume control are not reported.
+attenuatedNodes :: [String] -> IO [(String, Double, Bool)]
+attenuatedNodes names = do
+  gs <- nodeGains
+  return [ g | g@(n, v, m) <- gs, n `elem` names, m || v < 0.97 ]

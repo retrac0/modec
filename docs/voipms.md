@@ -175,3 +175,44 @@ If a call connects and then drops, look at the `MODEC_TRACE=1` log: it
 prints the V.22 decision-error figure per block, which rises before a
 connection is lost and tells you whether the problem is the trunk or the
 receiver.
+
+## Transmit level: WirePlumber will quietly attenuate the modem
+
+The one local fault that cost the most time. Sending was 7.5 dB low with
+every control reading unity, so the far end heard our carrier but decoded
+junk from it while our own recordings of what we sent were flawless.
+
+WirePlumber restores per-application volumes from
+`~/.local/state/wireplumber/stream-properties`, and the key it matched was
+`Output/Audio:application.name:pw-cat`. Every `pw-cat` playback stream on
+the machine shares that name, so one slider left at three quarters in a
+mixer years ago (0.75 cubed is the 0.421824 that appears in the file) was
+being reapplied to the modem's transmit stream. Nothing in a call points
+at it: the node volume, the loopback volumes and the sink volumes all read
+1.0, because the attenuation lives in `channelVolumes` rather than
+`volume`.
+
+modec now creates its `pw-cat` streams with `application.name = modec` and
+`state.restore-props = false`, which opts out of the restore, and checks
+the applied gain shortly after the streams appear:
+
+```
+modec: warning: modec-tx is -7.5 dB; audio levels will be wrong (reset it in a mixer)
+```
+
+A send level is part of the modulation rather than a listening preference,
+so this is deliberately not a user-adjustable control. To confirm a chain
+end to end, play a known tone through it and measure what comes back;
+through a `pw-loopback` pair it should return within a decibel:
+
+```
+pw-loopback -n t --capture-props='{ media.class = Audio/Sink node.name = t-sink }' \
+                 --playback-props='{ media.class = Audio/Source node.name = t-src }' &
+pw-cat --record --target t-src --raw --rate 8000 --channels 1 --format s16 out.raw &
+pw-cat --playback --target t-sink --rate 8000 --channels 1 --format s16 tone.wav
+```
+
+The same measurement showed the loopback itself is otherwise clean:
+distortion and noise sit 83 dB below a 1004 Hz tone, and nothing escapes
+the 300-3400 Hz band, so the 8 kHz to 48 kHz and back resampling is not
+what was damaging the signal.

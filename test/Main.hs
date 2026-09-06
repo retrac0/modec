@@ -578,8 +578,26 @@ pipewireTests = testGroup "PipeWire device discovery"
       assertEqual "id" NoMatch (matchNode "999" nodes)
       assertEqual "garbage" [] (parseNodes (BC.pack "not json"))
       assertEqual "empty" [] (parseNodes (BC.pack "[]"))
+  , testCase "read the volume a session manager applied to a stream" $ do
+      -- 0.421824 is 0.75 cubed: a mixer slider left at three quarters,
+      -- which WirePlumber restores onto every stream sharing the
+      -- application name.  On the transmit stream that is 7.5 dB the far
+      -- end never gets back, so it has to be visible.
+      assertEqual "gains"
+        [ ("modec-tx", 0.421824, False), ("modec-rx", 1.0, False), ("muted-one", 1.0, True) ]
+        (parseGains volDump)
+      assertEqual "no volume control, no report" [] (parseGains (BC.pack "[]"))
   ]
   where
+    volDump = BC.pack (concat
+      [ "[ {\"id\": 70, \"info\": { \"props\": { \"node.name\": \"modec-tx\" },"
+      , " \"params\": { \"Props\": [ { \"volume\": 1.0, \"mute\": false,"
+      , " \"channelVolumes\": [0.421824] } ] } } },"
+      , " {\"id\": 71, \"info\": { \"props\": { \"node.name\": \"modec-rx\" },"
+      , " \"params\": { \"Props\": [ { \"mute\": false, \"channelVolumes\": [1.0, 1.0] } ] } } },"
+      , " {\"id\": 72, \"info\": { \"props\": { \"node.name\": \"muted-one\" },"
+      , " \"params\": { \"Props\": [ { \"mute\": true, \"channelVolumes\": [1.0] } ] } } },"
+      , " {\"id\": 73, \"info\": { \"props\": { \"node.name\": \"no-props\" } } } ]" ])
     dump = BC.pack (concat
       [ "[ {\"id\": 52, \"type\": \"PipeWire:Interface:Node\", \"info\": { \"props\": {"
       , " \"node.name\": \"alsa_output.pci-0000_00_1f.3.analog-stereo\","

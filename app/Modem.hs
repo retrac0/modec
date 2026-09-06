@@ -11,6 +11,7 @@ module Modem
   ) where
 
 import Control.Concurrent
+import Numeric (showFFloat)
 import Control.Exception (IOException, bracket, finally, throwTo, try)
 import Control.Monad
 import qualified Data.ByteString as B
@@ -497,8 +498,8 @@ withAudio aio rate role body = case aio of
     -- what baresip's PipeWire module accepts.
     let lb name sink src = proc "pw-loopback"
           [ "-n", name
-          , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" }"
-          , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" }" ]
+          , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" " ++ noRestore ++ " }"
+          , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" " ++ noRestore ++ " }" ]
         toSip = prefix ++ "-to-sip"; lineSrc = prefix ++ "-line"
         fromSip = "sip-to-" ++ prefix; sipSrc = prefix ++ "-sip-line"
     bracket (createProcess (lb (prefix ++ "-lb1") toSip lineSrc)) cleanupProc $ \_ ->
@@ -511,9 +512,9 @@ withAudio aio rate role body = case aio of
           exitFailure
         logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
         withPwCatPair
-          (["--record", "--target", sipSrc, "-P", "{ node.name = " ++ prefix ++ "-rx }"] ++ common ++ ["-"])
-          (["--playback", "--target", toSip, "-P", "{ node.name = " ++ prefix ++ "-tx }"] ++ common ++ ["-"])
-          body
+          (["--record", "--target", sipSrc, "-P", streamProps (prefix ++ "-rx")] ++ common ++ ["-"])
+          (["--playback", "--target", toSip, "-P", streamProps (prefix ++ "-tx")] ++ common ++ ["-"])
+          (withGainCheck [prefix ++ "-rx", prefix ++ "-tx"] body)
   AudioPipewire inSpec outSpec monitor0 -> do
     -- With no capture device the only thing to record is an output's
     -- monitor; pw-cat cannot auto-connect to that, and a failed capture
@@ -527,14 +528,38 @@ withAudio aio rate role body = case aio of
     inN <- if monitor then maybe (resolveOpt inSpec PwSink) (return . Just) outN
                       else resolveOpt inSpec PwSource
     let target = maybe [] (\n -> ["--target", show (pnId n)])
-        recArgs = ["--record"] ++ (if monitor then ["-P", "{ stream.capture.sink = true }"] else [])
+        recArgs = ["--record", "-P", streamPropsWith "modec-rx"
+                     (if monitor then ["stream.capture.sink = true"] else [])]
                   ++ target inN ++ common ++ ["-"]
-        playArgs = ["--playback"] ++ target outN ++ common ++ ["-"]
+        playArgs = ["--playback", "-P", streamProps "modec-tx"] ++ target outN ++ common ++ ["-"]
     logMsg ("audio in: " ++ (if monitor then "monitor of " else "") ++ nodeLabel inN
             ++ ", out: " ++ nodeLabel outN ++ ", " ++ show rate ++ " Hz")
-    withPwCatPair recArgs playArgs body
+    withPwCatPair recArgs playArgs (withGainCheck ["modec-rx", "modec-tx"] body)
   where
     common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", "100ms"]
+    -- WirePlumber restores per-application volumes from its
+    -- stream-properties state, and every pw-cat stream on the machine
+    -- shares the application name "pw-cat".  A single slider drag in a
+    -- mixer therefore attenuates the modem's transmit permanently, on a
+    -- control nothing in a call would lead you to inspect.  A send level
+    -- is part of the modulation, not a listening preference, so opt out
+    -- of the restore and take a name of our own.
+    noRestore = "state.restore-props = false"
+    streamProps name = streamPropsWith name []
+    streamPropsWith name extra =
+      "{ node.name = " ++ name ++ " application.name = modec " ++ noRestore
+        ++ concatMap (' ' :) extra ++ " }"
+    -- Confirm the opt-out took: a graph we do not control could still
+    -- put a volume on the stream, and silently sending 8 dB low is worse
+    -- than a warning nobody needs.
+    withGainCheck names act aif = do
+      _ <- forkIO $ do
+        threadDelay 800000
+        bad <- attenuatedNodes names
+        mapM_ (\(n, v, m) -> logMsg ("warning: " ++ n ++ " is " ++
+                (if m then "muted" else showFFloat (Just 1) (20 * logBase 10 v) "" ++ " dB")
+                ++ "; audio levels will be wrong (reset it in a mixer)")) bad
+      act aif
     ignoreIO act = void (try act :: IO (Either IOException ()))
     cleanupProc (mi, mo, _, ph) = do
       mapM_ hClose mi
