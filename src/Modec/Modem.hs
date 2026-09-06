@@ -87,12 +87,13 @@ data TxState = TxState
   , txBits    :: [Bool]
   , txQueue   :: [Word8]
   , txFir     :: Maybe (String, VS.Vector Double, Signal)   -- ^ spec name, reversed kernel, history
+  , txSync    :: [Bool]             -- ^ synchronous line bits waiting (MNP framing mode 3)
   , txV22     :: V22TxState
   , txPhase2  :: !Double            -- ^ second tone phase (dual tones)
   }
 
 txInit :: TxState
-txInit = TxState 0 0 True [] [] Nothing v22TxInit 0
+txInit = TxState 0 0 True [] [] Nothing [] v22TxInit 0
 
 -- | Generate @n@ samples for a transmit command, consuming queued bytes
 -- only in data modes.
@@ -128,8 +129,12 @@ txBlock fs amp fr guard cmd n st = case cmd of
     let (bytes, st1) = case mode of
           TxScrambledData -> (txQueue st, st { txQueue = [] })
           _ -> ([], st)
-        (v', sig) = v22TxBlock fs ch fr amp guard rate mode bytes n (txV22 st1)
-    in (st1 { txV22 = v', txFir = Nothing }, sig)
+        v0 = case mode of
+          TxSyncData -> withBits (txV22 st1) (txSync st1)
+          _ -> txV22 st1
+        (v', sig) = v22TxBlock fs ch fr amp guard rate mode bytes n v0
+        st2 = case mode of { TxSyncData -> st1 { txSync = [] }; _ -> st1 }
+    in (st2 { txV22 = v', txFir = Nothing }, sig)
   where
     twoPi = 2 * pi
     wrap p = p - twoPi * fromIntegral (floor (p / twoPi) :: Int)
@@ -194,7 +199,6 @@ data ModemState = ModemState
   , msStatus  :: HsStatus
   , msDte     :: [Word8]     -- ^ terminal bytes the protocol layer has not taken yet
   , msMnp     :: Maybe MnpState
-  , msTxBits  :: [Bool]      -- ^ synchronous line bits waiting for the transmitter
   }
 
 modemInit :: ModemConfig -> ModemState
@@ -210,7 +214,7 @@ modemInit cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
              (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200 0 0 0 HsBusy
-             [] Nothing []
+             [] Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -257,12 +261,34 @@ mnpConfFor cfg link = case mcMnp cfg of
 
 -- | Octets still waiting to go on the line, across both transmitters.
 txPending :: TxState -> Int
-txPending st = length (txQueue st) + v22TxPending (txV22 st) + (length (txBits st) + 7) `div` 8
+txPending st =
+  txOctetsPending st + (length (txSync st) + 7) `div` 8
+
+-- | Bytes still waiting to be framed as start-stop characters.  The
+-- framing switch waits on this: the acknowledgement that closes
+-- establishment is octet framed, and a synchronous transmitter does not
+-- drain the byte queue, so switching while it is still going out would
+-- strand it on the way to a far end waiting for exactly that frame.
+--
+-- The bits of the character already being shifted out are deliberately
+-- not counted.  The synchronous mode appends its frame bits behind them,
+-- so the ordering holds either way -- and in that mode those bits /are/
+-- the frames, so counting them would hold the switch off for ever and
+-- leave the line filling between frames with mark instead of flags.
+txOctetsPending :: TxState -> Int
+txOctetsPending st = length (txQueue st) + v22TxQueued (txV22 st)
 
 
 dataCmd :: Link -> TxCmd
 dataCmd (FskLink tx _) = TxData tx
 dataCmd (V22Link tx _ r) = TxV22 tx r TxScrambledData
+
+-- | The same link carrying bit-oriented framing.  Only the V.22 data pump
+-- has a synchronous mode; 'linkSyncable' keeps the FSK links from ever
+-- negotiating one, so the fallback here is never reached.
+syncCmd :: Link -> TxCmd
+syncCmd (V22Link tx _ r) = TxV22 tx r TxSyncData
+syncCmd l = dataCmd l
 
 -- | Idle-mark command for a link (used while settling after CONNECT).
 markCmd :: Link -> TxCmd
@@ -394,9 +420,20 @@ modemStep cfg st0 rxBlock newBytes =
           -- downstream can tell the difference.
           trust = rxEvmEstimate rxSt' < mcMaxEvm cfg
           armed' = armed || (roOnesRun o >= 16 && trust)
-          (framer', bytes) = if armed && trust then asyncRxBits framer (roBits o) else (framer, [])
+          -- Once the protocol layer has switched to bit-oriented framing
+          -- the start-stop framer is out of the way entirely: HDLC finds
+          -- its own frames from the flags, so there is nothing to arm and
+          -- no character boundary to keep.
+          sync = case msMnp st of
+            Just m -> mnpFraming m == FramingBit
+            Nothing -> False
+          (framer', line)
+            | sync = (framer, LineBits (if trust then roBits o else []))
+            | otherwise =
+                let (f', bs) = if armed && trust then asyncRxBits framer (roBits o) else (framer, [])
+                in (f', LineOctets bs)
           st1 = st { msV22Rx = Just (rx, rxSt'), msRxRate = rate }
-      in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) (LineOctets bytes)
+      in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) line
   where
     -- common tail of the data modes: carrier watchdog, settle time, transmit
     finishData st mode link present line =
@@ -423,16 +460,28 @@ modemStep cfg st0 rxBlock newBytes =
 
           tx0 = msTx st
           tx1 = case toLine of
-            OutOctets bs -> tx0 { txQueue = txQueue tx0 ++ bs }
-            OutBits _ -> tx0
-          bits1 = case toLine of
-            OutBits bs -> msTxBits st ++ bs
-            OutOctets _ -> msTxBits st
+            -- back in octet framing after a switch was undone: whatever
+            -- synchronous bits were still queued are frames the far end
+            -- was never going to read, so they go
+            OutOctets bs -> tx0 { txQueue = txQueue tx0 ++ bs, txSync = [] }
+            OutBits bs -> tx0 { txSync = txSync tx0 ++ bs }
 
-          cmd = if settled < mcSettle cfg then markCmd link else dataCmd link
+          -- The command has to match what the protocol layer just encoded,
+          -- not the framing it will use next: the frame closing
+          -- establishment is octet framed and the switch lands after it.
+          -- An empty block still matters, because a synchronous
+          -- transmitter idles on flags rather than on mark.
+          --
+          -- The switch also waits for the octet queue to empty.  That
+          -- frame takes several blocks to reach the line at 1200 bit/s,
+          -- and the synchronous mode would not carry the rest of it.
+          wantSync = case toLine of { OutBits _ -> True; OutOctets _ -> False }
+          cmd | settled < mcSettle cfg = markCmd link
+              | wantSync && txOctetsPending tx1 == 0 = syncCmd link
+              | otherwise = dataCmd link
           (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n tx1
-          st1 = st { msMode = mode, msTx = txSt, msLost = lost, msSettled = settled
-                   , msMnp = mnp', msTxBits = bits1
+          st1 = st { msMode = mode, msTx = txSt, msTxCmd = cmd, msLost = lost, msSettled = settled
+                   , msMnp = mnp'
                    , msDte = if isJust (msMnp st) && ran then [] else msDte st }
           evs = map EvMnp mnpEvs
           -- a disconnected error-correcting link is a dead data path, so

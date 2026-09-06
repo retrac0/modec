@@ -377,6 +377,50 @@ mnpModemTests = testGroup "MNP over the data pump"
       assertBool ("answer events " ++ show evA) (any isMnpUp evA)
       assertEqual "answer to originate" text rxO
       assertEqual "originate to answer" text rxA
+  , testCase "synchronous framing costs fewer line bits, and delivers sooner" $ do
+      -- The encoding first, exactly: dropping the start and stop bits is
+      -- worth a fifth on a large frame, and more on a small one, because
+      -- HDLC's two flags and check sequence are cheaper than the four
+      -- octets of lead-in and the four of trailer that mode 2 spends.
+      let frame n = encodeFrame True (FrLT 7 (replicate n 65))
+          bitsOctet n = length (mode2Encode (frame n)) * 10   -- ten bits to the character
+          bitsSync n = length (mode3Encode (frame n))
+      assertEqual "a 256-octet frame, mode 2" 2670 (bitsOctet 256)
+      assertEqual "a 256-octet frame, mode 3" 2104 (bitsSync 256)
+      assertBool "at least a fifth cheaper on a full frame"
+        (fromIntegral (bitsSync 256) <= 0.8 * (fromIntegral (bitsOctet 256) :: Double))
+      assertBool "cheaper still on a short one"
+        (fromIntegral (bitsSync 16) <= 0.7 * (fromIntegral (bitsOctet 16) :: Double))
+      -- and then on the line.  The terminal offers more than the link can
+      -- carry, so the link is what limits the run rather than the source;
+      -- at one byte a block it would be the source, and the two framings
+      -- would finish together and prove nothing.
+      let payload = map (fromIntegral . (`mod` 251)) [1 .. 400 :: Int]
+          mnp sync = Just ((defaultMnpConfig 1200 sync) { mnClass = 4, mnN401 = 16, mnK = 4 })
+          cfg m r = (defaultModemConfig 8000 r [V22]) { mcNoHandshake = True, mcMnp = m }
+          got sync = let (o, _, _, _) = modemDuplexStream
+                           (cfg (mnp sync) Originate) (cfg (mnp sync) Answer) 20 20 payload payload 6
+                     in o
+          octet = got False
+          sync' = got True
+      assertEqual "bit framing has delivered all of it by six seconds" payload sync'
+      assertBool ("octet framing is still going: " ++ show (length octet))
+        (length octet < length payload)
+      assertBool ("and is well behind: octet " ++ show (length octet)
+                  ++ " against bit " ++ show (length sync'))
+        (5 * length sync' >= 6 * length octet)
+  , testCase "the framing switch survives a lost acknowledgement" $ do
+      -- at this signal to noise ratio the frame that closes establishment
+      -- is regularly lost.  The far end goes on repeating its link
+      -- request, and the station that already switched has to notice and
+      -- go back to the framing the far end can still read.
+      let payload = map (fromIntegral . (`mod` 251)) [1 .. 120 :: Int]
+          mnp = Just ((defaultMnpConfig 1200 True) { mnClass = 4, mnN401 = 16, mnK = 4, mnLrTries = 6 })
+          cfg r = (defaultModemConfig 8000 r [V22]) { mcNoHandshake = True, mcMnp = mnp }
+          (rxO, rxA, evO, _) = modemDuplexStream (cfg Originate) (cfg Answer) 5 1 payload payload 45
+      assertBool ("came up: " ++ show (take 2 evO)) (any isMnpUp evO)
+      assertEqual "answer to originate" payload rxO
+      assertEqual "originate to answer" payload rxA
   , testCase "without the protocol the modem behaves exactly as before" $ do
       -- mcMnp defaults to Nothing, and then not one byte takes a
       -- different path through modemStep
@@ -872,6 +916,22 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
         _ -> assertFailure ("no link: " ++ show evI)
       assertEqual "responder to initiator" textA rxI
       assertEqual "initiator to responder" textO rxR
+  , testCase "noise is not mistaken for a far end with no protocol" $ do
+      -- a far end that does speak the protocol, on a line bad enough that
+      -- none of its frames survive, produces nothing but wreckage.  Giving
+      -- up on it there would abandon error correction exactly where it is
+      -- needed.  Only something that reads as characters counts.
+      let c = defaultMnpConfig 1200 False
+          junk = [ fromIntegral (i * 37 + 11) | i <- [0 .. 40 :: Int] ]
+          st0 = mnpInit c MnpInitiator
+          step (st, ph) _ =
+            let (st', _) = mnpStep c st (MnpIn 0.02 (LineOctets junk) [] 0 maxBound)
+            in (st', ph ++ [mnpPhase st'])
+          (_, phases) = foldl step (st0, []) [1 .. 40 :: Int]
+      assertBool ("stayed in establishment: " ++ show (take 3 phases))
+        (all (== MnpEstablish) phases)
+      assertBool "the text case still falls through"
+        (looksLikeTextCase (map (fromIntegral . fromEnum) "\r\nWelcome to the board\r\n"))
   , testCase "the first repeat of the last frame draws no acknowledgement" $ do
       -- A.7.3.2.2.  Answering a duplicate is what turns one lost
       -- acknowledgement into an exchange that never settles.
@@ -930,6 +990,16 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
   ]
   where
     isUp e = case e of { MnpUp {} -> True; _ -> False }
+    -- a banner really does still trigger the fall-through
+    looksLikeTextCase banner =
+      let c = defaultMnpConfig 1200 False
+          st0 = mnpInit c MnpInitiator
+          step (st, _) k =
+            let line = if k == (3 :: Int) then LineOctets banner else LineOctets []
+                (st', o) = mnpStep c st (MnpIn 0.02 line [] 0 maxBound)
+            in (st', o)
+          (stEnd, _) = foldl step (st0, undefined) [1 .. 20]
+      in mnpPhase stEnd == MnpTransparent
     isLa f = case f of { FrLA {} -> True; _ -> False }
     isLt f = case f of { FrLT {} -> True; _ -> False }
     isLd f = case f of { FrLD {} -> True; _ -> False }

@@ -60,6 +60,7 @@ module Modec.V22
   , rrcTaps
   , txBitsOf
   , v22TxPending
+  , v22TxQueued
   , withBits
   ) where
 
@@ -69,6 +70,7 @@ import Data.Word (Word8)
 
 import Modec.DSP
 import Modec.FSK (Framing, frameBits)
+import Modec.Hdlc (hdlcFlagBits)
 
 data V22Channel = LowChannel | HighChannel deriving (Eq, Show)
 
@@ -154,6 +156,7 @@ data TxMode
   | TxS1                -- ^ unscrambled repetitive double dibit 00 and 11
   | TxScrambledOnes
   | TxScrambledData     -- ^ queued bytes with start/stop framing, idle mark
+  | TxSyncData          -- ^ raw synchronous bits, idling on HDLC flags (MNP framing mode 3)
   deriving (Eq, Show)
 
 data V22TxState = V22TxState
@@ -178,6 +181,13 @@ v22TxInit = V22TxState 0 0 [] 0 0 False [] [] 0 0
 -- measures the far end's silence rather than our own backlog.
 v22TxPending :: V22TxState -> Int
 v22TxPending st = length (txQueue st) + (length (txBits st) + 7) `div` 8
+
+-- | Only the bytes still waiting to be framed, not the bits of the
+-- character already being shifted out.  The synchronous mode keeps its
+-- own frame bits in the same place as those character bits, so a caller
+-- asking "has the start-stop queue drained" has to ask for this one.
+v22TxQueued :: V22TxState -> Int
+v22TxQueued = length . txQueue
 
 -- | Generate @n@ samples.  @guard@ adds the 1800 Hz guard tone at -6 dB
 -- (high channel option).
@@ -208,6 +218,16 @@ v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
              , txSymbols = txSymbols stB ++ [(gx * gridScale, gy * gridScale)] }
     nextBit st = case mode of
       TxU11 -> (True, st)
+      -- Synchronous: the bits arrive already framed from the protocol
+      -- layer, and the interframe fill is the flag, as ISO 3309 requires.
+      -- The scrambler still runs underneath: a bare stream of flags is a
+      -- strong periodic pattern that the far end's timing recovery would
+      -- not enjoy.
+      TxSyncData -> case txBits st of
+        (b : bs) -> scr b st { txBits = bs }
+        [] -> case hdlcFlagBits of
+          (b : bs) -> scr b st { txBits = bs }
+          [] -> scr True st
       TxS1 -> (True, st)
       TxScrambledOnes -> scr True st
       TxScrambledData ->

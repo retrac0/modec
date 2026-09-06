@@ -339,12 +339,12 @@ transparent st os =
 -- Returns the frames, whether anything was damaged, and how many octets
 -- arrived outside any frame (which is how a far end with no protocol at
 -- all announces itself).
-decodeLine :: MnpState -> MnpLineIn -> (MnpState, [MnpFrame], Bool, Int)
+decodeLine :: MnpState -> MnpLineIn -> (MnpState, [MnpFrame], Bool, [Word8])
 decodeLine st line = case (msFraming st, line) of
   (FramingOctet, LineOctets os) ->
     let (rx', out) = mode2RxOctets (msRx2 st) os
         st' = st { msRx2 = rx' }
-    in (st', bodies out, any isBad out, length (mode2Junk rx'))
+    in (st', bodies out, any isBad out, mode2Junk rx')
   (FramingBit, LineBits bs) ->
     let (rx', frs) = hdlcRxBits (msRx3 st) bs
         -- while the switch settles, keep decoding the same bits as
@@ -360,9 +360,9 @@ decodeLine st line = case (msFraming st, line) of
                     (m2', out) = mode2RxOctets m2 os
                 in (Just (ar', m2'), bodies out)
         st' = st { msRx3 = rx', msRxGrace = grace' }
-    in (st', decodeAll frs ++ graceFrames, False, 0)
+    in (st', decodeAll frs ++ graceFrames, False, [])
   -- the caller handed us the wrong shape; nothing to do but wait
-  _ -> (st, [], False, 0)
+  _ -> (st, [], False, [])
   where
     isBad = either (const True) (const False)
     bodies out = decodeAll [ b | Right b <- out ]
@@ -396,6 +396,25 @@ handleFrame c (st, evs) frame = case (msPhase st, frame) of
     MnpResponder | msSawGood st -> enterData c st { msSawGood = True } (msNeg st) evs
     _ -> (st, evs)
 
+  -- A link request arriving in the data phase means the acknowledgement
+  -- that closed establishment never got there: the far end is still octet
+  -- framed and repeating itself.  Go back to the framing it can read, say
+  -- so again, and re-arm the switch.  Without this the two ends are stuck
+  -- for good -- one talking flags, the other listening for characters --
+  -- and it is exactly the frame most likely to be lost that causes it,
+  -- since nothing is retransmitting it.
+  (MnpData, FrLR _) | msRole st == MnpInitiator ->
+    let st' = sendCtrl st { msFraming = FramingOctet } (FrLA 0 (mnK c))
+    in ( st' { msNextFraming = framingOf (msNeg st)
+             , msRxGrace = if framingOf (msNeg st) == FramingBit
+                             then Just (asyncRxInit framing8N1, mode2RxInit)
+                             else Nothing
+             , msGraceAt = if framingOf (msNeg st) == FramingBit
+                             then msT st + 2 * t401Of c (msNeg st)
+                             else never
+             }
+       , evs )
+
   -- data phase
   (MnpData, FrLT ns info) -> (receiveLt c st ns info, evs)
   (MnpData, FrLA nr nk) -> (receiveLa st nr nk, evs)
@@ -427,9 +446,20 @@ enterData c st n evs =
        }
   , evs ++ [MnpUp (negClass n) (lrK n) (lrN401 n)] )
   where
-    framingOf x = if lrFraming x == 3 then FramingBit else FramingOctet
     grace | lrFraming n == 3 = Just (asyncRxInit framing8N1, mode2RxInit)
           | otherwise = Nothing
+
+-- | Whether a run of octets reads as text a terminal would have been
+-- shown, rather than as the wreckage of frames that did not survive the
+-- line.  Nearly all of it must be printable ASCII or ordinary whitespace.
+looksLikeText :: [Word8] -> Bool
+looksLikeText os =
+  not (null os) && 5 * length [ () | o <- os, printable o ] >= 4 * length os
+  where printable o = o == 9 || o == 10 || o == 13 || (o >= 32 && o <= 126)
+
+-- | The framing a negotiated link request calls for.
+framingOf :: MnpLr -> MnpFraming
+framingOf x = if lrFraming x == 3 then FramingBit else FramingOctet
 
 t401Of :: MnpConfig -> MnpLr -> Double
 t401Of c n = case mnT401 c of
@@ -503,12 +533,21 @@ sendCtrl st f = st { msOutCtrl = msOutCtrl st ++ [f] }
 -- | Everything the clock decides: the two ways establishment can end, the
 -- retransmission timer, the acknowledgement timers and the inactivity
 -- timer.
-timers :: MnpConfig -> MnpState -> Int -> (MnpState, [MnpEvent])
+timers :: MnpConfig -> MnpState -> [Word8] -> (MnpState, [MnpEvent])
 timers c st plain = case msPhase st of
   MnpEstablish
-    -- the far end is sending ordinary characters rather than link
-    -- requests, so there is no protocol over there to wait for
-    | mnDataDetect c && plain > 8 && not (msSawGood st) -> fallThrough st
+    -- The far end is sending ordinary characters rather than link
+    -- requests, so there is no protocol over there to wait for.
+    --
+    -- What it sends has to actually look like characters.  On a noisy
+    -- line a far end that does speak the protocol produces nothing but
+    -- junk -- its link requests arrive too damaged to frame -- and
+    -- counting octets alone would read that as a modem with no error
+    -- correction and give up on it precisely when it is needed most.  A
+    -- damaged frame is likewise evidence of a protocol, not of its
+    -- absence.
+    | mnDataDetect c && not (msSawGood st) && not (msSawBad st)
+    , length plain > 16, looksLikeText plain -> fallThrough st
     | msRole st == MnpInitiator && msLrTries st == 0 ->
         ( (sendCtrl st (FrLR (offerLr c)))
             { msLrTries = 1, msT401At = msT st + mnT401Lr c }, [] )
