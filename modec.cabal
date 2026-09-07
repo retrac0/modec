@@ -25,7 +25,9 @@ library
                       Modec.Async
                       Modec.Baudot
                       Modec.V22
+                      Modec.QAM
                       Modec.V32
+                      Modec.V32Pump
                       Modec.Hdlc
                       Modec.MnpFrame
                       Modec.Mnp
