@@ -1,0 +1,19 @@
+# The first V.32 call that ever carried data, 7 Sep 2026.  V.8 selects
+# V.32 out of the far end's menu, Figure 4's start-up runs, the rate
+# signals settle on 9600 trellis coded, and the same banner every other
+# fixture in this directory carries comes back at eight times the speed
+# of the V.21 one.
+#
+# Everything V.32 has -- the coding layer, the start-up, the data pump,
+# the echo canceller -- has to work for these fifty-one bytes to appear,
+# and nothing else in the suite asks for all of it at once against a real
+# line.
+source:    recordings/20260907T155453-+15642442600.wav
+seconds:   30
+role:      originate
+modes:     v32,v22bis,v22,v21
+v8:        yes
+connect:   V32 9600
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

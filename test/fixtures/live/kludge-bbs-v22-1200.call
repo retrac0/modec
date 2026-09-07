@@ -1,0 +1,12 @@
+# Kludge BBS at 1200, the cleanest call in the corpus: the noise sweep in
+# docs/robustness.md still gets 100 % of this one back at 14 dB SNR.  The
+# banner is ASCII art, so a single wrong byte is visible rather than
+# arguable.
+source:    recordings/20260906T005739-kludge-bbs-v22.wav
+seconds:   30
+role:      originate
+modes:     v22bis,v22
+v8:        no
+connect:   V22 1200
+expect:    Telnet/Web: klud.ge  Modem: +1-312-500-2600
+tolerance: 0

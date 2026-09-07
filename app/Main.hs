@@ -6,9 +6,17 @@ import qualified Data.ByteString as B
 import qualified Data.Vector.Storable as VS
 import Options.Applicative
 import System.IO
-import Text.Printf (printf)
+import Text.Printf (printf, hPrintf)
+
+import Data.List (intercalate)
+import System.Directory (createDirectoryIfMissing)
+import System.FilePath (takeFileName, (</>))
 
 import Dial
+import qualified Modec.Channel as Ch
+import Modec.Mnp (defaultMnpConfig, MnpConfig (..))
+import Modec.Modem
+import Modec.Replay
 import Modec.Detect
 import Modec.V32Start (v32Timeline)
 import qualified Modec.V32 as V32
@@ -33,11 +41,28 @@ data Cmd
   | Probe FilePath
   | Detect FilePath
   | V32Trace Bool FilePath   -- ^ True = we were the answering modem
+  | Replay ReplayOpts
   | ProgressOf FilePath
   | DtmfOf FilePath
   | RunModem ModemOpts
   | DialOut DialOpts
   | ListDevices
+
+-- | Reading a recording back through the whole modem, and optionally
+-- minting a test fixture out of what came back.
+data ReplayOpts = ReplayOpts
+  { roModes   :: [H.Standard]
+  , roAnswer  :: Bool
+  , roV8      :: Bool
+  , roMnp     :: Maybe Int
+  , roMaxEvm  :: Double
+  , roSeconds :: Maybe Double
+  , roLine    :: Bool
+  , roImpair  :: [String]
+  , roMint    :: Maybe String
+  , roDir     :: FilePath
+  , roPath    :: FilePath
+  }
 
 channelP :: Parser Channel
 channelP =
@@ -60,6 +85,7 @@ cmdP = hsubparser
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
   <> command "v32trace" (info v32traceP (progDesc "Read a V.32 start-up back out of a recording, as a timeline"))
+  <> command "replay" (info replayP (progDesc "Run the whole modem over a recording: the call timeline on stderr, the bytes on stdout"))
   <> command "progress" (info progressP (progDesc "Report the call progress tones in a WAV file: dial tone, ringing, busy, congestion, special information tone"))
   <> command "dtmf"  (info dtmfP   (progDesc "Report the DTMF digits in a WAV file"))
   <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
@@ -78,6 +104,23 @@ cmdP = hsubparser
     detectP = Detect <$> argument str (metavar "FILE.wav")
     v32traceP = V32Trace <$> switch (long "answer" <> help "we were the answering modem (default: calling)")
                          <*> argument str (metavar "FILE.wav")
+    replayP = Replay <$> (ReplayOpts
+      <$> modesP
+      <*> switch (long "answer" <> help "we were the answering modem (default: calling)")
+      <*> switch (long "v8" <> help "V.8 was in use on the call")
+      <*> (flag' (Just 4) (long "mnp" <> help "MNP error correction was in use")
+           <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, offering only up to class N")
+           <|> pure Nothing)
+      <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
+             <> help "stop passing bytes to the DTE above this decision error")
+      <*> optional (option auto (long "seconds" <> metavar "S" <> help "stop after this much of the recording"))
+      <*> switch (long "line" <> help "report the receiver's decision error and symbol timing twice a second")
+      <*> many (strOption (long "impair" <> metavar "K=V"
+             <> help "degrade the recording first: snr, freq, rate, dropout, echo, clip, hum, jitter, slips, seed. Repeatable"))
+      <*> optional (strOption (long "mint" <> metavar "NAME"
+             <> help "write NAME.wav (trimmed to --seconds), NAME.txt (this decode) and NAME.call into the fixture directory"))
+      <*> strOption (long "fixture-dir" <> value "test/fixtures/live" <> showDefault <> metavar "DIR")
+      <*> argument str (metavar "FILE.wav"))
     progressP = ProgressOf <$> argument str (metavar "FILE.wav")
     dtmfP = DtmfOf <$> argument str (metavar "FILE.wav")
     modemP = RunModem <$> (ModemOpts
@@ -290,6 +333,7 @@ main = do
           dir = if answered then V32.Answering else V32.Calling
       forM_ (v32Timeline fs dir (wavSamples w)) $ \(t, what) ->
         printf "%8.3f  %s\n" t what
+    Replay ro -> runReplay ro
     Detect path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)
@@ -335,3 +379,99 @@ main = do
             peak = VS.maximum amps
             mean = VS.sum amps / fromIntegral (max 1 n)
         printf "  %-20s %6.0f Hz  mean amp %.4f  peak amp %.4f\n" (name :: String) f mean peak
+
+-- | Read a recording back through the whole modem.  The call timeline
+-- goes to stderr and the bytes to stdout, so a replay reads like the
+-- call log it reproduces; @--mint@ additionally writes the three files a
+-- corpus fixture is made of.
+runReplay :: ReplayOpts -> IO ()
+runReplay ro = do
+  w <- readWav (roPath ro)
+  let fs = fromIntegral (wavRate w) :: Double
+      role = if roAnswer ro then H.Answer else H.Originate
+      cfg0 = defaultModemConfig fs role (roModes ro)
+      cfg = cfg0 { mcMaxEvm = roMaxEvm ro
+                 , mcMnp = fmap (\c -> (defaultMnpConfig 2400 (not (roAnswer ro))) { mnClass = c })
+                                (roMnp ro)
+                 , mcHandshake = (mcHandshake cfg0) { H.hcV8 = roV8 ro } }
+      trimmed = case roSeconds ro of
+        Nothing -> wavSamples w
+        Just s -> VS.take (round (s * fs)) (wavSamples w)
+      x = Ch.applyChannel fs (impairments (roImpair ro)) trimmed
+      rc = (defaultReplayConfig cfg)
+             { rcEvery = if roLine ro then Just 0.5 else Nothing }
+      r = replay rc x
+  forM_ (rrPhases r) $ \(t, ph) -> hPrintf stderr "  %6.2f  %s\n" t ph
+  forM_ (rrLine r) $ \(t, evm, sps) ->
+    hPrintf stderr "  %6.2f  evm %7.4f  sps %8.5f\n" t evm sps
+  forM_ (rrEvents r) $ \(t, e) -> hPrintf stderr "  %6.2f  %s\n" t (describeEvent e)
+  hPrintf stderr "%d bytes\n" (length (rrBytes r))
+  hSetBinaryMode stdout True
+  B.hPut stdout (B.pack (rrBytes r))
+  case roMint ro of
+    Nothing -> return ()
+    Just name -> mint ro r name (wavRate w) trimmed
+
+describeEvent :: ModemEvent -> String
+describeEvent e = case e of
+  EvConnected s l -> "CONNECT " ++ show s ++ " " ++ show (round (linkBitRate l) :: Int) ++ " bit/s"
+  EvDropped -> "NO CARRIER"
+  EvFailed why -> "failed: " ++ why
+  EvV8Menu _ -> "V.8 menu"
+  EvMnp m -> "MNP " ++ show m
+
+-- | The channel simulator, driven from repeated @--impair K=V@ options,
+-- so a fixture can be asked what it survives without leaving the file.
+impairments :: [String] -> Ch.Channel
+impairments = foldl one Ch.idealChannel
+  where
+    one ch kv = case break (== '=') kv of
+      (k, '=' : v) -> set ch k (read v :: Double)
+      _ -> ch
+    set ch k val = case k of
+      "snr"     -> ch { Ch.chSnrDb = Just val }
+      "freq"    -> ch { Ch.chFreqOffsetHz = val }
+      "rate"    -> ch { Ch.chRateOffset = val }
+      "dropout" -> ch { Ch.chDropout = Just (0.02, val) }
+      "echo"    -> ch { Ch.chEcho = Just (0.02, val) }
+      "clip"    -> ch { Ch.chClip = Just val }
+      "hum"     -> ch { Ch.chHum = Just (50, val) }
+      "jitter"  -> ch { Ch.chJitter = Ch.WalkJitter val (4 * val) }
+      "slips"   -> ch { Ch.chJitter = Ch.Slips 1.0 val }
+      "seed"    -> ch { Ch.chSeed = round val }
+      _         -> ch
+
+-- | Write the three files a corpus fixture is made of: the recording
+-- trimmed to what the test needs, this decode as the reference, and a
+-- spec saying how to replay it.  The spec's @expect:@ line is left for a
+-- human, because what the far end really sent is not something a decode
+-- can assert about itself.
+mint :: ReplayOpts -> ReplayResult -> String -> Int -> Signal -> IO ()
+mint ro r name rate trimmed = do
+  createDirectoryIfMissing True dir
+  writeWav16Mono (dir </> name ++ ".wav") rate trimmed
+  B.writeFile (dir </> name ++ ".txt") (B.pack (rrBytes r))
+  writeFile (dir </> name ++ ".call") (unlines spec)
+  hPutStrLn stderr ("minted " ++ dir </> name ++ ".{wav,txt,call} -- now write its expect: line by hand")
+  where
+    dir = roDir ro
+    spec =
+      [ "# " ++ takeFileName (roPath ro)
+      , "role:      " ++ (if roAnswer ro then "answer" else "originate")
+      , "modes:     " ++ intercalate "," (map modeName (roModes ro))
+      , "v8:        " ++ (if roV8 ro then "yes" else "no")
+      ] ++
+      [ "mnp:       " ++ show c | Just c <- [roMnp ro] ] ++
+      [ "seconds:   " ++ show s | Just s <- [roSeconds ro] ] ++
+      [ "connect:   " ++ conn
+      , "expect:    "
+      , "tolerance: 0"
+      ]
+    conn = case [ (s, l) | (_, EvConnected s l) <- rrEvents r ] of
+      ((s, l) : _) -> show s ++ " " ++ show (round (linkBitRate l) :: Int)
+      [] -> "none"
+
+modeName :: H.Standard -> String
+modeName s = case s of
+  H.Bell103 -> "bell103"; H.V21 -> "v21"; H.V23 -> "v23"; H.Bell212A -> "bell212a"
+  H.V22 -> "v22"; H.V22bis -> "v22bis"; H.V32 -> "v32"; H.V32bis -> "v32bis"

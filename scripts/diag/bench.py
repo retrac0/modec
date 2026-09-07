@@ -7,7 +7,7 @@ rather than against an ideal that never existed.
 """
 import difflib, os, subprocess, sys
 
-REPLAY = os.environ.get("REPLAY", "/tmp/replay")
+REPLAY = os.environ.get("REPLAY", "cabal run -v0 modec -- replay").split()
 
 CALLS = [
     ("Kludge BBS",     "kludge-bbs-v22",          "v22bis,v22"),
@@ -24,14 +24,14 @@ def newest(tag):
 
 def run(wav, modes, args):
     try:
-        p = subprocess.run([REPLAY, wav, modes] + args, capture_output=True, timeout=600)
+        p = subprocess.run(REPLAY + ["--mode", modes] + args + [wav], capture_output=True, timeout=600)
     except subprocess.TimeoutExpired:
         return b"", "timeout"
     err = p.stderr.decode(errors="replace")
     std = "-"
     for line in err.splitlines():
-        if line.startswith("CONNECT"):
-            std = line.split()[1]
+        if "CONNECT" in line:
+            std = line.split("CONNECT")[1].split()[0]
     return p.stdout, std
 
 def score(ref, got):
@@ -60,11 +60,11 @@ def main(sweep):
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "snr"
     if which == "snr":
-        sweep = [(["snr", str(d)], "%ddB" % d) for d in (30, 24, 20, 17, 14, 11)]
+        sweep = [(["--impair", "snr=%d" % d], "%ddB" % d) for d in (30, 24, 20, 17, 14, 11)]
     elif which == "freq":
-        sweep = [(["freq", str(h)], "%gHz" % h) for h in (1, 2, 4, 7, 10, 15)]
+        sweep = [(["--impair", "freq=%g" % h], "%gHz" % h) for h in (1, 2, 4, 7, 10, 15)]
     elif which == "rate":
-        sweep = [(["rate", str(r)], "%g%%" % (100 * r)) for r in (.0005, .001, .002, .005, .01, .02)]
+        sweep = [(["--impair", "rate=%g" % r], "%g%%" % (100 * r)) for r in (.0005, .001, .002, .005, .01, .02)]
     else:
-        sweep = [([which, v], v) for v in sys.argv[2:]]
+        sweep = [(["--impair", "%s=%s" % (which, v)], v) for v in sys.argv[2:]]
     main(sweep)

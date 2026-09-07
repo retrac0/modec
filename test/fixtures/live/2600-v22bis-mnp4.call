@@ -1,0 +1,15 @@
+# 2600.network with error correction: the same 2400 bit/s carrier, with
+# MNP class 4 negotiated on top of it about two seconds after CONNECT.
+# The banner arrives through the protocol rather than beside it, so this
+# is the one fixture where a framing or windowing fault shows up as
+# missing text rather than as a failed link.
+source:    recordings/20260906T181110-+15642442600.wav
+seconds:   24
+role:      originate
+modes:     v22bis,v22
+v8:        no
+mnp:       4
+connect:   V22bis 2400
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

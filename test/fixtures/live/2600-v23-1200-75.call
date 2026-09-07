@@ -1,0 +1,13 @@
+# 2600.network over V.23: 1200 bit/s down and 75 bit/s back, the
+# asymmetric viewdata split, negotiated through V.8.  The far end offers
+# it and modec takes it, which is worth pinning because V.23 is the one
+# duplex FSK mode where the two directions are not the same shape.
+source:    recordings/20260907T160922-+15642442600.wav
+seconds:   24
+role:      originate
+modes:     v23
+v8:        yes
+connect:   V23 75
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

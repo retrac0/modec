@@ -1,0 +1,17 @@
+# 2600.network, +1 564 244 2600, 6 Sep 2026.  A Patton 3120 access
+# server, and the best oracle on this trunk: it answers every call with
+# the same two lines, so what the far end sent is known rather than
+# guessed.  Six modulations have now connected to it, and each has a
+# fixture here; between them they say that the same known text comes
+# back however it is carried.
+#
+# This one is the plain V.22bis 2400 case, no V.8 in front of it.
+source:    recordings/20260906T180830-+15642442600.wav
+seconds:   20
+role:      originate
+modes:     v22bis,v22
+v8:        no
+connect:   V22bis 2400
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

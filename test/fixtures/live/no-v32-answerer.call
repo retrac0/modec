@@ -1,0 +1,16 @@
+# A V.32 call to a far end that has no V.32, diagnosed tone by tone in
+# docs/recordings/v32/README.md: answer tone, then V.22's unscrambled
+# binary 1, then V.21's mark, and nowhere any energy at 600 and 3000 Hz.
+#
+# The fixture is here to pin the failure.  A modem that reports CONNECT
+# on this recording is hallucinating a carrier, and one that hands bytes
+# to the DTE is handing over its own descrambler running on noise -- the
+# two false banners named in recordings/README.md were exactly that.
+# Nothing, from a call that offered everything, is the right answer.
+source:    docs/recordings/v32/live-bbs-heard.wav
+seconds:   22
+role:      originate
+modes:     v32,v22bis,v22,v21
+v8:        yes
+connect:   none
+tolerance: 0

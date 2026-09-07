@@ -6,8 +6,7 @@ reference for each call is what that recording decodes to untouched, so
 this measures the modem against its own best effort on that line rather
 than against an ideal that never existed.
 
-    cabal exec -- ghc -O1 -package modec -o /tmp/replay scripts/diag/replay.hs
-    REPLAY=/tmp/replay python3 scripts/diag/bench.py snr
+    REPLAY="cabal run -v0 modec -- replay" python3 scripts/diag/bench.py snr
 
 ## Replaying a recording
 
@@ -16,9 +15,17 @@ fails in a way that looks like success: the receiver acquires on ringback
 and the answer tone, locks to nothing, and returns a constant that the
 descrambler turns into a page of `U` or `w` characters. A live modem
 never does that -- the handshake starts the data receiver at the right
-instant, at the right rate, in the right channel. `scripts/diag/replay.hs`
+instant, at the right rate, in the right channel. `modec replay`
 therefore runs the whole modem over the recording, which reproduces the
 live decode exactly, banner for banner.
+
+    cabal run modec -- replay --mode v22bis,v22 recordings/CALL.wav
+
+The timeline goes to stderr and the bytes to stdout, so a replay reads
+like the call log it reproduces. `--impair snr=18` degrades the recording
+on the way in, which is what the sweep below drives, and `--mint` writes
+the recording out again as a test fixture: twelve of these calls are in
+`test/fixtures/live/` and run on every `cabal test`.
 
 The far end's audio is fixed, so our transmissions go nowhere. That is
 sound for these recordings because a live modec already drew out the

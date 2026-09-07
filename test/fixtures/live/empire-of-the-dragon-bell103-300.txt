@@ -1,0 +1,15 @@
+[0m[2J[sChecking for ANSI...[u
+[0m    [!
+Choose a display protocol (Most common is English/ANSI):
+
+   1. English/ANSI     The standard English language version
+   2. English/RIP      The English version of RIPscrip graphics
+
+Choose a number from 1 to 2:
+
+Choose a display protocol (Most common is English/ANSI):
+
+   1. English/ANSI     The standard English language version
+   2. English/RIP      The English version of RIPscrip graphics
+
+Choose a number from 1 to 2:

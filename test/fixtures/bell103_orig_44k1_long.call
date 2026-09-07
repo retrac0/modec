@@ -1,0 +1,7 @@
+# minimodem 0.24, Bell 103 originate channel at 44100 Hz: an awkward
+# rate and a long file, to say that the receiver is rate-independent
+# over more than a line of text.  Trimmed from fifty seconds to
+# seventeen -- the front end costs O(fs^2), so this one file was five
+# per cent of the whole suite -- and the reference is the first 509
+# bytes of what minimodem itself produced, unchanged.
+standard:  bell103-originate

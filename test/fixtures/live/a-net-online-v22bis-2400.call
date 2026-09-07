@@ -1,0 +1,18 @@
+# A-Net Online at 2400, and the call that produced --max-evm.  The banner
+# arrives whole and then the far end hangs up: the level falls to nothing
+# between 21 and 22 seconds and the receiver went on framing its own
+# decisions all the way down, which is where the second, corrupted copy
+# of the banner in the reference comes from.
+#
+# So this fixture pins two things at once -- that the banner decodes, and
+# that the junk behind it stays the length it is now.  See
+# docs/robustness.md; 140 bytes became 60 when the decision-error gate
+# went in, and it should not go back up.
+source:    recordings/20260906T004535-a-net-online-v22bis.wav
+seconds:   22
+role:      originate
+modes:     v22bis,v22
+v8:        no
+connect:   V22bis 2400
+expect:    Synchronet External POTS Support v1.32-Win32 Copyright 2020 Ro
+tolerance: 0

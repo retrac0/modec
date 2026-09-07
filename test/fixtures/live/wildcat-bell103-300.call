@@ -1,0 +1,13 @@
+# A WILDCAT! board on +1 341 221 4808 at 300 bit/s, Bell 103.  The
+# banner names the software and its registration number, and the
+# recording carries the escape sequences and the backspace runs intact,
+# which is more than a printable-character check would notice.
+source:    recordings/20260906T173401-+13412214808.wav
+seconds:   30
+role:      originate
+modes:     bell103
+v8:        no
+connect:   Bell103 300
+expect:    WILDCAT! Copyright (c) 87,96 Mustang Software, Inc.
+expect:    Connected at 300 bps. No ANSI detected.
+tolerance: 0

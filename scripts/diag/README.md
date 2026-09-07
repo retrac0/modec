@@ -1,7 +1,12 @@
 # Receiver diagnostics
 
-Standalone tools for taking a recording apart. Build any of them against
-the library:
+Reading a recording back through the whole modem is `modec replay`, a
+subcommand rather than a script:
+
+    cabal run modec -- replay --mode v22bis,v22 [--v8] [--seconds N] FILE.wav
+
+What follows are standalone tools for taking the signal apart below that
+level. Build any of them against the library:
 
     cabal exec -- ghc -O1 -package modec -o /tmp/bits scripts/diag/bits.hs
 

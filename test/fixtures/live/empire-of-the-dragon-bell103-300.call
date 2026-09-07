@@ -1,0 +1,13 @@
+# Empire of the Dragon, the one board in the September sweep that offered
+# a Bell 103 rung below its ITU ladder and then sent real text over it.
+# Its ANSI probe and menu come through with the escape sequences whole,
+# at thirty characters a second.
+source:    recordings/20260906T005154-empire-of-the-dragon-bell103.wav
+seconds:   32
+role:      originate
+modes:     bell103,v21
+v8:        no
+connect:   Bell103 300
+expect:    Checking for ANSI...
+expect:    Choose a display protocol (Most common is English/ANSI):
+tolerance: 0

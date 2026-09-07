@@ -1,0 +1,18 @@
+
+ __  __ ____   __   __ _____   ______ ______ 
+|  |/ /|    | |  | |  |     \ |   ___|   ___|  .-------.
+|     \|    |_|  |_|  |  |>  \|   |  |   ___|  |.-----.|
+|__|\__|______|_______|______/|______|______|  ||     ||
+ Telnet/Web: klud.ge  Modem: +1-312-500-2600   |`-----'|
+     Running on an 8 Mhz Macintosh Plus        | . --= |
+              fsxNet: 21:3/177                 `-------'
+
+Visitors may login as "guest"
+
+Username: /A(vi
+Password: ******
+Login incorrect
+Username: ;1
+Password: *************
+Login incorrect
+Username: x7sVL

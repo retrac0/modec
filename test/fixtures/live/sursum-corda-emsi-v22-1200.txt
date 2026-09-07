@@ -1,0 +1,13 @@
+**EMSI_REQA77E              **EMSI_REQA77E+ Address 1:396/45 using BT/2 2.60XE/Gamma-6(async) Watcom/i386  
+
+Sursum Corda! BBS-OS/2 Line 2-FidoNet=1:396/45.
+...
+....
+For telnet: Please set your client to send CR only w/o LF.
+NOTICE! Your IP address is being logged and tracked.
+Abuse WILL result in reports to your ISP and/or a block of your
+ISP's IP address block.
+.....
+......
+.......
+**EMSI_REQA77EIP address logged. Hit <ESC> to speed entry to the BBS!

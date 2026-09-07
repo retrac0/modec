@@ -1,0 +1,12 @@
+# 2600.network at 300 bit/s: the same banner through V.21's 980/1180 and
+# 1650/1850 Hz tone pairs, sixteen times slower than the V.32 call to the
+# same number and character for character identical.
+source:    recordings/20260906T175942-+15642442600.wav
+seconds:   22
+role:      originate
+modes:     v21
+v8:        no
+connect:   V21 300
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

@@ -1,0 +1,14 @@
+# Sursum Corda answers as a FidoNet mailer rather than as a BBS: EMSI_REQ
+# with its own checksum, then a plain-text greeting.  Worth keeping
+# because it is the one far end in the corpus whose first bytes are a
+# machine protocol, and because those bytes are checksummed at the other
+# end -- if they decode, they decoded exactly.
+source:    recordings/20260906T010453-sursum-corda-v22bis.wav
+seconds:   38
+role:      originate
+modes:     v22bis,v22
+v8:        no
+connect:   V22 1200
+expect:    **EMSI_REQA77E
+expect:    Sursum Corda! BBS-OS/2 Line 2-FidoNet=1:396/45.
+tolerance: 0

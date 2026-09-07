@@ -1,0 +1,13 @@
+# Basement BBS: 2400 bit/s negotiated through V.8 rather than through the
+# classic tone ladder, so the ANSam answer tone and the CM/JM menus are
+# in the path.  A Synchronet banner five years older than A-Net's, and
+# the board's own greeting behind it.
+source:    recordings/20260906T004604-basement-bbs-v22bis-v8.wav
+seconds:   30
+role:      originate
+modes:     v22bis,v22
+v8:        yes
+connect:   V22bis 2400
+expect:    Synchronet External POTS Support v1.30-Win32 Copyright 2015 Rob Swindell
+expect:    Basement BBS
+tolerance: 0

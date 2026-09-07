@@ -20,6 +20,7 @@ import Suite.V32
 main :: IO ()
 main = do
   fx <- fixtureTests
+  live <- liveTests
   defaultMain $ testGroup "modec"
     [ testGroup "primitives"
         [wavTests, dspTests, scramblerTests, stageTests, toneFrameTests]
@@ -27,8 +28,11 @@ main = do
         [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests]
     , testGroup "bringing a call up"
         [handshakeTests, modemTests, v8Tests, telnetTests]
+    -- Recorded calls, replayed through the whole modem: the only tests
+    -- here whose far end was a real modem on a real line.
+    , live
     , testGroup "phase and quadrature"
-        [v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, echoTests]
+        [v22Tests, v32Tests, v32PumpTests, v32FloorTests, v32SignalTests, v32StartTests, echoTests]
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"
