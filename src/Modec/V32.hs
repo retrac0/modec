@@ -28,6 +28,9 @@ module Modec.V32
   ( -- * Rates
     V32Rate (..)
   , rateBitsPerSymbol
+  , rateTrellis
+  , rateUncoded
+  , allV32Rates
   , rateBitRate
     -- * Scrambler (§4)
   , Direction (..)
@@ -64,6 +67,9 @@ module Modec.V32
   , trnStates
   , RateSeq (..)
   , noRates
+  , allRates
+  , defaultRates
+  , rateSeqV32bis
   , rateSeqBits
   , eSeqBits
   , decodeRateSeq
@@ -73,7 +79,9 @@ module Modec.V32
   ) where
 
 import Data.Bits (testBit, (.&.), (.|.))
+import Control.Monad (replicateM)
 import Data.List (foldl')
+import qualified Data.Vector.Unboxed as VU
 
 import Modec.Scrambler (Lfsr, lfsr, scramble, descramble)
 import qualified Modec.Scrambler as Scr
@@ -82,17 +90,41 @@ import qualified Modec.Scrambler as Scr
 -- study" in §2.4.3 and does not exist in any real modem, so it is not
 -- here; the rate signal can still advertise it as unavailable.
 data V32Rate
-  = V32R4800    -- ^ 4800 bit\/s, four states, no trellis
-  | V32R9600    -- ^ 9600 bit\/s, 16-point non-redundant (§2.4.1.1)
-  | V32R9600T   -- ^ 9600 bit\/s, 32-point trellis coded (§2.4.1.2)
-  deriving (Eq, Show, Enum, Bounded)
+  = V32R4800    -- ^ 4800 bit\/s, four states, no trellis (V.32 §2.4.2)
+  | V32R7200    -- ^ 7200 bit\/s, 16-point trellis coded (V.32bis §2.3.4)
+  | V32R9600    -- ^ 9600 bit\/s, 16-point non-redundant (V.32 §2.4.1.1)
+  | V32R9600T   -- ^ 9600 bit\/s, 32-point trellis coded (V.32 §2.4.1.2)
+  | V32R12000   -- ^ 12000 bit\/s, 64-point trellis coded (V.32bis §2.3.2)
+  | V32R14400   -- ^ 14400 bit\/s, 128-point trellis coded (V.32bis §2.3.1)
+  deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | Data bits carried per symbol.  The trellis alternative carries the
--- same four; its fifth bit is redundant.
+-- | The V.32bis rates, best first.  4800 and 9600 are V.32's and are
+-- reached by a V.32bis modem talking to a V.32 one; Table 5\/V.32bis
+-- Note 1 says as much, by making the bits for those two rates
+-- permanently set.
+allV32Rates :: [V32Rate]
+allV32Rates = [V32R14400, V32R12000, V32R9600T, V32R9600, V32R7200, V32R4800]
+
+-- | Data bits carried per symbol.  A trellis rate's redundant bit is not
+-- among them: it is the constellation that grows, not the payload.
 rateBitsPerSymbol :: V32Rate -> Int
 rateBitsPerSymbol V32R4800 = 2
+rateBitsPerSymbol V32R7200 = 3
 rateBitsPerSymbol V32R9600 = 4
 rateBitsPerSymbol V32R9600T = 4
+rateBitsPerSymbol V32R12000 = 5
+rateBitsPerSymbol V32R14400 = 6
+
+-- | Whether this rate runs through the convolutional encoder.
+rateTrellis :: V32Rate -> Bool
+rateTrellis r = r `elem` [V32R7200, V32R9600T, V32R12000, V32R14400]
+
+-- | Bits that bypass the coding entirely (Q3 onwards), choosing between
+-- the points of one trellis subset.
+rateUncoded :: V32Rate -> Int
+rateUncoded r
+  | rateTrellis r = rateBitsPerSymbol r - 2
+  | otherwise = 0
 
 rateBitRate :: V32Rate -> Int
 rateBitRate r = 2400 * rateBitsPerSymbol r
@@ -215,35 +247,140 @@ points32 =
 -- | The transmitted point for a coded symbol index: 2 bits at 4800
 -- (a state), 4 bits at 9600 non-redundant (Y1 Y2 Q3 Q4), 5 bits at 9600
 -- trellis (Y0 Y1 Y2 Q3 Q4).
+-- | Figure 2-4\/V.32bis, 7200 bit\/s, indexed by Y0 Y1 Y2 Q3.  A square
+-- of 16 points at odd coordinates -- not the checkerboard the 9600 and
+-- 14400 sets use, and worth noticing: the lattice is a property of the
+-- rate, not of V.32.
+points16at7200 :: [(Double, Double)]
+points16at7200 =
+  [ ( 3, -3), (-1,  1), (-3,  3), ( 1, -1)
+  , ( 3,  1), (-1, -3), (-3, -1), ( 1,  3)
+  , (-1,  3), ( 3, -1), ( 1, -3), (-3,  1)
+  , (-3, -3), ( 1,  1), ( 3,  3), (-1, -1)
+  ]
+-- | Figure 2-2\/V.32bis, 12000 bit\/s, indexed by Y0 Y1 Y2 Q3 Q4 Q5.
+-- An 8 by 8 square at odd coordinates.
+points64 :: [(Double, Double)]
+points64 =
+  [ ( 7,  1), ( 3,  5), ( 7, -7), (-5,  5)
+  , ( 3, -3), (-1,  1), (-1, -7), (-5, -3)
+  , (-7, -1), (-3, -5), (-7,  7), ( 5, -5)
+  , (-3,  3), ( 1, -1), ( 1,  7), ( 5,  3)
+  , (-1,  5), (-5,  1), ( 7,  5), (-5, -7)
+  , ( 3,  1), (-1, -3), ( 7, -3), ( 3, -7)
+  , ( 1, -5), ( 5, -1), (-7, -5), ( 5,  7)
+  , (-3, -1), ( 1,  3), (-7,  3), (-3,  7)
+  , (-5, -1), (-1, -5), (-5,  7), ( 7, -5)
+  , (-1,  3), ( 3, -1), ( 3,  7), ( 7,  3)
+  , ( 5,  1), ( 1,  5), ( 5, -7), (-7,  5)
+  , ( 1, -3), (-3,  1), (-3, -7), (-7, -3)
+  , ( 1, -7), ( 5, -3), (-7, -7), ( 5,  5)
+  , (-3, -3), ( 1,  1), (-7,  1), (-3,  5)
+  , (-1,  7), (-5,  3), ( 7,  7), (-5, -5)
+  , ( 3,  3), (-1, -1), ( 7, -1), ( 3, -5)
+  ]
+-- | Figure 2-1\/V.32bis, 14400 bit\/s, indexed by Y0 Y1 Y2 Q3 Q4 Q5 Q6.
+-- A 128-point cross on the same checkerboard as the 32-point set: even
+-- real part with odd imaginary, or the other way about.  The top and
+-- bottom rows hold two points rather than three, at plus and minus two
+-- -- the notch is in the Recommendation's figure, and the lattice
+-- requires it, since at an odd imaginary part the real part must be even.
+points128 :: [(Double, Double)]
+points128 =
+  [ (-8, -3), ( 8, -3), ( 4, -3), ( 4, -7)
+  , (-4, -3), (-4, -7), ( 0, -3), ( 0, -7)
+  , (-8,  1), ( 8,  1), ( 4,  1), ( 4,  5)
+  , (-4,  1), (-4,  5), ( 0,  1), ( 0,  5)
+  , ( 8,  3), (-8,  3), (-4,  3), (-4,  7)
+  , ( 4,  3), ( 4,  7), ( 0,  3), ( 0,  7)
+  , ( 8, -1), (-8, -1), (-4, -1), (-4, -5)
+  , ( 4, -1), ( 4, -5), ( 0, -1), ( 0, -5)
+  , ( 2, -9), ( 2,  7), ( 2,  3), ( 6,  3)
+  , ( 2, -5), ( 6, -5), ( 2, -1), ( 6, -1)
+  , (-2, -9), (-2,  7), (-2,  3), (-6,  3)
+  , (-2, -5), (-6, -5), (-2, -1), (-6, -1)
+  , (-2,  9), (-2, -7), (-2, -3), (-6, -3)
+  , (-2,  5), (-6,  5), (-2,  1), (-6,  1)
+  , ( 2,  9), ( 2, -7), ( 2, -3), ( 6, -3)
+  , ( 2,  5), ( 6,  5), ( 2,  1), ( 6,  1)
+  , ( 9,  2), (-7,  2), (-3,  2), (-3,  6)
+  , ( 5,  2), ( 5,  6), ( 1,  2), ( 1,  6)
+  , ( 9, -2), (-7, -2), (-3, -2), (-3, -6)
+  , ( 5, -2), ( 5, -6), ( 1, -2), ( 1, -6)
+  , (-9, -2), ( 7, -2), ( 3, -2), ( 3, -6)
+  , (-5, -2), (-5, -6), (-1, -2), (-1, -6)
+  , (-9,  2), ( 7,  2), ( 3,  2), ( 3,  6)
+  , (-5,  2), (-5,  6), (-1,  2), (-1,  6)
+  , (-3,  8), (-3, -8), (-3, -4), (-7, -4)
+  , (-3,  4), (-7,  4), (-3,  0), (-7,  0)
+  , ( 1,  8), ( 1, -8), ( 1, -4), ( 5, -4)
+  , ( 1,  4), ( 5,  4), ( 1,  0), ( 5,  0)
+  , ( 3, -8), ( 3,  8), ( 3,  4), ( 7,  4)
+  , ( 3, -4), ( 7, -4), ( 3,  0), ( 7,  0)
+  , (-1, -8), (-1,  8), (-1,  4), (-5,  4)
+  , (-1, -4), (-5, -4), (-1,  0), (-5,  0)
+  ]
+-- | Each rate's points, scaled so the set has unit mean power.
+--
+-- The scaling is per rate because the Recommendations draw each
+-- constellation on whatever integer grid suits it -- mean square 10 for
+-- the V.32 sets and the 7200 one, 42 for 12000, 41 for 14400 -- while a
+-- modem transmits at one level whatever rate it is running.  Normalising
+-- each set to unit mean power is what makes that true, and it leaves the
+-- four training states at unit power too, which they must be: they go on
+-- the line before either end knows what the rate will be.
+pointsFor :: V32Rate -> VU.Vector (Double, Double)
+pointsFor r = case r of
+  V32R4800 -> pts4800
+  V32R7200 -> pts7200
+  V32R9600 -> pts9600
+  V32R9600T -> pts9600T
+  V32R12000 -> pts12000
+  V32R14400 -> pts14400
+
+pts4800, pts7200, pts9600, pts9600T, pts12000, pts14400 :: VU.Vector (Double, Double)
+-- indexed by the differentially encoded dibit Y1 Y2, which is not the
+-- order the states are declared in: Table 1's signal-state column has
+-- 10 as D and 11 as C
+pts4800 = VU.fromList (map (statePoint . stateOfDibit)
+            [ (False, False), (False, True), (True, False), (True, True) ])
+pts7200 = normalisePoints points16at7200
+pts9600 = normalisePoints points16
+pts9600T = normalisePoints points32
+pts12000 = normalisePoints points64
+pts14400 = normalisePoints points128
+
+normalisePoints :: [(Double, Double)] -> VU.Vector (Double, Double)
+normalisePoints ps = VU.fromList [ (x * k, y * k) | (x, y) <- ps ]
+  where
+    mean = sum [ x * x + y * y | (x, y) <- ps ] / fromIntegral (length ps)
+    k = 1 / sqrt mean
+
+-- | The transmitted point for a coded symbol index: the coded bits most
+-- significant, so Y0 (where there is one) then Y1 Y2 then Q3 onwards.
 constellation :: V32Rate -> Int -> Point
-constellation V32R4800 i = statePoint (toEnum (i .&. 3))
-constellation V32R9600 i = scalePoint (points16 !! (i .&. 15))
-constellation V32R9600T i = scalePoint (points32 !! (i .&. 31))
+constellation r i = pointsFor r VU.! (i `mod` VU.length (pointsFor r))
 
 -- | Nearest constellation point, as its index.  This is an immediate
 -- decision with no memory: at 4800 and 9600 non-redundant it is the
--- decision, and on the trellis alternative it is what the carrier and
--- timing loops use, because they cannot wait for the Viterbi decoder's
--- traceback without going unstable.
+-- decision, and on a trellis alternative it is what the carrier and
+-- timing loops use, because they cannot wait for a traceback without
+-- going unstable.
 slicePoint :: V32Rate -> Point -> Int
-slicePoint r p = snd (minimum [ (dist2 p (constellation r i), i) | i <- [0 .. n - 1] ])
-  where
-    n = case r of
-      V32R4800 -> 4
-      V32R9600 -> 16
-      V32R9600T -> 32
+slicePoint r p = snd (minimum [ (dist2 p (ps VU.! i), i) | i <- [0 .. VU.length ps - 1] ])
+  where ps = pointsFor r
 
 dist2 :: Point -> Point -> Double
 dist2 (a, b) (c, d) = (a - c) * (a - c) + (b - d) * (b - d)
 
 -- | The nearest point of the trellis subset named by Y0 Y1 Y2, with its
--- squared distance and the uncoded bits that chose it.  The Viterbi
--- decoder's branch metric.
-subsetPoint :: Point -> (Bool, Bool, Bool) -> (Double, (Bool, Bool))
-subsetPoint p (y0, y1, y2) = minimum
-  [ (dist2 p (constellation V32R9600T i), (q3, q4))
-  | q3 <- [False, True], q4 <- [False, True]
-  , let i = bitsToInt [y0, y1, y2, q3, q4] ]
+-- squared distance and the uncoded bits that chose it: the Viterbi
+-- decoder's branch metric.  How many uncoded bits there are is the only
+-- thing that changes between 7200 and 14400.
+subsetPoint :: V32Rate -> Point -> (Bool, Bool, Bool) -> (Double, [Bool])
+subsetPoint r p (y0, y1, y2) = minimum
+  [ (dist2 p (constellation r (bitsToInt ([y0, y1, y2] ++ q))), q)
+  | q <- replicateM (rateUncoded r) [False, True] ]
 
 bitsToInt :: [Bool] -> Int
 bitsToInt = foldl' (\acc b -> acc * 2 + (if b then 1 else 0)) 0
@@ -344,13 +481,14 @@ convStep (ConvState st) (y1, y2) = (ConvState st', y0)
     st' = (if a' then 4 else 0) .|. (if b' then 2 else 0) .|. (if c' then 1 else 0)
 
 -- | Viterbi decoder over the 8-state trellis, with @depth@ symbols of
--- traceback.  Returns (Y1, Y2, Q3, Q4) per symbol -- still differentially
--- encoded, so Table 2 undoes the rotation afterwards.
+-- traceback.  Returns, per symbol, the differentially encoded Y1 and Y2
+-- and whatever uncoded bits the rate carries above them -- so Table 2
+-- still has to undo the rotation afterwards.
 --
 -- Emission is delayed by @depth@ symbols; the tail is flushed from the
 -- best surviving path at the end.
-viterbiDecode :: Int -> [Point] -> [(Bool, Bool, Bool, Bool)]
-viterbiDecode depth = go start (0 :: Int)
+viterbiDecode :: V32Rate -> Int -> [Point] -> [(Bool, Bool, [Bool])]
+viterbiDecode rate depth = go start (0 :: Int)
   where
     -- §5.4: the encoder's delay elements start at zero, so the decoder
     -- knows the initial state and need not consider the other seven.
@@ -375,11 +513,11 @@ viterbiDecode depth = go start (0 :: Int)
       [ pick s' | s' <- [0 .. 7] ]
       where
         cands =
-          [ (s', (m + bm, take (depth + 1) ((y1, y2, q3, q4) : hist)))
+          [ (s', (m + bm, take (depth + 1) ((y1, y2, q) : hist)))
           | (s, (m, hist)) <- zip [0 ..] sts
           , (y1, y2) <- [(False, False), (False, True), (True, False), (True, True)]
           , let (ConvState s', y0) = convStep (ConvState s) (y1, y2)
-          , let (bm, (q3, q4)) = subsetPoint p (y0, y1, y2) ]
+          , let (bm, q) = subsetPoint rate p (y0, y1, y2) ]
         pick s' = minimum [ c | (t, c) <- cands, t == s' ]
 
 -- | Segment 3 of the receiver conditioning signal (§5.2.3): binary ones
@@ -413,41 +551,85 @@ table5 (False, True) = StB
 table5 (True, True) = StC
 table5 (True, False) = StD
 
--- | The capabilities a rate signal carries (Table 6\/V.32).
+-- | The capabilities a rate signal carries.
+--
+-- One 16-bit sequence serves both Recommendations, which is the whole
+-- trick of V.32bis interworking: Table 6/V.32 defines B4, B5, B6 and B8,
+-- and Table 5/V.32 bis keeps all four and adds B9, B10 and B12 out of
+-- bits V.32 had reserved.  A V.32 modem reading a V.32bis signal sees
+-- the rates it knows and bits it was told to ignore.
 data RateSeq = RateSeq
-  { rsCan2400 :: !Bool
-  , rsCan4800 :: !Bool
-  , rsCan9600 :: !Bool
-  , rsTrellis :: !Bool   -- ^ trellis coding available at the highest rate indicated
+  { rsCan2400  :: !Bool   -- ^ B4; V.32bis fixes this at 1 (Table 5, Note 1)
+  , rsCan4800  :: !Bool   -- ^ B5
+  , rsCan9600  :: !Bool   -- ^ B6
+  , rsTrellis  :: !Bool   -- ^ B8; V.32bis fixes this at 1 as well
+  , rsCan7200  :: !Bool   -- ^ B9, V.32bis only
+  , rsCan12000 :: !Bool   -- ^ B10, V.32bis only
+  , rsCan14400 :: !Bool   -- ^ B12, V.32bis only
   } deriving (Eq, Show)
 
 -- | All rates refused: Table 6's call for a GSTN cleardown.
 noRates :: RateSeq
-noRates = RateSeq False False False False
+noRates = RateSeq False False False False False False False
+
+-- | Every rate the two Recommendations define.
+allRates :: RateSeq
+allRates = RateSeq True True True True True True True
+
+-- | What this modem offers by default: V.32's 4800 and both 9600s.
+--
+-- All three V.32bis rates are implemented and negotiate correctly, and
+-- the data pump carries every one of them through a telephone channel
+-- once it has the training the start-up provides -- that is what the
+-- impairment tests measure, down to 25 dB at 12000 and 14400.  What none
+-- of them yet survives is a whole call: 7200 delivers the text with a
+-- dozen bytes of rubbish in front of it, 12000 manages one direction of
+-- two, and 14400 neither.  Offering a rate that then damages the session
+-- is worse than not offering it, so they are opt-in through
+-- 'Modec.Modem.mcV32Rates' until that is fixed.
+--
+-- For 14400 at least the ceiling is the receiver's own noise floor
+-- rather than the line's: cubic interpolation at 3.3 samples per symbol
+-- and a root raised cosine cut at 12 symbols leave about 25 dB of
+-- implementation signal to noise, which is enough for 32 points and not
+-- for 128.  Raising it means a better interpolator, not a better
+-- channel.  'allRates' offers the lot, for measuring exactly that.
+defaultRates :: RateSeq
+defaultRates = noRates
+  { rsCan2400 = True, rsTrellis = True
+  , rsCan4800 = True, rsCan9600 = True }
 
 rateSeqCleardown :: RateSeq -> Bool
-rateSeqCleardown r = not (rsCan2400 r || rsCan4800 r || rsCan9600 r)
+rateSeqCleardown r = not (or [ rsCan2400 r, rsCan4800 r, rsCan9600 r
+                             , rsCan7200 r, rsCan12000 r, rsCan14400 r ])
 
--- | Table 6\/V.32: the 16 bits of a rate sequence, B0 first.  B0-B3, B7,
--- B11 and B15 are there to synchronise on, B4-B6 are the rates we can
--- receive, B8 offers trellis coding and B9-B14 = 001000 says there are
--- no special operational modes.
+-- | Whether the far end is speaking V.32bis at all.  Table 5/V.32 bis
+-- Note 1: with B4 or B8 clear in a signal sent or received, interworking
+-- proceeds only under V.32.  Those two bits are therefore how a V.32bis
+-- modem announces itself, and a plain V.32 modem cannot say it by
+-- accident -- B4 means "can receive 2400 bit/s" to V.32, a rate 2.4.3
+-- leaves for further study and no modem implements.
+rateSeqV32bis :: RateSeq -> Bool
+rateSeqV32bis r = rsCan2400 r && rsTrellis r
+
+-- | Table 6/V.32 and Table 5/V.32 bis: the 16 bits of a rate sequence,
+-- B0 first.  B0-B3, B7, B11 and B15 are there to synchronise on.
 rateSeqBits :: RateSeq -> [Bool]
 rateSeqBits r =
   [ False, False, False, False
   , rsCan2400 r, rsCan4800 r, rsCan9600 r, True
-  , rsTrellis r, False, False, True
-  , False, False, False, True ]
+  , rsTrellis r, rsCan7200 r, rsCan12000 r, True
+  , rsCan14400 r, False, False, True ]
 
--- | Table 7\/V.32: signal E, which ends a rate signal and names the rate
+-- | Table 7/V.32: signal E, which ends a rate signal and names the rate
 -- and coding of the scrambled ones that follow it.  B0-B3 are ones
 -- rather than zeros, which is what tells it from a rate sequence.
 eSeqBits :: RateSeq -> [Bool]
 eSeqBits r =
   [ True, True, True, True
   , rsCan2400 r, rsCan4800 r, rsCan9600 r, True
-  , rsTrellis r, False, False, True
-  , False, False, False, True ]
+  , rsTrellis r, rsCan7200 r, rsCan12000 r, True
+  , rsCan14400 r, False, False, True ]
 
 decodeRateSeq :: [Bool] -> Maybe RateSeq
 decodeRateSeq = decodeSeq False
@@ -456,22 +638,37 @@ decodeESeq :: [Bool] -> Maybe RateSeq
 decodeESeq = decodeSeq True
 
 -- | §5.3.1: a sequence is only a rate signal if the synchronising bits
--- are right, which is the whole of the protection it has.
+-- are right, which is the whole of the protection it has.  B13 and B14
+-- are read but not checked: Table 5 Note 2 reserves them and says to
+-- ignore them on reception, so a modem that insisted on their value
+-- would refuse a conformant signal from a later modem.
 decodeSeq :: Bool -> [Bool] -> Maybe RateSeq
 decodeSeq lead bs = case bs of
-  [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15]
+  [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, _, _, b15]
     | [b0, b1, b2, b3] == replicate 4 lead
-    , b7, b11, b15
-    , not b9, not b10, not b12, not b13, not b14 ->
-        Just (RateSeq b4 b5 b6 b8)
+    , b7, b11, b15 ->
+        Just (RateSeq b4 b5 b6 b8 b9 b10 b12)
   _ -> Nothing
 
 -- | The best rate both ends can run, given what the far end offered and
 -- what we can do.  §5.4.1: a reply must exclude anything absent from the
 -- signal it answers.
+--
+-- The V.32bis rates are only on the table if both signals claim V.32bis;
+-- otherwise this is a V.32 call and 9600 is the ceiling, which is Note 1
+-- of Table 5 doing its work.
 bestCommonRate :: RateSeq -> RateSeq -> Maybe V32Rate
-bestCommonRate ours theirs
-  | rsCan9600 ours && rsCan9600 theirs =
-      Just (if rsTrellis ours && rsTrellis theirs then V32R9600T else V32R9600)
-  | rsCan4800 ours && rsCan4800 theirs = Just V32R4800
-  | otherwise = Nothing
+bestCommonRate ours theirs = case filter usable allV32Rates of
+  (r : _) -> Just r
+  [] -> Nothing
+  where
+    bis = rateSeqV32bis ours && rateSeqV32bis theirs
+    usable r = has ours r && has theirs r
+               && (bis || r `elem` [V32R9600T, V32R9600, V32R4800])
+    has c r = case r of
+      V32R14400 -> rsCan14400 c
+      V32R12000 -> rsCan12000 c
+      V32R9600T -> rsCan9600 c && rsTrellis c
+      V32R9600 -> rsCan9600 c
+      V32R7200 -> rsCan7200 c
+      V32R4800 -> rsCan4800 c

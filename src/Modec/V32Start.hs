@@ -42,6 +42,7 @@ module Modec.V32Start
   , v32StartRx
   , v32StartTx
   , v32StartCoder
+  , chosen
   , v32Bits
   ) where
 
@@ -279,7 +280,27 @@ observe st rx = st
     (r6, e6) = revBlock rx (vsRev600 st)
     (r30, e30) = revBlock rx (vsRev3000 st)
     p = v32Params (vsFs st)
-    (rxSt, syms) = qamRxBlock p (v32RxCfg V32R4800) rx (vsRx st)
+    -- Once the rate is settled the far end stops sending anything this
+    -- four-point receiver can read -- §5.4.1 has it move to the agreed
+    -- coding straight after E -- so the equaliser must stop adapting to
+    -- it.  Left running it would train itself on a signal it is not
+    -- looking at, hit the watchdog, and start over: the data pump would
+    -- then inherit an untrained receiver at exactly the moment the whole
+    -- of TRN was meant to have prepared one.  At 4800 and 9600 it could
+    -- re-acquire and the loss was invisible; at 12000 and 14400 it
+    -- cannot, and that is the whole difference.
+    -- Freeze only once the far end has stopped sending anything this
+    -- four-point receiver can read, which is the moment its signal E has
+    -- been seen -- not the moment the rate is settled.  The two are
+    -- several phases apart, and not the same distance apart at the two
+    -- ends: an answering modem knows the rate as soon as it reads R2 and
+    -- then has a whole second conditioning signal still to send and a
+    -- signal E still to wait for.  Freezing there leaves it holding an
+    -- equaliser trained on the first conditioning signal only, and the
+    -- link works in one direction and not the other.
+    cfgNow = (v32RxCfg V32R4800) { qrAdapt = not (afterFarE (vsPhase st)) }
+    afterFarE ph = case ph of { AE -> True; V32Up _ -> True; _ -> False }
+    (rxSt, syms) = qamRxBlock p cfgNow rx (vsRx st)
     -- Everything the start-up has to recognise is a quadrant change:
     -- the conditioning signal is a quarter turn every symbol, the
     -- alternating AC of the earlier phases a half turn, and the rate
@@ -576,8 +597,16 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         Nothing | tooLong 30000 s -> enter (V32Fail "no reversal in AA") s
                 | otherwise -> s
       AAC2
-        -- the caller goes off the line once it has timed the round trip
-        | vsQuiet s > sym 8 -> enter AGap (restart s) { vsSrc = TxNothing, vsSwitch = Nothing }
+        -- §5.4.2 waits for "an amplitude drop in the incoming tone", and
+        -- means the tone rather than the line.  Waiting for the line to
+        -- go quiet instead works right up until there is an echo on it:
+        -- our own alternating AC comes back at us, the line is never
+        -- quiet, and the answering modem waits for a silence that cannot
+        -- happen while it is the one making the noise.  The caller's tone
+        -- is at 1800 Hz and ours is at 600 and 3000, so measuring the
+        -- right thing is also the thing that is immune to our own echo.
+        | vsSince s > sym 32 && heard 1800 < 0.2 ->
+            enter AGap (restart s) { vsSrc = TxNothing, vsSwitch = Nothing }
         | tooLong 60000 s -> enter (V32Fail "the calling modem did not stop") s
         | otherwise -> s
       AGap
@@ -626,9 +655,17 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       V32Fail _ -> s
 
 -- | The rate signal that names one rate and nothing else, which is what
--- E and R3 carry (Table 7, and §5.4.2 for R3).
+-- E and R3 carry (Table 7, and §5.4.2 for R3).  B4 and B8 stay set on
+-- the V.32bis rates so the far end can still tell which Recommendation
+-- it is talking to.
 chosen :: V32Rate -> RateSeq
 chosen r = case r of
-  V32R4800 -> RateSeq False True False False
-  V32R9600 -> RateSeq False True True False
-  V32R9600T -> RateSeq False True True True
+  V32R4800 -> base { rsCan4800 = True }
+  V32R7200 -> bis { rsCan7200 = True }
+  V32R9600 -> base { rsCan9600 = True }
+  V32R9600T -> base { rsCan9600 = True, rsTrellis = True }
+  V32R12000 -> bis { rsCan12000 = True }
+  V32R14400 -> bis { rsCan14400 = True }
+  where
+    base = noRates
+    bis = noRates { rsCan2400 = True, rsTrellis = True }

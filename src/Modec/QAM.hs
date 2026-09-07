@@ -75,6 +75,7 @@ data QamRxCfg = QamRxCfg
   , qrEqTaps    :: !Int     -- ^ equaliser taps, T/2 spaced
   , qrEvmFreeze :: !Double  -- ^ stop adapting above this decision error power
   , qrEvmGiveUp :: !Int     -- ^ symbols of bad decisions before starting over
+  , qrAdapt     :: !Bool    -- ^ let the equaliser and the watchdog move at all
   , qrPower     :: !Double  -- ^ mean square of the constellation (the AGC target)
   , qrSlice     :: (Double, Double) -> Int          -- ^ nearest point, as an index
   , qrPoint     :: Int -> (Double, Double)          -- ^ that index back to a point
@@ -96,7 +97,7 @@ defaultRxCfg slice point = QamRxCfg
   { qrKp = 0.12, qrKi = 0.0015, qrClamp = 2
   , qrThKp = 0.03, qrThKi = 0.0015
   , qrEqMu = 0.002, qrEqTaps = 31
-  , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrPower = 1
+  , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrPower = 1
   , qrSlice = slice, qrPoint = point }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
@@ -338,7 +339,8 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               recent = take 8 (idx : rxRecent st)
               varied = length (distinct recent) > 2
               lineP = max 1e-6 (VS.sum (VS.zipWith (\a b -> a * a + b * b) lineRe lineIm) / fromIntegral taps)
-              mu = if locked && evm < qrEvmFreeze cfg && varied then qrEqMu cfg / lineP else 0
+              mu = if qrAdapt cfg && locked && evm < qrEvmFreeze cfg && varied
+                     then qrEqMu cfg / lineP else 0
               eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
               eqIm' = VS.zipWith3 (\w lr li -> w + mu * (errI * lr - errR * li)) (rxEqIm st) lineRe lineIm
 
@@ -351,7 +353,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- this a receiver handed a signal it cannot read -- the far
               -- end still finishing its start-up, say -- is ruined by it
               -- permanently rather than for as long as it lasts.
-              bad = if locked && evm > qrEvmFreeze cfg then rxBad st + 1 else 0
+              bad = if qrAdapt cfg && locked && evm > qrEvmFreeze cfg then rxBad st + 1 else 0
               st1 = st { rxTau = tau'
                        , rxSps = max (0.9 * nominalSps) (min (1.1 * nominalSps) sps')
                        , rxPrevSym = (yr, yi), rxPower_ = pw

@@ -524,8 +524,11 @@ runModem o = do
       V32Link _ r -> show (rateBitRate r) ++ " bit/s"
     showV32Rate r = case r of
       V32R4800 -> "4800 bit/s"
+      V32R7200 -> "7200 bit/s, trellis coded"
       V32R9600 -> "9600 bit/s, 16 point"
       V32R9600T -> "9600 bit/s, trellis coded"
+      V32R12000 -> "12000 bit/s, trellis coded"
+      V32R14400 -> "14400 bit/s, trellis coded"
     -- which way round the link runs, in the terms the standard uses
     describeChannels link = case link of
       FskLink tx rx -> "sending " ++ fskName tx ++ ", hearing " ++ fskName rx

@@ -19,6 +19,7 @@ module Modec.V32Pump
   , RxCoder
   , rxCoderInit
   , decodeSymbols
+  , Coded
   , codedQuads
   , decodeQuads
     -- * Start-up signalling
@@ -109,21 +110,29 @@ encodeSymbols dir r newBits st0 = go st0 { tcBits = [] } (tcBits st0 ++ scramble
               (st', p) = codeSymbol r st grp
           in go st' rest (p : acc)
 
+-- | One symbol.  Every rate does the same three things in the same
+-- order -- differentially encode the first two bits, run them through
+-- the convolutional encoder if this rate is trellis coded, and map the
+-- result with whatever bits are left over -- so the only differences are
+-- which differential table (Table 1 without trellis coding, Table 2
+-- with) and how many bits ride above.
 codeSymbol :: V32Rate -> TxCoder -> [Bool] -> (TxCoder, Point)
-codeSymbol V32R4800 st [q1, q2] =
-  let y = diffEncode1 (q1, q2) (tcPrev st)
-  in (st { tcPrev = y }, statePoint (stateOfDibit y))
-codeSymbol V32R9600 st [q1, q2, q3, q4] =
-  let y@(y1, y2) = diffEncode1 (q1, q2) (tcPrev st)
-  in (st { tcPrev = y }, constellation V32R9600 (packBits [y1, y2, q3, q4]))
-codeSymbol V32R9600T st [q1, q2, q3, q4] =
-  let y@(y1, y2) = diffEncode2 (q1, q2) (tcPrev st)
-      (cv, y0) = convStep (tcConv st) y
-  in (st { tcPrev = y, tcConv = cv }, constellation V32R9600T (packBits [y0, y1, y2, q3, q4]))
-codeSymbol _ _ _ = error "Modec.V32Pump.codeSymbol: wrong group size"
+codeSymbol r st (q1 : q2 : rest)
+  | not (rateTrellis r) =
+      let y@(y1, y2) = diffEncode1 (q1, q2) (tcPrev st)
+      in (st { tcPrev = y }, constellation r (packBits ([y1, y2] ++ rest)))
+  | otherwise =
+      let y@(y1, y2) = diffEncode2 (q1, q2) (tcPrev st)
+          (cv, y0) = convStep (tcConv st) y
+      in (st { tcPrev = y, tcConv = cv }, constellation r (packBits ([y0, y1, y2] ++ rest)))
+codeSymbol _ _ _ = error "Modec.V32Pump.codeSymbol: short group"
 
 packBits :: [Bool] -> Int
 packBits = foldl (\acc b -> acc * 2 + (if b then 1 else 0)) 0
+
+-- | One symbol's coded content: the differentially encoded pair, then
+-- whatever uncoded bits the rate carries above it.
+type Coded = (Bool, Bool, [Bool])
 
 data RxCoder = RxCoder
   { rcDescr :: !Scrambler
@@ -153,34 +162,31 @@ decodeSymbols dir r syms st = decodeQuads dir r (codedQuads r syms) st
 -- descrambler must see every line bit exactly once, and showing it the
 -- overlap a second time puts it out of step with the far end -- which
 -- looks like a receiver that locks perfectly and then decodes noise.
-codedQuads :: V32Rate -> [QamSym] -> [(Bool, Bool, Bool, Bool)]
-codedQuads V32R9600T syms = viterbiDecode 16 (map qsPoint syms)
-codedQuads V32R9600 syms =
-  [ let i = qsIndex sym
-        (y1, y2) = unpair (i `div` 4)
-        (q3, q4) = unpair (i `mod` 4)
-    in (y1, y2, q3, q4)
-  | sym <- syms ]
-codedQuads V32R4800 syms =
-  [ let (y1, y2) = dibitOfState (toEnum (qsIndex sym)) in (y1, y2, False, False)
-  | sym <- syms ]
+codedQuads :: V32Rate -> [QamSym] -> [Coded]
+codedQuads r syms
+  | rateTrellis r = viterbiDecode r viterbiDepth (map qsPoint syms)
+  | otherwise =
+      [ let i = qsIndex sym
+            k = rateBitsPerSymbol r
+            bits = [ odd (i `div` (2 ^ b)) | b <- reverse [0 .. k - 1] ]
+        in case bits of
+             (y1 : y2 : rest) -> (y1, y2, rest)
+             _ -> (False, False, [])
+      | sym <- syms ]
 
 -- | Coded bits to data bits: undo the differential encoding, then the
 -- scrambler.  Stateful, and advanced exactly once per symbol.
 --
 -- The far end scrambles with the polynomial of /its/ direction, so the
 -- descrambler here is given the other one.
-decodeQuads :: Direction -> V32Rate -> [(Bool, Bool, Bool, Bool)] -> RxCoder -> (RxCoder, [Bool])
+decodeQuads :: Direction -> V32Rate -> [Coded] -> RxCoder -> (RxCoder, [Bool])
 decodeQuads dir r quads st0 = (st1 { rcDescr = descr' }, dataBits)
   where
     far = case dir of { Calling -> Answering; Answering -> Calling }
-    diff = case r of { V32R9600T -> diffDecode2; _ -> diffDecode1 }
-    (st1, coded) = foldlAcc (\st (y1, y2, q3, q4) ->
+    diff = if rateTrellis r then diffDecode2 else diffDecode1
+    (st1, coded) = foldlAcc (\st (y1, y2, rest) ->
       let (q1, q2) = diff (y1, y2) (rcPrev st)
-          out = case r of
-            V32R4800 -> [q1, q2]
-            _ -> [q1, q2, q3, q4]
-      in (st { rcPrev = (y1, y2) }, out)) st0 quads
+      in (st { rcPrev = (y1, y2) }, q1 : q2 : rest)) st0 quads
     (descr', dataBits) = descrambleRun far (rcDescr st0) coded
 
 unpair :: Int -> (Bool, Bool)
@@ -303,6 +309,7 @@ data V32Data = V32Data
   , vdRx    :: !QamRxState
   , vdDec   :: !RxCoder
   , vdPend  :: [QamSym]   -- ^ symbols held back for the decoder's traceback
+  , vdWait  :: [QamSym]   -- ^ symbols decoded but held back for traceback
   , vdBits  :: [Bool]     -- ^ data bits not yet coded onto symbols
   }
 
@@ -310,7 +317,7 @@ v32DataInit :: Double -> V32Rate -> V32Data
 v32DataInit fs r = V32Data
   { vdTx = qamTxInit, vdCode = txCoderInit
   , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
-  , vdPend = [], vdBits = [] }
+  , vdPend = [], vdWait = [], vdBits = [] }
 
 -- | A data pump that inherits a receiver and transmitter the start-up
 -- has already brought into lock.
@@ -328,6 +335,11 @@ v32DataEvm = qamRxEvm . vdRx
 vdOverlap :: Int
 vdOverlap = 40
 
+-- | Traceback depth, in symbols.  The same number the offline decoder
+-- uses, and the number of symbols the block decoder must hold back.
+viterbiDepth :: Int
+viterbiDepth = 16
+
 -- | Receive one block.
 --
 -- Transmit and receive are separate calls on purpose.  A modem does both
@@ -342,12 +354,22 @@ v32DataRx fs dir r st rx = (st', out)
   where
     p = v32Params fs
     (rx', syms) = qamRxBlock p (v32RxCfg r) rx (vdRx st)
-    both = vdPend st ++ syms
-    -- the decoder sees the overlap for its path metrics; the descrambler
-    -- below sees only what is new
-    fresh = drop (length (vdPend st)) (codedQuads r both)
+    -- A Viterbi decoder is only sure of a symbol once it has seen the
+    -- traceback's worth of symbols after it.  Emitting a block's newest
+    -- symbols the moment they arrive therefore hands out precisely the
+    -- decisions the decoder has not finished making -- and then, next
+    -- block, re-decodes them properly and throws the good answer away.
+    -- At 9600 the difference rarely shows; at 12000 and 14400 it is the
+    -- difference between a working link and a stream of noise.
+    depth = if rateTrellis r then viterbiDepth else 0
+    stream = vdPend st ++ vdWait st ++ syms
+    nPend = length (vdPend st)
+    emitTo = max nPend (length stream - depth)
+    fresh = take (emitTo - nPend) (drop nPend (codedQuads r stream))
     (dec', out) = decodeQuads dir r fresh (vdDec st)
-    st' = st { vdRx = rx', vdDec = dec', vdPend = lastN vdOverlap both }
+    st' = st { vdRx = rx', vdDec = dec'
+             , vdWait = drop emitTo stream
+             , vdPend = lastN vdOverlap (take emitTo stream) }
 
 -- | Transmit @n@ samples, carrying as many of @bits@ as will fit.  What
 -- does not fit stays in the coder, so nothing has to be handed back.

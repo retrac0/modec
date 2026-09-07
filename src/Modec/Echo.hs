@@ -110,6 +110,15 @@ echoSetFar d st = st { esDelay = max 0 d, esTaps = VS.map (const 0) (esTaps st) 
 -- drives the filter away from the echo path it is trying to learn.  The
 -- start-up of Figure 4\/V.32 is built out of half-duplex periods for
 -- exactly this reason, so a V.32 modem never needs to guess.
+-- The filter adapts whenever it is told to; what it may not do is make
+-- the signal worse.  A least-mean-squares filter adapting against a
+-- reference it cannot predict wanders, and puts back a fraction of its
+-- step size as noise.  On a line carrying no echo -- a four-wire VoIP
+-- leg, or two modems wired together through a pair of pipes -- that
+-- noise is the only thing it can produce, and at a step size that
+-- converges quickly it is enough to take 9600 bit\/s apart.  It did,
+-- too: two modems that had been talking cleanly started talking
+-- nonsense the moment the canceller was allowed to adapt.
 echoBlock :: EchoConfig -> Bool -> Signal -> EchoState -> (EchoState, Signal)
 echoBlock cfg adapt rx st0 = (st', out)
   where
@@ -136,9 +145,13 @@ echoBlock cfg adapt rx st0 = (st', out)
               w' = if adapt
                      then VS.zipWith (\wk xk -> lk * wk + g * xk) w xs
                      else w
-              ep' = 0.999 * ep + 0.001 * (d * d)
-              rp' = 0.999 * rp + 0.001 * (e * e)
-          in go (i + 1) w' ep' rp' (e : acc)
+              ep' = 0.99 * ep + 0.01 * (d * d)
+              rp' = 0.99 * rp + 0.01 * (e * e)
+              -- Subtract only while subtracting is measurably helping,
+              -- and decide that per sample rather than per block, so the
+              -- answer does not depend on where the audio was cut.
+              helping = ep' > 1e-18 && rp' < 0.95 * ep'
+          in go (i + 1) w' ep' rp' ((if helping then e else d) : acc)
 
     (w1, ep1, rp1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) []
     out = VS.fromList outs

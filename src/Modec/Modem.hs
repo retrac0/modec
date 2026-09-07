@@ -14,6 +14,7 @@ module Modec.Modem
   , modemStatus
   , modemConnected
   , modemV32Evm
+  , modemEchoErle
   , modemTxCmd
   , modemV22Rx
   , modemMnp
@@ -39,7 +40,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), allRates, defaultRates, rateBitRate)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
 import Modec.V32Start
 import Modec.Echo
@@ -57,6 +58,8 @@ data ModemConfig = ModemConfig
   , mcSettle    :: Double        -- ^ seconds of idle mark after CONNECT before data flows
   , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
   , mcMnp       :: Maybe MnpConfig  -- ^ MNP error correction; 'Nothing' passes bytes straight through
+  , mcV32Rates  :: RateSeq -- ^ the V.32 and V.32bis rates we will accept
+  , mcEcho      :: EchoConfig    -- ^ echo canceller tuning, for the modes that need one
   , mcMaxEvmV32 :: Double  -- ^ the same, in V.32's unit-mean-power units
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
@@ -76,6 +79,8 @@ defaultModemConfig fs role modes = ModemConfig
   -- V.22 measures its decision error in grid units where the mean
   -- power is 10; V.32's constellations are normalised to unit mean
   -- power, so the same fraction of the signal is a tenth of the number.
+  , mcV32Rates = defaultRates
+  , mcEcho = defaultEchoConfig
   , mcMaxEvmV32 = 0.1
   , mcMaxEvm = 1.0
   }
@@ -239,16 +244,18 @@ modemInit cfg
              echo0 0 0 0 HsBusy [] Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
-    echo0 = if V32 `elem` hcModes hs then Just (echoInit defaultEchoConfig) else Nothing
+    echo0 = if V32 `elem` hcModes hs then Just (echoInit (mcEcho cfg)) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
       V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
 
--- | Which V.32 rates we will accept.  4800 and both 9600 alternatives;
--- 2400 is "for further study" in §2.4.3 and exists in no modem.
+-- | Which rates we will accept.  If the far end is V.32 only, its rate
+-- signal says so (Table 5\/V.32 bis Note 1) and the exchange settles on
+-- 9600 or below without either end being told which Recommendation to
+-- speak.
 v32Offer :: ModemConfig -> RateSeq
-v32Offer _ = RateSeq False True True True
+v32Offer = mcV32Rates
 
 dirOfRole :: Role -> Direction
 dirOfRole Originate = Calling
@@ -356,6 +363,12 @@ modemMnp = msMnp
 modemV22Rx :: ModemState -> (Maybe (V22Channel, V22RxState), Rate)
 modemV22Rx st = (msV22Rx st, msRxRate st)
 
+-- | The echo canceller's return loss enhancement, for tracing: how much
+-- of what arrived it is taking out.  'Nothing' when no canceller is
+-- running, which is every mode but V.32.
+modemEchoErle :: ModemState -> Maybe Double
+modemEchoErle = fmap echoErle . msEcho
+
 -- | The V.32 receiver's decision error, for tracing.
 modemV32Evm :: ModemState -> Maybe Double
 modemV32Evm st = case msMode st of
@@ -455,7 +468,7 @@ modemStep cfg st0 rxBlock newBytes =
            HsStartV32 ->
              let s32 = v32StartAfterAnswerTone fs (dirOfRole (hcRole hs)) (v32Offer cfg)
                  st2 = st1 { msMode = Starting32 s32
-                           , msEcho = Just (echoInit defaultEchoConfig) }
+                           , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
            HsFailed why ->
              (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], v8Menus ++ [EvFailed why])
@@ -470,9 +483,9 @@ modemStep cfg st0 rxBlock newBytes =
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
       in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) (LineOctets bytes)
     Starting32 s32 ->
-      let (echo', rxClean) = cancelEcho st n rxBlock
+      let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
           (s32', audio, status) = v32StartStep s32 rxClean
-          st1 = st { msEcho = pushEcho cfg (v32EchoAdapt s32') audio echo' }
+          st1 = st { msEcho = aimEcho s32 s32' (pushEcho audio echo') }
       in case status of
            V32Busy -> (st1 { msMode = Starting32 s32' }, audio, [], [])
            V32Connected r ->
@@ -489,7 +502,7 @@ modemStep cfg st0 rxBlock newBytes =
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsFailed why }, audio, [], [EvFailed why])
     DataV32 role rate pump framer armed ->
-      let (echo', rxClean) = cancelEcho st n rxBlock
+      let (echo', rxClean) = cancelEcho False st n rxBlock
           -- receive only; what goes on the line is decided further down,
           -- once the protocol layer has had its say
           (pump', gotBits) = v32DataRx fs (dirOfRole role) rate pump rxClean
@@ -602,6 +615,14 @@ modemStep cfg st0 rxBlock newBytes =
           (txSt, audio, mode') = mkAudio n tx1 cmd mode
           st1 = st { msMode = mode', msTx = txSt, msTxCmd = cmd, msLost = lost, msSettled = settled
                    , msMnp = mnp'
+                   -- Remember what we just put on the line.  The canceller
+                   -- stops adapting at the handover -- both ends are
+                   -- talking from here -- but it still has to be fed, or
+                   -- the reference runs out from under the taps the
+                   -- start-up trained and it quietly cancels nothing.
+                   -- 'msEcho' is Nothing in every other mode, so this is
+                   -- the identity there.
+                   , msEcho = pushEcho audio (msEcho st)
                    , msDte = if isJust (msMnp st) && ran then [] else msDte st }
           evs = map EvMnp mnpEvs
           -- a disconnected error-correcting link is a dead data path, so
@@ -632,10 +653,24 @@ modemStep cfg st0 rxBlock newBytes =
     -- Take our own signal back out of what arrived, and remember what we
     -- sent so the next block can be cleaned too.  Only V.32 needs this;
     -- for every other mode msEcho is Nothing and this is the identity.
-    cancelEcho st' n' blk = case msEcho st' of
+    -- @adapt@ is the far end's silence, and it is the only thing that
+    -- lets the taps move: with both ends transmitting, the far signal
+    -- lands in the error term and drives the filter away from the echo
+    -- path.  Figure 4/V.32 is built out of half-duplex periods precisely
+    -- so this never has to be guessed at, and 'v32EchoAdapt' is the
+    -- start-up saying which of them we are in.
+    cancelEcho adapt st' n' blk = case msEcho st' of
       Nothing -> (Nothing, blk)
-      Just e -> let (e', clean) = echoBlock defaultEchoConfig False blk e
+      Just e -> let (e', clean) = echoBlock (mcEcho cfg) adapt blk e
                 in (Just e', if n' == 0 then blk else clean)
 
-    pushEcho _ adapt audio = fmap (\e -> echoPush defaultEchoConfig audio (adaptMark adapt e))
-    adaptMark _ e = e
+    pushEcho audio = fmap (echoPush (mcEcho cfg) audio)
+
+    -- The start-up times the round trip (NT and MT in Figure 4) and that
+    -- measurement is where the filter belongs: it then has to cover only
+    -- the dispersion a hybrid adds around the delay, not the delay
+    -- itself.  Applied on the edge where it first becomes known, because
+    -- 'echoSetFar' drops the taps.
+    aimEcho before after = case (v32RoundTrip before, v32RoundTrip after) of
+      (Nothing, Just d) -> fmap (echoSetFar d)
+      _ -> id
