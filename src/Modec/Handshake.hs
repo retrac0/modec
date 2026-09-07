@@ -82,6 +82,7 @@ module Modec.Handshake
   , HsOut (..)
   , HsStatus (..)
   , HsState
+  , hsPhaseName
   , initialHandshake
   , HsIn (..)
   , noHsIn
@@ -343,6 +344,10 @@ data HsState = HsState
   , hsV8Mod     :: !(Maybe Modulation)  -- ^ what V.8 selected
   , hsT         :: !Double
   }
+
+-- | The current phase, by name, for tracing.
+hsPhaseName :: HsState -> String
+hsPhaseName = show . hsPhase
 
 initialHandshake :: HsConfig -> HsState
 initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) Nothing 0 Nothing Nothing False Nothing V22 False 0 0 Nothing (-1) False Nothing 0 Nothing Nothing 0
@@ -607,6 +612,14 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
         | s1Seen -> enter112 AV22S1
         | scrambledAnySeen -> (enter AV22Ones) { hsFamily = V22 }
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
+        -- 6.3.1.2: the answering modem answers the calling modem's
+        -- unscrambled binary 1 with scrambled binary 1.  Keying off the
+        -- caller's scrambled ones instead works against a caller that
+        -- sends them early, and leaves a caller that follows the
+        -- Recommendation -- holding unscrambled ones and waiting to be
+        -- answered -- waiting for ever.  Bell 103 is qualified above, so
+        -- an FSK caller has already been taken by then.
+        | u11Seen -> (enter AV22Ones) { hsFamily = V22 }
         | rotating && inPhase >= hcProbe cfg -> enter (AProbe (nextProbe V22))
         | otherwise -> st'
       -- the Bell probe transmits 2225 Hz, which serves Bell 103 and
@@ -687,7 +700,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
         | inPhase >= hcQualify cfg && qualified s -> enter (Connected s R1200)
         | inPhase >= 5 -> enter OListen
       OV22Wait
-        | inPhase >= 0.456 -> enter (if allow2400 && hsFamily st /= Bell212A then OV22S1 else OV22Ones)
+        | inPhase >= 0.456 -> enter (if allow2400 && hsFamily st /= Bell212A then OV22S1 else OV22U11)
       -- 100 ms is what 6.3.1.2 asks for and 150 is what survives a
       -- trunk: one lost 20 ms packet takes a fifth of the pattern, and
       -- an answerer that misses it offers 1200 and never mentions 2400
@@ -701,9 +714,22 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       -- 456 ms, and the far end -- which changes rate on its own clock,
       -- not on ours -- then reads our 2400 bit/s as 1200 for the rest of
       -- the call while its own transmission stays perfectly readable.
+      -- 6.3.1.2 has the answering modem send scrambled binary 1 only once
+      -- it has detected /our/ unscrambled binary 1, so the calling modem
+      -- holds it until that answer comes back rather than for a fixed
+      -- time.  Leaving after 406 ms works against an answerer that keys
+      -- off scrambled ones instead -- which is what this one used to do,
+      -- so the two faults cancelled and modec talked to itself perfectly
+      -- -- and fails against a modem that follows the Recommendation: on
+      -- a VoIP trunk the burst arrives 150 ms late and is over before the
+      -- far end has finished qualifying it.  One recorded call sat on
+      -- unscrambled ones for three seconds and then gave up and offered
+      -- V.21 instead.
       OV22U11
         | s1Seen -> enter112 OV22Ones1200
-        | inPhase >= 0.406 -> enter OV22Ones
+        | inPhase >= 0.406 && scrambledOnesSeen -> enter OV22Ones
+        -- nothing came back: go on anyway rather than hold the line
+        | inPhase >= 3 -> enter OV22Ones
       OV22Ones
         | s1Seen -> enter112 OV22Ones1200
         | scrambledOnesSeen -> enter OV22Settle

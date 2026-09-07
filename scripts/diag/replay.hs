@@ -35,7 +35,7 @@ import Modec.Wav
 modeOf :: String -> Standard
 modeOf s = case s of
   "bell103" -> Bell103; "v21" -> V21; "bell212a" -> Bell212A
-  "v22" -> V22; _ -> V22bis
+  "v22" -> V22; "v32" -> V32; _ -> V22bis
 
 impair :: [String] -> Channel
 impair (k : v : rest) = case k of
@@ -58,19 +58,24 @@ main :: IO ()
 main = do
   hSetBinaryMode stdout True
   args <- getArgs
-  let (path : modesS : rest) = args
+  let (path : modesS : rest0) = args
+      (v8, rest) = case rest0 of { ("v8" : r) -> (True, r); r -> (False, r) }
       modes = map modeOf (words (map (\c -> if c == ',' then ' ' else c) modesS))
   evmOn <- fmap (/= Nothing) (lookupEnv "MODEC_EVM")
   w <- readWav path
   let fs = fromIntegral (wavRate w) :: Double
       x = applyChannel fs (impair rest) (wavSamples w)
-      cfg = defaultModemConfig fs Originate modes
+      cfg0 = defaultModemConfig fs Originate modes
+      cfg = cfg0 { mcHandshake = (mcHandshake cfg0) { hcV8 = v8 } }
       blk = round (fs * 0.02) :: Int
       go st i acc evs
         | i * blk >= VS.length x = return (reverse acc, reverse evs)
         | otherwise = do
             let n = min blk (VS.length x - i * blk)
                 (st', _, bytes, es) = modemStep cfg st (VS.slice (i * blk) n x) []
+            -- every phase change, with the time
+            when (modemPhase st' /= modemPhase st) $
+              hPrintf stderr "  %6.2fs  %s\n" (fromIntegral i * 0.02 :: Double) (modemPhase st')
             -- every half second, what the receiver thinks of the line
             when (evmOn && i `mod` 25 == 0) $ case fst (modemV22Rx st') of
               Just (_, r) -> hPrintf stderr "  %5.1fs evm %7.4f sps %8.5f  %d bytes so far\n"

@@ -15,6 +15,7 @@ module Modec.Modem
   , modemConnected
   , modemV32Evm
   , modemEchoErle
+  , modemPhase
   , modemV32Phase
   , modemTxCmd
   , modemV22Rx
@@ -363,6 +364,16 @@ modemMnp = msMnp
 -- | The V.22 receiver state and its decision rate (for tracing).
 modemV22Rx :: ModemState -> (Maybe (V22Channel, V22RxState), Rate)
 modemV22Rx st = (msV22Rx st, msRxRate st)
+
+-- | Where the modem is, by name, for tracing a call back.
+modemPhase :: ModemState -> String
+modemPhase st = case msMode st of
+  Handshaking -> hsPhaseName (msHs st)
+  Starting32 s32 -> "Starting32 " ++ show (v32Phase s32)
+  DataFsk s _ _ _ _ -> "Data " ++ show s
+  DataV22 _ _ r _ _ -> "Data V22 " ++ show r
+  DataV32 _ r _ _ _ -> "Data V32 " ++ show r
+  Finished -> "Finished"
 
 -- | The echo canceller's return loss enhancement, for tracing: how much
 -- of what arrived it is taking out.  'Nothing' when no canceller is

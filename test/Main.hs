@@ -235,6 +235,40 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
              _ -> let (tx, st) = last outs
                   in s' { sdTx = tx, sdStatus = if st == HsBusy then sdStatus s else st, sdTrace = sdTrace s ++ [ (t, tx) | tx /= sdTx s ] }
 
+-- | Drive the calling side against a synthetic answering modem that
+-- follows 6.3.1.2: it sends unscrambled binary 1 and waits to be
+-- answered in kind, and never sends scrambled ones.  That is what the
+-- recorded BBS in docs/recordings/v32 does.
+--
+-- Returns the transmit command timeline.
+callerAgainstU11 :: [Standard] -> Double -> [(Double, TxCmd)]
+callerAgainstU11 modes maxT = go 0 (toneBank fs (hcBank cfg)) (initialHandshake cfg) TxSilence []
+  where
+    fs = 8000
+    blk = 160 :: Int
+    cfg = (withModes modes (defaultHsConfig Originate)) { hcV8bis = False }
+    -- 2100 Hz answer tone for three seconds, then the answerer's
+    -- unscrambled binary 1 on the high channel, for ever
+    audioAt t
+      | t < 3.0 = tone 2100 t
+      | otherwise = tone 2250 t
+    tone f t = VS.generate blk (\i -> 0.35 * sin (2 * pi * f * (t + fromIntegral i / fs)))
+    -- what the V.22 receiver makes of it: unscrambled ones once the
+    -- answer tone is over, and never a scrambled one
+    pumpAt t
+      | t < 3.0 = V22Report 0.02 90 0 0 0 0 0
+      | otherwise = V22Report 0.02 1 400 0 0 0 0
+    go t bank hs lastTx acc
+      | t >= maxT = acc
+      | otherwise = case bank of
+          Stage bst bstep ->
+            let (bst', frames) = bstep bst (audioAt t)
+                inp = noHsIn { hiPump = Just (pumpAt t) }
+                (hs', outs) = foldl (\(h, o) fr -> let (h2, o2) = handshakeStep cfg h fr inp in (h2, o ++ [hoTx o2])) (hs, []) frames
+                tx = case outs of { [] -> lastTx; _ -> last outs }
+                acc' = acc ++ [ (t, tx) | tx /= lastTx ]
+            in go (t + fromIntegral blk / fs) (Stage bst' bstep) hs' tx acc'
+
 -- | Duration of the first run of a given transmit command in a trace.
 runLength :: (TxCmd -> Bool) -> [(Double, TxCmd)] -> Maybe Double
 runLength p tr = case dropWhile (not . p . snd) tr of
@@ -245,9 +279,29 @@ runLength p tr = case dropWhile (not . p . snd) tr of
 
 handshakeTests :: TestTree
 handshakeTests = testGroup "handshake simulation"
+  [ testCase "the calling modem holds unscrambled binary 1 until it is answered" $
+      -- 6.3.1.2: the answering modem sends scrambled binary 1 only once
+      -- it has detected the calling modem's unscrambled binary 1.  A
+      -- caller that sends its own for a fixed 406 ms and then moves on
+      -- talks to an answerer that keys off scrambled ones -- modec used
+      -- to be one, so the two faults cancelled -- and is ignored by one
+      -- that follows the Recommendation.  A recorded call to a real BBS
+      -- sat on unscrambled ones for three seconds and then gave up and
+      -- offered V.21 instead.
+      forM_ [([V22], "1200"), ([V22bis, V22], "2400")] $ \(modes, what) -> do
+        let tr = callerAgainstU11 modes 8
+            isU11 c = case c of { TxV22 _ _ TxU11 -> True; _ -> False }
+            isScr c = case c of { TxV22 _ _ TxScrambledOnes -> True; _ -> False }
+            firstOf p = case [ t | (t, c) <- tr, p c ] of { (t : _) -> Just t; [] -> Nothing }
+        case (firstOf isU11, firstOf isScr) of
+          (Nothing, _) -> assertFailure (what ++ ": never sent unscrambled binary 1: " ++ show tr)
+          (Just u, Just sc) -> assertBool
+            (what ++ ": held unscrambled ones only " ++ show (sc - u) ++ " s")
+            (sc - u >= 1.0)
+          (Just _, Nothing) -> return ()
   -- the tone-only simulation cannot carry V.22, so these cases enable the
   -- FSK modes only; the answerer probes V.21 first, so V.21 wins
-  [ call "FSK modes both ends -> V.21" fsk fsk V21
+  , call "FSK modes both ends -> V.21" fsk fsk V21
   , call "originate V.21 / answer auto" [V21] allStandards V21
   , call "originate Bell 103 / answer auto" [Bell103] allStandards Bell103
   , call "originate auto / answer Bell 103" allStandards [Bell103] Bell103

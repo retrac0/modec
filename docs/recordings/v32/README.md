@@ -73,11 +73,37 @@ BBSes reachable on this trunk answer V.22bis, and a V.32 connection
 needs a far end that speaks it. The place to test V.32 against real
 hardware is the USR modem on the bench, not a dialled BBS.
 
-The call also showed something at this end that is *not* fixed. Dialled
-`--mode v32,v22bis,v22,v21 --v8`, against a far end offering V.22 and
-V.21 and no V.8 at all, the caller did not fall back: it ran to
-`connection failed: timeout` at 46 s rather than taking the 2250 Hz it
-had been hearing since 13 s. A V.22-only dial to the same number
-connects, so the automode ladder is being held up by something in the
-V.8 or V.32 path rather than by the line. That is the next thing to
-chase, and this recording is the case to chase it with.
+## What the call actually exposed, and the fix
+
+The failure had nothing to do with V.32 or V.8, and the recording is
+what showed that. Replaying it through the whole modem
+(`scripts/diag/replay.hs`) with V.32 and V.8 removed fails in exactly
+the same place, and the receiver is not the problem either: through the
+V.22 phase it is locked at an EVM of 0.0002, decoding the far end
+perfectly.
+
+The fault was ours, and it is a plain reading of 6.3.1.2. The answering
+modem sends scrambled binary 1 only once it has detected the *calling*
+modem's unscrambled binary 1. modec sent its unscrambled ones for a
+fixed 406 ms and then moved on to scrambled ones -- and at 1200 bit/s
+skipped them altogether, going straight from the 456 ms silence to
+scrambled ones. On a trunk with 150 ms each way, a 406 ms burst is over
+before the far end has finished qualifying it. This far end sat on its
+own unscrambled ones for three full seconds waiting to be answered, gave
+up, and offered V.21 instead -- which is exactly what the tone list
+above shows.
+
+It survived so long because modec's *answerer* had the mirror fault: it
+advanced on the caller's scrambled ones rather than its unscrambled
+ones, so the two cancelled and modec talked to itself perfectly. Both
+sides are fixed, and `handshake simulation / the calling modem holds
+unscrambled binary 1 until it is answered` drives the calling side
+against a synthetic answerer that behaves the way this BBS does. Without
+the fix it reports "1200: never sent unscrambled binary 1".
+
+Replayed now, the caller holds unscrambled binary 1 from 14.08 s to
+17.08 s, overlapping almost the whole of the far end's own 13.26-16.34 s
+window. What that cannot show is the connection completing: in replay
+our transmissions go nowhere, because the far end's audio is fixed. The
+recording proves the diagnosis and the fix addresses it; only another
+call will prove the connection.
