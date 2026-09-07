@@ -41,6 +41,7 @@ import Modec.Hayes
 import Modec.Modem
 import Modec.Standards (fskBaud, fskName)
 import Modec.V32 (V32Rate (..), rateBitRate)
+import qualified Modec.V32 as V32
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
 import Modec.Pipewire
 import Modec.V8 (describeMenu)
@@ -81,6 +82,7 @@ data ModemOpts = ModemOpts
   , moV8       :: Bool
   , moV8All    :: Bool
   , moMaxEvm   :: Double
+  , moV32Rates :: Maybe V32.V32Rate  -- ^ hold V.32 to one rate
   , moMnp      :: Maybe Int          -- ^ highest MNP class to offer (2, 3 or 4)
   , moMnpTrt   :: Double             -- ^ round trip the retransmission timer allows for
   , moMnpProbes :: Int               -- ^ link requests sent before giving up
@@ -106,7 +108,7 @@ defaultModemOpts :: ModemOpts
 defaultModemOpts = ModemOpts
   { moRate = 8000, moBlockMs = 20, moRole = Originate, moModes = allStandards
   , moNoHandshake = False, moNoV8bis = False, moV8 = False, moV8All = False
-  , moMaxEvm = 1.0, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
+  , moMaxEvm = 1.0, moV32Rates = Nothing, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
@@ -126,7 +128,7 @@ runModem o = do
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       cfg0 = defaultModemConfig fs (moRole o) (moModes o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcMnp = mnpCfg, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
       -- The rate and whether the link can go synchronous belong to the
       -- link rather than to the command line, so those two are left for
       -- Modec.Modem to fill in once the call is established.
@@ -247,7 +249,7 @@ runModem o = do
             _ -> Nothing
           cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
-                              , mcMaxEvm = moMaxEvm o, mcMnp = mnpCfg
+                              , mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg
                               , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
           -- A call we placed watches the line for what the network
           -- plays back at it; a call we answered does not.
@@ -904,3 +906,11 @@ push buf bs = atomicModifyIORef' buf (\xs -> (bs : xs, ()))
 
 drain :: IORef [B.ByteString] -> IO B.ByteString
 drain buf = B.concat . reverse <$> atomicModifyIORef' buf (\xs -> ([], xs))
+
+
+-- | The V.32 rate signal this modem sends: everything it offers by
+-- default, or the single rate @--v32-rate@ pins it to.  Pinning is how
+-- 7200, 12000 and 14400 are reached, since they are not in the default
+-- offer, and how a rate can be held down to see what a line will carry.
+v32Offered :: ModemOpts -> V32.RateSeq
+v32Offered o = maybe V32.defaultRates V32.chosenRate (moV32Rates o)

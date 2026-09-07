@@ -1,5 +1,6 @@
 module Main (main) where
 
+import Control.Applicative (optional, (<|>))
 import Control.Monad (forM_, when)
 import qualified Data.ByteString as B
 import qualified Data.Vector.Storable as VS
@@ -9,6 +10,8 @@ import Text.Printf (printf)
 
 import Dial
 import Modec.Detect
+import Modec.V32Start (v32Timeline)
+import qualified Modec.V32 as V32
 import Modec.Dtmf
 import Modec.Progress
 import Modec.Pipewire (describeNodes, pwAudioNodes)
@@ -29,6 +32,7 @@ data Cmd
   | Encode Std Channel Int Double FilePath
   | Probe FilePath
   | Detect FilePath
+  | V32Trace Bool FilePath   -- ^ True = we were the answering modem
   | ProgressOf FilePath
   | DtmfOf FilePath
   | RunModem ModemOpts
@@ -55,6 +59,7 @@ cmdP = hsubparser
   <> command "encode" (info encodeP (progDesc "Modulate stdin bytes to a WAV file"))
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
+  <> command "v32trace" (info v32traceP (progDesc "Read a V.32 start-up back out of a recording, as a timeline"))
   <> command "progress" (info progressP (progDesc "Report the call progress tones in a WAV file: dial tone, ringing, busy, congestion, special information tone"))
   <> command "dtmf"  (info dtmfP   (progDesc "Report the DTMF digits in a WAV file"))
   <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
@@ -71,6 +76,8 @@ cmdP = hsubparser
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
     probeP = Probe <$> argument str (metavar "FILE.wav")
     detectP = Detect <$> argument str (metavar "FILE.wav")
+    v32traceP = V32Trace <$> switch (long "answer" <> help "we were the answering modem (default: calling)")
+                         <*> argument str (metavar "FILE.wav")
     progressP = ProgressOf <$> argument str (metavar "FILE.wav")
     dtmfP = DtmfOf <$> argument str (metavar "FILE.wav")
     modemP = RunModem <$> (ModemOpts
@@ -87,6 +94,8 @@ cmdP = hsubparser
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full. A survey option: the mode it then selects will not be one this modem can run")
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
              <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this; a good link sits near 0.01 and 20 dB SNR near 0.35, while a converging or collapsing carrier runs past 1. Raise it to pass noisy data through, lower it to pass only what is trustworthy")
+      <*> optional (option (maybeReader v32RateReader) (long "v32-rate" <> metavar "BPS"
+            <> help "hold V.32 to one rate: 4800, 7200, 9600, 9600t, 12000 or 14400. 7200, 12000 and 14400 are not in the default offer"))
       <*> (flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A): frames the data, checks it, and asks again for whatever the line damaged. Classes 2 to 4; falls through to an unprotected connection if the far end does not answer")
            <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, but offering only up to class N: 2 start-stop framing, 3 synchronous framing, 4 adds the data phase optimization and adaptive frame sizing")
            <|> pure Nothing)
@@ -172,6 +181,14 @@ cmdP = hsubparser
       "auto" -> Just H.allStandards
       "all" -> Just H.allStandards
       _ -> mapM modeReader (splitOn ',' s)
+    v32RateReader m = case m of
+      "4800" -> Just V32.V32R4800
+      "7200" -> Just V32.V32R7200
+      "9600" -> Just V32.V32R9600
+      "9600t" -> Just V32.V32R9600T
+      "12000" -> Just V32.V32R12000
+      "14400" -> Just V32.V32R14400
+      _ -> Nothing
     modeReader m = case m of
       "bell103" -> Just H.Bell103
       "v21" -> Just H.V21
@@ -266,6 +283,12 @@ main = do
         else putStr (describeNodes ns)
     RunModem mo -> runModem mo
     DialOut d -> runDial d
+    V32Trace answered path -> do
+      w <- readWav path
+      let fs = fromIntegral (wavRate w)
+          dir = if answered then V32.Answering else V32.Calling
+      forM_ (v32Timeline fs dir (wavSamples w)) $ \(t, what) ->
+        printf "%8.3f  %s\n" t what
     Detect path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)

@@ -42,6 +42,7 @@ module Modec.V32Start
   , v32StartRx
   , v32StartTx
   , v32StartCoder
+  , v32Timeline
   , chosen
   , v32Bits
   ) where
@@ -49,7 +50,7 @@ module Modec.V32Start
 import Data.Maybe (listToMaybe)
 import qualified Data.Vector.Storable as VS
 
-import Modec.DSP (Signal)
+import Modec.DSP (Signal, chunksOf)
 import Modec.QAM
 import Modec.V32
 import Modec.V32Pump
@@ -665,3 +666,38 @@ chosen r = case r of
   where
     base = noRates
     bis = noRates { rsCan2400 = True, rsTrellis = True }
+
+-- | What a V.32 recording contains, as a timeline: the answer tone, the
+-- reversals in AC and AA, the conditioning signal, and any rate signals
+-- -- everything the start-up's own detectors can see, run over a whole
+-- file rather than a live line.  For reading a recorded call back, and
+-- for comparing one recorded over a real trunk with one recorded over a
+-- pair of pipes.
+--
+-- Each entry is (seconds, what).  @dir@ is which end /we/ are, since it
+-- decides which scrambler the rate signals are read with.
+v32Timeline :: Double -> Direction -> Signal -> [(Double, String)]
+v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
+  where
+    blk = 160
+    p = v32Params fs
+    st0 = v32StartInit fs dir allRates
+    go _ _ [] acc = reverse acc
+    go st n (c : cs) acc =
+      let st1 = observe st c
+          t = fromIntegral n / fs
+          revs = [ (t + fromIntegral (i - n) / fs, "phase reversal at " ++ show (round f :: Int) ++ " Hz")
+                 | (f, i) <- vsRevAt st1 ]
+          levels = [ (f, revLevel tr) | (f, tr) <- [ (1800, vsRev1800 st1), (600, vsRev600 st1), (3000, vsRev3000 st1) ] ]
+          tone = [ (t, "tone at " ++ show (round f :: Int) ++ " Hz")
+                 | (f, lv) <- levels, lv > 0.45, not (toneWas f st) ]
+          cond = [ (t, "conditioning signal (S)") | isConditioning (vsTurns st1), not (vsSeenS st) ]
+          rate = [ (t, "rate signal " ++ showRates r) | Just r <- [detectRate (vsBits st1)], not (vsSeenTrn st) ]
+          eSig = [ (t, "signal E " ++ showRates r) | Just r <- [detectE (vsBits st1)] ]
+          st2 = st1 { vsSeenS = vsSeenS st || not (null cond)
+                    , vsSeenTrn = vsSeenTrn st || not (null rate) }
+      in go st2 (n + blk) cs (reverse (revs ++ tone ++ cond ++ rate ++ eSig) ++ acc)
+    toneWas f st = revLevel (case f of { 1800 -> vsRev1800 st; 600 -> vsRev600 st; _ -> vsRev3000 st }) > 0.45
+    showRates r = unwords (["4800" | rsCan4800 r] ++ ["7200" | rsCan7200 r] ++ ["9600" | rsCan9600 r]
+                           ++ ["tcm" | rsTrellis r] ++ ["12000" | rsCan12000 r] ++ ["14400" | rsCan14400 r]
+                           ++ ["(V.32bis)" | rateSeqV32bis r])

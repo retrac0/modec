@@ -78,6 +78,7 @@ module Modec.V32
   , decodeESeq
   , rateSeqCleardown
   , bestCommonRate
+  , chosenRate
   ) where
 
 import Data.Maybe (listToMaybe)
@@ -683,3 +684,18 @@ bestCommonRate ours theirs = listToMaybe (filter usable allV32Rates)
       V32R9600 -> rsCan9600 c
       V32R7200 -> rsCan7200 c
       V32R4800 -> rsCan4800 c
+
+-- | The rate signal that offers exactly one rate.  B4 and B8 stay set on
+-- the V.32bis rates so the far end can still tell which Recommendation
+-- it is talking to.
+chosenRate :: V32Rate -> RateSeq
+chosenRate r = case r of
+  V32R4800 -> base { rsCan4800 = True }
+  V32R7200 -> bis { rsCan7200 = True }
+  V32R9600 -> base { rsCan9600 = True }
+  V32R9600T -> base { rsCan9600 = True, rsTrellis = True }
+  V32R12000 -> bis { rsCan12000 = True }
+  V32R14400 -> bis { rsCan14400 = True }
+  where
+    base = noRates
+    bis = noRates { rsCan2400 = True, rsTrellis = True }
