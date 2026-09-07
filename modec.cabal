@@ -21,6 +21,7 @@ library
                       Modec.Detect
                       Modec.Handshake
                       Modec.Modem
+                      Modec.Replay
                       Modec.Telnet
                       Modec.Async
                       Modec.Baudot
