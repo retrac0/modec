@@ -40,6 +40,8 @@ module Modec.V32Pump
   , v32DemodulateWith
   , v32DemodulateTrained
   , v32DemodulateTrainedWith
+  , v32DemodulateTrainedEvm
+  , v32DemodulateTrainedEvmWith
   ) where
 
 import Modec.DSP (Signal, chunksOf)
@@ -305,7 +307,23 @@ v32DemodulateTrained = v32DemodulateTrainedWith id
 -- | The same, with the receiver's tuning adjusted -- for finding out
 -- what the tuning should be.
 v32DemodulateTrainedWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
-v32DemodulateTrainedWith tune fs dir r preSyms sig = snd (decodeSymbols dir r syms rxCoderInit)
+v32DemodulateTrainedWith tune fs dir r preSyms sig =
+  fst (v32DemodulateTrainedEvmWith tune fs dir r preSyms sig)
+
+-- | The same, and the receiver's decision error where it finished.
+--
+-- On a clean channel that error is the implementation noise and nothing
+-- else, which is the only way to see a floor that costs no bit errors at
+-- all until it costs every one of them: a receiver can be eating four
+-- tenths of its own decision margin and still decode a noiseless signal
+-- perfectly.
+v32DemodulateTrainedEvm :: Double -> Direction -> V32Rate -> Int -> Signal -> ([Bool], Double)
+v32DemodulateTrainedEvm = v32DemodulateTrainedEvmWith id
+
+v32DemodulateTrainedEvmWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal
+                            -> ([Bool], Double)
+v32DemodulateTrainedEvmWith tune fs dir r preSyms sig =
+  (snd (decodeSymbols dir r syms rxCoderInit), qamRxEvm stEnd)
   where
     p = v32Params fs
     trainCfg = tune (v32RxCfg V32R4800)
@@ -313,7 +331,7 @@ v32DemodulateTrainedWith tune fs dir r preSyms sig = snd (decodeSymbols dir r sy
     preN = ceiling (fromIntegral preSyms * samplesPerSymbol p)
     (pre, dat) = VS.splitAt preN sig
     stAfter = snd (runBlocks p trainCfg pre (qamRxInit p trainCfg))
-    syms = fst (runBlocks p dataCfg dat stAfter)
+    (syms, stEnd) = runBlocks p dataCfg dat stAfter
 
 -- | Drive the receiver over a whole signal, returning the state it ends
 -- in as well as the symbols.  The trained start-up needs that state to

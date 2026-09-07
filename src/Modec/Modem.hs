@@ -43,7 +43,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, v32Rates, v32bisRates)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, v32Rates, v32bisRates)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
 import Modec.V32Start
 import Modec.Echo
@@ -63,7 +63,7 @@ data ModemConfig = ModemConfig
   , mcMnp       :: Maybe MnpConfig  -- ^ MNP error correction; 'Nothing' passes bytes straight through
   , mcV32Rates  :: Maybe RateSeq -- ^ rates to offer; 'Nothing' takes them from the modes
   , mcEcho      :: EchoConfig    -- ^ echo canceller tuning, for the modes that need one
-  , mcMaxEvmV32 :: Double  -- ^ the same, in V.32's unit-mean-power units
+  , mcMaxEvmV32 :: Double  -- ^ stop passing bytes when the decision error exceeds this much of the constellation's own margin
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -84,7 +84,7 @@ defaultModemConfig fs role modes = ModemConfig
   -- power, so the same fraction of the signal is a tenth of the number.
   , mcV32Rates = Nothing
   , mcEcho = defaultEchoConfig
-  , mcMaxEvmV32 = 0.1
+  , mcMaxEvmV32 = 0.5
   , mcMaxEvm = 1.0
   }
 
@@ -545,7 +545,16 @@ modemStep cfg st0 rxBlock newBytes =
           -- receive only; what goes on the line is decided further down,
           -- once the protocol layer has had its say
           (pump', gotBits) = v32DataRx fs (dirOfRole role) rate pump rxClean
-          trust = v32DataEvm pump' < mcMaxEvmV32 cfg
+          -- Scaled by how far this constellation's points are from the
+          -- wrong answer, because the same decision error means
+          -- different things at 4800 and at 14400 -- 0.71 of margin
+          -- against 0.11.  A fixed ceiling is generous enough at the
+          -- bottom of the range to pass a receiver that is already
+          -- making errors at the top, and a marginal 14400 line then
+          -- spends a whole call handing the terminal noise between the
+          -- bytes it gets right.
+          trust = decisionError < mcMaxEvmV32 cfg * rateMargin rate
+          decisionError = sqrt (v32DataEvm pump')
           -- Arm on a *run* of descrambled ones -- the idle both ends send
           -- between characters -- and not on a count of them, since noise
           -- is half ones and counting arms the framer on nothing at all.
@@ -587,7 +596,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- signal and tracking it: hard to catch, easy to keep.  The
           -- half second is for the line that never gets that good, where
           -- passing bits with errors in them still beats passing none.
-          acquired = v32DataEvm pump' < mcMaxEvmV32 cfg / 4 || msSettled st > 0.5
+          acquired = decisionError < mcMaxEvmV32 cfg * rateMargin rate / 4 || msSettled st > 0.5
           onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
           armed' = armed || (onesRun' >= 64 && trust && acquired)
           sync = case msMnp st of

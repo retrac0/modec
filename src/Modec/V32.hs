@@ -50,6 +50,7 @@ module Modec.V32
   , bitsToInt
   , constellation
   , slicePoint
+  , rateMargin
   , subsetPoint
   , gridScale
     -- * Differential encoding (Tables 1 and 2)
@@ -380,6 +381,22 @@ constellation r i = pointsFor r VU.! (i `mod` VU.length (pointsFor r))
 -- decision, and on a trellis alternative it is what the carrier and
 -- timing loops use, because they cannot wait for a traceback without
 -- going unstable.
+-- | Half the distance to the nearest wrong answer, for the rate's own
+-- constellation.
+--
+-- This is the unit a decision error means anything in.  A tenth of the
+-- signal is a comfortable error at 4800, where the four points are 0.71
+-- apart from the decision boundary, and it is past the boundary
+-- altogether at 14400, where they are 0.11.  Anything that compares a
+-- decision error against a fixed number is really comparing it against
+-- six different things depending on the rate.
+rateMargin :: V32Rate -> Double
+rateMargin r = 0.5 * sqrt (minimum [ dist2 (ps VU.! i) (ps VU.! j)
+                                   | i <- [0 .. n - 1], j <- [i + 1 .. n - 1] ])
+  where
+    ps = pointsFor r
+    n = VU.length ps
+
 slicePoint :: V32Rate -> Point -> Int
 slicePoint r p = snd (minimum [ (dist2 p (ps VU.! i), i) | i <- [0 .. VU.length ps - 1] ])
   where ps = pointsFor r
@@ -623,11 +640,16 @@ v32Rates = noRates
 --
 -- 7200 is in now that the receiver acquires the data constellation
 -- instead of trying to track it: a call at 7200 delivers both
--- directions exactly, head of the session included.  12000 and 14400
--- are not.  They are implemented, they negotiate, and they carry a
--- telephone channel in the impairment tests, and they still do not
--- survive a whole call -- 12000 manages one direction of two and 14400
--- neither.  For 14400 the ceiling is the receiver's own noise floor
+-- directions exactly, head of the session included.  12000 carries a
+-- whole call both ways too, and is still out of the offer because that
+-- has only been shown down a pair of pipes at 30 dB and never on a
+-- line.  14400 trains, negotiates, and cannot carry data at all: the
+-- receiver's decision error settles at around half the distance to the
+-- wrong answer -- 39 to 49 % of it with no channel in the way -- and
+-- the gate that keeps noise off the terminal keeps the data off with
+-- it.  The offline pump reaches both rates error-free through a
+-- telephone band at 25 dB, so whatever is missing is in the start-up,
+-- the handover or the canceller and not in the modulation.  For 14400 the ceiling is the receiver's own noise floor
 -- rather than the line's: cubic interpolation at 3.3 samples per symbol
 -- and a root raised cosine cut at 12 symbols leave about 25 dB of
 -- implementation signal to noise, enough for 32 points and not for 128.

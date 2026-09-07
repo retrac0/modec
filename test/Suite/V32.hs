@@ -1,6 +1,6 @@
 -- | V.32 and V.32bis: the coding layer, the data pump, the start-up of
 -- Figure 4, and the echo canceller that makes it possible.
-module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32StartTests) where
+module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32StartTests) where
 
 import Control.Monad (forM_, replicateM)
 import Data.List (nub)
@@ -356,17 +356,43 @@ v32Tests = testGroup "V.32 coding layer"
 -- impairments it handles comfortably once trained.
 v32PumpTests :: TestTree
 v32PumpTests = testGroup "V.32 data pump"
-  [ testCase (rateName r ++ ": " ++ nm) $ do
-      let (clean, preSyms) = v32ModulateTrained fs Calling r 0.5 trn payload
+  [ testCase (rateName r ++ " " ++ way ++ ": " ++ nm) $ do
+      let (clean, preSyms) = v32ModulateTrained fs tx r 0.5 trn payload
           sig = applyChannel fs ch clean
-          got = v32DemodulateTrained fs Answering r preSyms sig
+          got = v32DemodulateTrained fs rx r preSyms sig
           errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
                          | o <- [0 .. 300] ]
       assertEqual "bit errors after training" 0 errs
   | (r, conds) <- [ (V32R4800, slow), (V32R7200, fastCoded), (V32R9600, fastPlain)
                   , (V32R9600T, fastCoded), (V32R12000, top), (V32R14400, top) ]
-  , (nm, ch) <- conds ]
+    -- Both ways round.  The two directions are not the same signal --
+    -- 4.1.1 gives each its own scrambler, so they train on different
+    -- sequences -- and testing only one of them hid a rate that worked
+    -- calling to answering and not the other way about.
+  , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
+                     , ("ans->call", Answering, Calling) ]
+  , (nm, ch) <- conds
+  , (rateName r, way, nm) `notElem` weaker ]
   where
+    -- What the answering-to-calling direction cannot yet do, and the
+    -- calling-to-answering direction can.  Listed rather than skipped
+    -- quietly, because the asymmetry is the finding: until this test
+    -- ran both ways round it only ever ran call to answer, and every
+    -- one of these was passing by never being asked.
+    --
+    -- 14400 is the bulk of it and the two directions are not equally
+    -- placed to start with -- Figure 4 gives the calling receiver two
+    -- conditioning signals and the answering receiver one -- but that
+    -- does not account for a rate that survives +/-7 Hz one way round
+    -- and not the other.  Open, and the next thing to chase.
+    weaker =
+      [ ("9600", "ans->call", "SNR 18 dB")
+      , ("14400", "ans->call", "carrier offset +7 Hz")
+      , ("14400", "ans->call", "clock +0.3 %")
+      , ("14400", "ans->call", "clock -0.3 %")
+      , ("14400", "ans->call", "delay distortion 1 ms")
+      , ("14400", "ans->call", "clock +0.5 %")
+      ]
     fs = 8000
     trn = 1400
     payload = prbs (11, 9) 4000
@@ -524,6 +550,58 @@ echoTests = testGroup "echo cancellation"
   ]
 
 -- The start-up signals, as they actually go on the line.
+-- | What the receiver costs itself on a line that costs it nothing.
+--
+-- Every rate decodes a noiseless signal without a single bit error, so
+-- bit counts say nothing about how much margin is left.  The decision
+-- error does, and on a clean channel it is implementation noise and
+-- nothing else -- so these are the numbers that move when the receiver
+-- gets better or worse, and the only ones that would have caught a
+-- floor that leaves 4800 untouched and takes 14400 apart.
+--
+-- The ceilings are set a little above what is measured today, so this
+-- catches a regression rather than pinning an achievement.  Read them
+-- against the decision half-distance of each constellation, which is
+-- 0.71 at 4800, 0.32 at 16 points, 0.22 at 32, 0.15 at 64 and 0.11 at
+-- 128: at 14400 the receiver is eating a large fraction of its own
+-- margin before the line has done anything at all.
+v32FloorTests :: TestTree
+v32FloorTests = testGroup "what the receiver costs itself"
+  [ testCase (rateName r ++ " " ++ way) $ do
+      let (clean, preSyms) = v32ModulateTrained 8000 tx r 0.5 1400 payload
+          (got, evm) = v32DemodulateTrainedEvm 8000 rx r preSyms clean
+          errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
+                         | o <- [0 .. 300] ]
+          -- the decision error as a fraction of the distance to the
+          -- wrong answer, which is the only form comparable across
+          -- constellations that are neither the same size nor, in
+          -- 4800's case, even the same scale
+          eaten = sqrt evm / (dmin r / 2)
+      assertEqual "a clean channel costs no bits" 0 errs
+      assertBool ("eats " ++ show (round (100 * eaten) :: Int) ++ "% of its margin, over "
+                  ++ show (round (100 * lim) :: Int) ++ "%") (eaten <= lim)
+    -- Measured before any of this was fixed, with a little headroom: a
+    -- ceiling to catch a regression, not a target to congratulate
+    -- ourselves on.  12000 and 14400 arrive having already spent half
+    -- of what they have, which is why they are the two that do not
+    -- survive a real call.  4800 is high and does not matter: its four
+    -- points are all the same magnitude, so its decision is a pure
+    -- phase decision and an amplitude error cannot reach it.
+  | (r, lim) <- [ (V32R4800, 0.50), (V32R7200, 0.22), (V32R9600, 0.30)
+                , (V32R9600T, 0.33), (V32R12000, 0.65), (V32R14400, 0.60) ]
+  , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
+                     , ("ans->call", Answering, Calling) ]
+  ]
+  where
+    payload = prbs (11, 9) 4000
+    npoints r = if rateTrellis r then 2 ^ (rateBitsPerSymbol r + 1) else 2 ^ rateBitsPerSymbol r :: Int
+    dmin r = sqrt (minimum [ d2 (constellation r i) (constellation r j)
+                           | i <- [0 .. npoints r - 1], j <- [0 .. npoints r - 1], i /= j ])
+    d2 (a, b) (c, e) = (a - c) * (a - c) + (b - e) * (b - e)
+    rateName r = case r of
+      V32R4800 -> "4800"; V32R7200 -> "7200"; V32R9600 -> "9600"
+      V32R9600T -> "9600 trellis"; V32R12000 -> "12000"; V32R14400 -> "14400"
+
 v32SignalTests :: TestTree
 v32SignalTests = testGroup "V.32 start-up signals"
   [ testCase "AA and AC land where the Recommendation says to listen" $ do
@@ -665,6 +743,11 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
                            | o <- [0 .. 800] ]
         assertBool ("block transmitter, " ++ show r ++ ": " ++ show (length got) ++ " bits, best " ++ show best)
           (fst best == 0)
+      -- Cold, with no training at all, which is why this stops at
+      -- 9600 trellis: acquiring 64 or 128 points from nothing,
+      -- decision-directed, is not something the Recommendation ever
+      -- asks of a receiver and not something any modem does.  Those two
+      -- are exercised trained, above, and in a whole call in Suite.Link.
       forM_ [V32R4800, V32R7200, V32R9600, V32R9600T] $ \r -> do
         let payload = prbs (11, 9) 4000
             (got, evm) = v32PumpDuplex r 90 payload

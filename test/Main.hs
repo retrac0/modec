@@ -36,7 +36,7 @@ main = do
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"
-        [hayesTests, baresipTests, pipewireTests]
+        [hayesTests, baresipTests, pipewireTests, hermeticTests]
     , testGroup "tones as meaning"
         [ttyTests, dtmfTests, progressTests]
     ]

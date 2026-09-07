@@ -159,6 +159,37 @@ modemTests = testGroup "full modem duplex" $
       -- the descrambler coming into step but the receiver acquiring the
       -- data constellation on the carrier loop's tracking gain.
       assertEqual "text from originate to answer" textO rxA
+  , testCase "a V.32bis call at 12000, and 14400 which trains but cannot carry" $ do
+      -- The two rates V.32bis adds above 9600, and the two that do not
+      -- yet survive a call: the offline pump carries either of them
+      -- through a telephone band at 25 dB without a bit wrong, so
+      -- whatever this catches is in the start-up, the handover or the
+      -- canceller and not in the modulation.
+      let call r = let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosen r) }
+                   in modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
+      -- 12000 carries a whole call both ways.
+      let (rxO, rxA, evO, _) = call V32R12000
+      assertBool ("12000 originate events " ++ show evO)
+        (case evO of (EvConnected V32bis (V32Link Originate V32R12000) : _) -> True; _ -> False)
+      assertEqual "12000: text from answer to originate" textA rxO
+      assertEqual "12000: text from originate to answer" textO rxA
+      -- 14400 negotiates and trains and does not carry data, and this
+      -- says so rather than pretending otherwise.  The receiver's
+      -- decision error sits at about half the distance to the wrong
+      -- answer -- the offline pump measures 39 to 49 % of it on a
+      -- channel that has done nothing at all -- so the gate that stops
+      -- noise reaching the terminal stops the text with it.  Asserting
+      -- the connection and the silence pins both halves: if the link
+      -- improves this fails and wants tightening, and if the gate
+      -- regresses the terminal starts seeing rubbish again and this
+      -- fails too.
+      let (rxO', rxA', evO', _) = call V32R14400
+      assertBool ("14400 originate events " ++ show evO')
+        (case evO' of (EvConnected V32bis (V32Link Originate V32R14400) : _) -> True; _ -> False)
+      assertBool ("14400 hands up " ++ show (length rxO') ++ " bytes one way and "
+                  ++ show (length rxA') ++ " the other, which should be almost none"
+                  ++ " until the receiver is good enough to carry it")
+        (length rxO' < 8 && length rxA' < 8)
   , testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
       let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 18
       -- the station that received MS (the caller) becomes the answering modem on the high channel
