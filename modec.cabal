@@ -86,6 +86,16 @@ test-suite modec-test
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Main.hs
+    other-modules:    Corpus
+                      Harness
+                      Suite.Dsp
+                      Suite.Fsk
+                      Suite.Link
+                      Suite.Mnp
+                      Suite.Tones
+                      Suite.Tools
+                      Suite.V22
+                      Suite.V32
     -- The suite is CPU bound -- it simulates about twenty-five minutes of
     -- telephone audio -- and tasty schedules cases concurrently, which
     -- does nothing at all on a single capability.
