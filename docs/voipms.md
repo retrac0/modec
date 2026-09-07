@@ -74,6 +74,12 @@ Add `--listen 2323` to put the modem on a telnet port rather than the
 terminal, which is what you want for a terminal emulator with ANSI and
 file transfer.
 
+On the terminal the line discipline is turned off entirely: the return
+key reaches the far end as the carriage return it is rather than as a
+line feed, ^S and ^Q go down the line instead of freezing the screen,
+and the high bit survives. ctrl-C is the one key the terminal keeps, and
+it leaves.
+
 The long form is still there when you need to place the pieces yourself
 -- an existing baresip, a different audio path, the answering side:
 

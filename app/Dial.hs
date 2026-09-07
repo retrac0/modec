@@ -152,17 +152,34 @@ accountDomain = do
       (x : _) -> Just x
       [] -> Nothing
 
--- | The terminal as a DTE: no line discipline and no echo, because the
--- modem does both itself.  Restored however the call ends.
+-- | The terminal as a DTE: no line discipline, no echo, and above all
+-- no translation, because every byte here is going onto a telephone
+-- line where a modem and a far end have already agreed what the bytes
+-- mean.
+--
+-- 'MapCRtoLF' is the one that matters and the one that is on by default
+-- on every terminal: with it, the return key arrives as a line feed,
+-- which a BBS waiting for a carriage return ignores completely and an
+-- AT command parser does not accept either.  The rest are the same
+-- argument -- ^S and ^Q are characters to send, not flow control; the
+-- high bit belongs to whatever is using it; output translation would
+-- add a carriage return to what the far end already sent one for.
+--
+-- 'KeyboardInterrupts' stays on, which is the one deliberate exception:
+-- ctrl-C leaves rather than reaching the far end, as the banner says.
+-- Restored however the call ends.
 withRawTty :: IO a -> IO a
 withRawTty body = do
   isTty <- queryTerminal (Fd 0)
   if not isTty then body else do
     saved <- getTerminalAttributes (Fd 0)
-    let raw = flip withoutMode EnableEcho
-            . flip withoutMode ProcessInput
-            . flip withoutMode ExtendedFunctions
-            $ saved
+    let off = [ EnableEcho, ProcessInput, ExtendedFunctions
+              , MapCRtoLF, MapLFtoCR, IgnoreCR
+              , StartStopInput, StartStopOutput
+              , StripHighBit, CheckParity, MarkParityErrors, InterruptOnBreak
+              , ProcessOutput ]
+        raw = flip withTime 0 . flip withMinInput 1
+            $ foldl withoutMode saved off
     bracket_ (setTerminalAttributes (Fd 0) raw Immediately)
              (setTerminalAttributes (Fd 0) saved Immediately)
              (hSetBuffering stdin NoBuffering >> hSetBuffering stdout NoBuffering >> body)
