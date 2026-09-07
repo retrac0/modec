@@ -86,6 +86,14 @@ instance Arbitrary Payload where
   arbitrary = Payload <$> resize 40 (listOf arbitrary)
   shrink (Payload bs) = map Payload (shrink bs)
 
+-- | A handful of bytes rather than forty, for the sample rates where the
+-- front end costs O(fs^2) and every byte is paid for at that price.
+newtype ShortPayload = ShortPayload [Word8] deriving Show
+
+instance Arbitrary ShortPayload where
+  arbitrary = ShortPayload <$> resize 8 (listOf arbitrary)
+  shrink (ShortPayload bs) = map ShortPayload (shrink bs)
+
 propertyTests :: TestTree
 propertyTests = testGroup "self round trips"
   [ testProperty "bell103 answer 8 kHz clean" $ \(Payload bs) -> roundTrip 8000 bell103Answer 0 1 bs
@@ -95,13 +103,14 @@ propertyTests = testGroup "self round trips"
   -- sample rate and so does the number of samples to push through it:
   -- the front end costs O(fs^2), and 48 kHz is 35 times the work of
   -- 8 kHz.  These two cases exist to show the demodulator is
-  -- rate-independent, which a handful of payloads settles; the payload
-  -- space itself is covered at 8 kHz above, at a thirty-fifth of the
-  -- price.  Left at the default this one test was 73% of the suite.
+  -- rate-independent, which a handful of short payloads settles; the
+  -- payload space itself is covered at 8 kHz above, at a thirty-fifth of
+  -- the price.  Left at the default this one test was 73% of the suite,
+  -- and even capped it was the longest single case in a parallel run.
   , testProperty "bell103 answer 48 kHz clean" $ withMaxSuccess 8 $
-      \(Payload bs) -> roundTrip 48000 bell103Answer 0 4 bs
+      \(ShortPayload bs) -> roundTrip 48000 bell103Answer 0 4 bs
   , testProperty "bell103 answer 11025 Hz clean" $ withMaxSuccess 25 $
-      \(Payload bs) -> roundTrip 11025 bell103Answer 0 5 bs
+      \(ShortPayload bs) -> roundTrip 11025 bell103Answer 0 5 bs
   -- Amplitude 0.5 against sigma 0.2 of white noise at 8 kHz is about 5 dB
   -- SNR in the full band and an Eb/N0 of roughly 16 dB.  An ideal
   -- non-coherent FSK detector would have a bit error rate near 1e-9
@@ -360,27 +369,54 @@ detectTests = testGroup "detection" $
 
 -- | Two complete modems talking through attenuated, noisy audio in
 -- 20 ms blocks; text is queued on both sides once connected.
+-- | @maxT@ is a budget, not a duration: a call that has carried both
+-- texts has shown what it was asked to show, and the remaining thirty
+-- seconds of a V.32 call cost more than everything else in this suite
+-- put together.  'grace' keeps simulating for a while after the last
+-- expected byte, so trailing rubbish still has somewhere to appear.
 modemDuplex :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
-modemDuplex cfgO cfgA snr textO textA maxT = modemDuplexCut cfgO cfgA snr textO textA maxT (maxT * 2)
+modemDuplex cfgO cfgA snr textO textA maxT = modemDuplexFor (Just grace) cfgO cfgA snr textO textA maxT (maxT * 2)
+
+-- | Seconds of call to keep simulating after both directions have
+-- delivered everything they were given.
+grace :: Double
+grace = 2
 
 -- | As 'modemDuplex', but the answerer's audio stops at @cutAt@, the way
--- a far end that hangs up stops.
+-- a far end that hangs up stops.  This one runs the whole budget: what
+-- it is looking for is what arrives /after/ the text, so it cannot stop
+-- when the text is complete.
 modemDuplexCut :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
-modemDuplexCut cfgO cfgA snr textO textA maxT cutAt = go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False [] [] [] []
+modemDuplexCut = modemDuplexFor Nothing
+
+modemDuplexFor :: Maybe Double -> ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8] -> Double -> Double -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+modemDuplexFor stop cfgO cfgA snr textO textA maxT cutAt =
+  go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False Nothing [] [] [] []
   where
     fs = mcRate cfgO
     blk = 160 :: Int
     impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
-    go t so sa fromA fromO sentO sentA rxO rxA evO evA
-      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA)
+    go t so sa fromA fromO sentO sentA fullAt rxO rxA evO evA
+      | t >= maxT = out
+      | Just g <- stop, Just t0 <- fullAt, t - t0 >= g = out
       | otherwise =
           let queueO = if modemConnected so && not sentO then textO else []
               queueA = if modemConnected sa && not sentA then textA else []
               heard = if t >= cutAt then VS.replicate (VS.length fromA) 0 else fromA
               (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t heard) queueO
               (sa', audioA, bytesA, eA) = modemStep cfgA sa (impair 2 t fromO) queueA
-          in go (t + fromIntegral blk / fs) so' sa' audioA audioO (sentO || not (null queueO)) (sentA || not (null queueA))
-                (reverse bytesO ++ rxO) (reverse bytesA ++ rxA) (reverse eO ++ evO) (reverse eA ++ evA)
+              rxO' = reverse bytesO ++ rxO
+              rxA' = reverse bytesA ++ rxA
+              sentO' = sentO || not (null queueO)
+              sentA' = sentA || not (null queueA)
+              full = sentO' && sentA'
+                     && length rxO' >= length textA && length rxA' >= length textO
+              fullAt' = case fullAt of
+                          Just _ -> fullAt
+                          Nothing -> if full then Just t else Nothing
+          in go (t + fromIntegral blk / fs) so' sa' audioA audioO sentO' sentA' fullAt'
+                rxO' rxA' (reverse eO ++ evO) (reverse eA ++ evA)
+      where out = (reverse rxO, reverse rxA, reverse evO, reverse evA)
 
 -- | As 'modemDuplex', but each side also hears its own transmit coming
 -- back at it.  That is far-end echo: our signal reflected by the hybrid
@@ -398,7 +434,7 @@ modemDuplexEcho :: [(Double, Double)] -> ModemConfig -> ModemConfig -> Double
                 -> ([Word8], [Word8], [ModemEvent], [ModemEvent], Double, Double)
 modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
   go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0)
-     (replicate hist quiet) (replicate hist quiet) False False [] [] [] [] 0 0
+     (replicate hist quiet) (replicate hist quiet) False False Nothing [] [] [] [] 0 0
   where
     fs = mcRate cfgO
     blk = 160 :: Int
@@ -414,8 +450,11 @@ modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
           n0 = VS.length ext
       in VS.generate blk $ \i ->
            sum [ g * sampleAt ext (fromIntegral (n0 + i) - d) | (d, g) <- taps ]
-    go t so sa fromA fromO hO hA sentO sentA rxO rxA evO evA erO erA
-      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA, erO, erA)
+    -- the same budget-not-duration rule as 'modemDuplex', and for the
+    -- same reason: these are the most expensive calls in the suite
+    go t so sa fromA fromO hO hA sentO sentA fullAt rxO rxA evO evA erO erA
+      | t >= maxT = out
+      | Just t0 <- fullAt, t - t0 >= grace = out
       | otherwise =
           let queueO = if modemConnected so && not sentO then textO else []
               queueA = if modemConnected sa && not sentA then textA else []
@@ -423,11 +462,20 @@ modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
               heardA = VS.zipWith (+) fromO (echoNow hA)
               (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t heardO) queueO
               (sa', audioA, bytesA, eA) = modemStep cfgA sa (impair 2 t heardA) queueA
+              rxO' = reverse bytesO ++ rxO
+              rxA' = reverse bytesA ++ rxA
+              sentO' = sentO || not (null queueO)
+              sentA' = sentA || not (null queueA)
+              full = sentO' && sentA'
+                     && length rxO' >= length textA && length rxA' >= length textO
+              fullAt' = case fullAt of
+                          Just _ -> fullAt
+                          Nothing -> if full then Just t else Nothing
           in go (t + fromIntegral blk / fs) so' sa' audioA audioO
                 (drop 1 hO ++ [audioO]) (drop 1 hA ++ [audioA])
-                (sentO || not (null queueO)) (sentA || not (null queueA))
-                (reverse bytesO ++ rxO) (reverse bytesA ++ rxA) (reverse eO ++ evO) (reverse eA ++ evA)
+                sentO' sentA' fullAt' rxO' rxA' (reverse eO ++ evO) (reverse eA ++ evA)
                 (maybe erO (max erO) (modemEchoErle so')) (maybe erA (max erA) (modemEchoErle sa'))
+      where out = (reverse rxO, reverse rxA, reverse evO, reverse evA, erO, erA)
 
 -- | Like 'modemDuplex', but each side is offered @perBlock@ bytes of its
 -- text on every block once connected, rather than the whole of it in one
@@ -573,7 +621,7 @@ mnpModemTests = testGroup "MNP over the data pump"
     isMnpUp e = case e of { EvMnp (MnpUp {}) -> True; _ -> False }
 
 modemTests :: TestTree
-modemTests = testGroup "full modem duplex"
+modemTests = testGroup "full modem duplex" $
   [ testCase "a V.32bis call: Figure 4, then 9600 bit/s trellis coded, text both ways" $ do
       -- Two whole modems this time, not just the start-up machine: the
       -- V.32 exchange, the rate signals settling on the best rate both
@@ -587,50 +635,43 @@ modemTests = testGroup "full modem duplex"
         (case evA of (EvConnected V32 (V32Link Answer V32R9600T) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
-  , testCase "the echo canceller earns its place on a V.32 call" $ do
-      -- The same dispersive path Modec.Echo's own tests use.  What this
-      -- pins is that the canceller in a live call actually removes
-      -- something: it was wired in, and switched off, for as long as it
-      -- has existed -- the adapt flag hardcoded False, the reference
-      -- never fed once the call reached data, and the bulk delay the
-      -- start-up measures read from the config rather than the state.
-      -- Every one of those failed silently, and the tell is that the
-      -- return loss sat at exactly 0 dB.
-      --
-      -- It does not pin that a call survives echo.  It does not: see the
-      -- next case.
+  ] ++
+  -- How loud a reflection a 9600 bit/s call carries, on the same
+  -- dispersive path Modec.Echo's own tests use.  The first tap is the
+  -- hybrid's own return and the other two its dispersion; the gains run
+  -- from a quiet ATA to a badly matched one.
+  --
+  -- Two things at once.  That the text arrives at all is the call
+  -- surviving the echo.  That the return loss is a real number is the
+  -- canceller doing something: it was wired in, and switched off, for as
+  -- long as it had existed -- the adapt flag hardcoded False, the
+  -- reference never fed once the call reached data, the bulk delay the
+  -- start-up measures read from the config rather than the state -- and
+  -- every one of those failed silently, with the return loss sitting at
+  -- exactly 0 dB.
+  --
+  -- The reported loss rises with the echo rather than staying flat,
+  -- which is what it should do: it is measured against everything that
+  -- arrived, so a quiet echo leaves little to take out and reads as a
+  -- small number even when it is taking all of it out.
+  --
+  -- One call per gain rather than four in a loop: each is ten-odd
+  -- seconds of simulation, and tasty can only schedule what it can see.
+  [ testCase ("text survives a hybrid at " ++ show (round (20 * logBase 10 g) :: Int) ++ " dB") $ do
       let cfg r = defaultModemConfig 8000 r [V32]
-          path = [(200, 0.20), (203.5, 0.10), (209.2, 0.04)]
-          (_, _, evO, evA, erleO, erleA) =
+          path = [(200, g), (203.5, g / 2), (209.2, g / 5)]
+          (rxO, rxA, evO, evA, erleO, erleA) =
             modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
       assertBool ("originate events " ++ show evO)
         (case evO of (EvConnected V32 _ : _) -> True; _ -> False)
       assertBool ("answer events " ++ show evA)
         (case evA of (EvConnected V32 _ : _) -> True; _ -> False)
-      assertBool ("calling side return loss " ++ show erleO ++ " dB") (erleO > 12)
-      assertBool ("answering side return loss " ++ show erleA ++ " dB") (erleA > 8)
-
-  , testCase "text survives a hybrid from -26 dB to -10 dB" $ do
-      -- How loud a reflection a 9600 bit/s call carries.  The first tap
-      -- is the hybrid's own return and the other two its dispersion; the
-      -- gains run from a quiet ATA to a badly matched one.
-      --
-      -- The return loss the canceller reports rises with the echo rather
-      -- than staying flat, which is what it should do: it is measured
-      -- against everything that arrived, so a quiet echo leaves little to
-      -- take out and reads as a small number even when it is taking all
-      -- of it out.
-      let cfg r = defaultModemConfig 8000 r [V32]
-      forM_ [(0.05, 5), (0.10, 9), (0.20, 14), (0.30, 17)] $ \(g, wantErle) -> do
-        let path = [(200, g), (203.5, g / 2), (209.2, g / 5)]
-            (rxO, rxA, _, _, erleO, erleA) =
-              modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
-        assertEqual ("echo " ++ show g ++ ": answer to originate") textA rxO
-        assertEqual ("echo " ++ show g ++ ": originate to answer") textO rxA
-        assertBool ("echo " ++ show g ++ ": return loss " ++ show (erleO, erleA))
-          (erleO > wantErle && erleA > wantErle)
-
-  , testCase "V.8 picks V.32 out of a list, and the start-up follows without a second answer tone" $ do
+      assertEqual "answer to originate" textA rxO
+      assertEqual "originate to answer" textO rxA
+      assertBool ("return loss " ++ show (erleO, erleA))
+        (erleO > wantErle && erleA > wantErle)
+  | (g, wantErle) <- [(0.05, 5), (0.10, 9), (0.20, 14), (0.30, 17 :: Double)] ] ++
+  [ testCase "V.8 picks V.32 out of a list, and the start-up follows without a second answer tone" $ do
       -- The path a live V.32 call actually takes.  A modem configured for
       -- V.32 alone goes straight into Figure 4; one configured for V.32
       -- among others runs V.8 first, offers V.32 in its menu (Table 4
@@ -2345,105 +2386,6 @@ v32CallEvm cfgO cfgA maxT = go 0 (modemInit cfgO) (modemInit cfgA) quiet quiet N
                                              Just e -> Just (abs e)
                                              Nothing -> best)
 
--- Fuzz the trained V.32 receiver along each impairment axis and report
--- where it breaks, per rate.  A survey, not an assertion.
-v32Fuzz :: V32Rate -> [(String, Channel)] -> [(String, Int)]
-v32Fuzz r conds =
-  [ (nm, errs) | (nm, ch) <- conds
-  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
-        sig = applyChannel 8000 ch clean
-        got = v32DemodulateTrained 8000 Answering r preSyms sig
-        errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
-                       | o <- [0 .. 300] ] ]
-  where payload = prbs (11, 9) 4000
-
-v32FuzzWith :: (QamRxCfg -> QamRxCfg) -> V32Rate -> [(String, Channel)] -> [(String, Int)]
-v32FuzzWith tune r conds =
-  [ (nm, errs) | (nm, ch) <- conds
-  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
-        sig = applyChannel 8000 ch clean
-        got = v32DemodulateTrainedWith tune 8000 Answering r preSyms sig
-        errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
-                       | o <- [0 .. 300] ] ]
-  where payload = prbs (11, 9) 4000
-
-v32FuzzTests :: TestTree
-v32FuzzTests = testGroup "V.32 fuzz survey"
-  [ testCase "timing loop sweep" $ do
-      let tel = telephoneChannel 25
-          hard = [ ("jit 3@5", tel { chJitter = SineJitter 3 5 })
-                 , ("jit 5@2", tel { chJitter = SineJitter 5 2 })
-                 , ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
-                 , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
-                 , ("clock +1%", tel { chRateOffset = 0.01 })
-                 , ("clock +2%", tel { chRateOffset = 0.02 })
-                 , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
-                 , ("SNR 14", telephoneChannel 14) ]
-      forM_ [V32R4800, V32R9600] $ \r -> do
-        putStrLn ("=== " ++ show r)
-        forM_ [ (kp, ki) | kp <- [0.12, 0.25, 0.4], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) -> do
-          let res = v32FuzzWith (\c -> c { qrKp = kp, qrKi = ki }) r hard
-          putStrLn ("  kp=" ++ show kp ++ " ki=" ++ show ki ++ "  "
-                    ++ unwords [ take 11 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ') | (nm, e) <- res ])
-  , testCase "carrier loop sweep" $ do
-      let tel = telephoneChannel 25
-          hard = [ ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
-                 , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
-                 , ("jit 3@5", tel { chJitter = SineJitter 3 5 })
-                 , ("jit 2@2", tel { chJitter = SineJitter 2 2 })
-                 , ("clock +1%", tel { chRateOffset = 0.01 })
-                 , ("carrier +20", tel { chFreqOffsetHz = 20 })
-                 , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
-                 , ("SNR 14", telephoneChannel 14) ]
-          cell (nm, e) = take 14 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ')
-      forM_ [V32R4800, V32R9600T] $ \r -> do
-        putStrLn ("=== " ++ show r)
-        forM_ [ (kp, ki) | kp <- [0.03, 0.08, 0.15, 0.25], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) ->
-          putStrLn ("  thKp=" ++ show kp ++ " thKi=" ++ show ki ++ "  "
-                    ++ concatMap cell (v32FuzzWith (\c -> c { qrThKp = kp, qrThKi = ki }) r hard))
-  , testCase "loop trace" $ do
-      -- watch the timing loop's sps estimate and the decision error
-      -- through a clock offset, block by block
-      forM_ [ ("clock +1%", (telephoneChannel 25) { chRateOffset = 0.01 })
-            , ("clock -1%", (telephoneChannel 25) { chRateOffset = -0.01 })
-            , ("walk .02/5", (telephoneChannel 25) { chJitter = WalkJitter 0.02 5 }) ] $ \(nm, ch) -> do
-        let r = V32R4800
-            payload = prbs (11, 9) 4000
-            (clean, _) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
-            sig = applyChannel 8000 ch clean
-            p = v32Params 8000
-            cfg = v32RxCfg V32R4800
-            walk st k acc s
-              | VS.null s = reverse acc
-              | otherwise =
-                  let (c, rest) = VS.splitAt 800 s
-                      (st', _) = qamRxBlock p cfg c st
-                      row = (k, qamRxSps st', qamRxEvm st', qamRxFreq st' * 2400 / (2 * pi))
-                  in walk st' (k + 1) (row : acc) rest
-        putStrLn ("=== " ++ nm ++ " (nominal sps 3.3333)")
-        forM_ (walk (qamRxInit p cfg) (0 :: Int) [] sig) $ \(k, sps, evm, hz) ->
-          putStrLn ("  block " ++ show k ++ "  sps " ++ show (fromIntegral (round (sps * 10000)) / 10000 :: Double)
-                    ++ "  evm " ++ show (fromIntegral (round (evm * 1000)) / 1000 :: Double)
-                    ++ "  carrier " ++ show (fromIntegral (round hz) :: Double) ++ " Hz")
-  , testCase "survey" $
-      forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
-        let tel s = telephoneChannel s
-            axes =
-              [ ("SNR " ++ show s, tel s) | s <- [20, 16, 14, 12, 10, 8 :: Double] ] ++
-              [ ("sine jitter a=" ++ show a ++ " f=" ++ show f, (tel 25) { chJitter = SineJitter a f })
-              | (a, f) <- [(1, 2), (2, 2), (3, 2), (5, 2), (3, 5), (3, 10), (8, 1)] ] ++
-              [ ("walk jitter step=" ++ show st ++ " max=" ++ show mx, (tel 25) { chJitter = WalkJitter st mx })
-              | (st, mx) <- [(0.02, 5), (0.05, 10), (0.1, 20)] ] ++
-              [ ("slips every " ++ show e ++ "s of " ++ show k, (tel 25) { chJitter = Slips e k })
-              | (e, k) <- [(0.5, 2), (0.3, 4), (0.2, 8)] ] ++
-              [ ("clock " ++ show c, (tel 25) { chRateOffset = c }) | c <- [0.005, 0.01, 0.02, -0.01] ] ++
-              [ ("carrier " ++ show hz, (tel 25) { chFreqOffsetHz = hz }) | hz <- [10, 15, 20, -15] ] ++
-              [ ("delay dist " ++ show ms, (tel 25) { chDelayDist = ms }) | ms <- [1, 2, 3] ]
-        putStrLn ("=== " ++ show r)
-        forM_ (v32Fuzz r (map (\(n, c) -> (n, c)) axes)) $ \(nm, e) ->
-          putStrLn ("  " ++ take 30 (nm ++ repeat ' ') ++ (if e == 0 then "ok" else show e ++ " errors"))
-  ]
-
 v32StartTests :: TestTree
 v32StartTests = testGroup "V.32 start-up per Figure 4"
   [ testCase "the data pump carries bits between two of itself" $ do
@@ -2504,7 +2446,7 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, v32FuzzTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"

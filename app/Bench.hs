@@ -1,5 +1,10 @@
--- | Impairment sweep for the FSK modem: modulate a payload, push it
--- through a list of channel conditions, and report byte errors.
+-- | Impairment sweeps: modulate a payload, push it through a list of
+-- channel conditions, and report errors.
+--
+-- The default command sweeps the FSK and V.22 modems.  The @v32-@
+-- commands sweep the trained V.32 receiver and its two loops; they
+-- print tables and assert nothing, which is why they live here and not
+-- in the test suite.  A survey is a thing to read, not a thing to pass.
 module Main (main) where
 
 import Control.Monad (forM_)
@@ -12,9 +17,12 @@ import Modec.Channel
 import Modec.DSP
 import Modec.FSK
 import Modec.Metrics
+import Modec.QAM
 import Modec.Standards
 import Modec.Async
 import Modec.V22
+import Modec.V32
+import Modec.V32Pump
 
 data Opts = Opts
   { oRate    :: Double
@@ -32,12 +40,34 @@ optsP = Opts
   <*> option auto (long "timing-gain" <> value 0.5 <> showDefault)
   <*> strOption (long "window" <> value "rect" <> showDefault <> help "hann | rect")
 
+-- | The FSK sweep keeps the bare options it always had, so
+-- @modec-bench --channel answer@ still means what it used to; the V.32
+-- surveys hang off subcommands beside it.
+data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey
+
+cmdP :: Parser Cmd
+cmdP = hsubparser
+  (  command "v32-timing"  (info (pure V32Timing)  (progDesc "V.32: timing loop gains against the hard channels"))
+  <> command "v32-carrier" (info (pure V32Carrier) (progDesc "V.32: carrier loop gains against the hard channels"))
+  <> command "v32-trace"   (info (pure V32Trace)   (progDesc "V.32: the timing loop block by block through a clock offset"))
+  <> command "v32-survey"  (info (pure V32Survey)  (progDesc "V.32: every impairment axis, per rate"))
+  ) <|> (Fsk <$> optsP)
+
 payloadBytes :: Int -> Int -> [Word8]
 payloadBytes salt n = [fromIntegral ((i * 7919 + salt * 104729 + 13) `mod` 256) | i <- [1 .. n]]
 
 main :: IO ()
 main = do
-  o <- execParser (info (optsP <**> helper) (fullDesc <> progDesc "modec impairment sweep"))
+  c <- execParser (info (cmdP <**> helper) (fullDesc <> progDesc "modec impairment sweep"))
+  case c of
+    Fsk o      -> fskSweep o
+    V32Timing  -> v32TimingSweep
+    V32Carrier -> v32CarrierSweep
+    V32Trace   -> v32LoopTrace
+    V32Survey  -> v32Survey
+
+fskSweep :: Opts -> IO ()
+fskSweep o = do
   let fs = oRate o
       isV22 = oChannel o `elem` ["v22low", "v22high", "v22bislow", "v22bishigh"]
       is2400 = oChannel o `elem` ["v22bislow", "v22bishigh"]
@@ -115,3 +145,99 @@ main = do
         d = editDistance payload got
     printf "  %-62s %5d errors  (%5.1f %%)  rms %.3f\n" cname d (100 * fromIntegral d / fromIntegral (oBytes o) :: Double) (rms sig)
     VS.length sig `seq` return ()
+
+-- Fuzz the trained V.32 receiver along each impairment axis and report
+-- where it breaks, per rate.  A survey, not an assertion.
+v32Fuzz :: V32Rate -> [(String, Channel)] -> [(String, Int)]
+v32Fuzz = v32FuzzWith id
+
+v32FuzzWith :: (QamRxCfg -> QamRxCfg) -> V32Rate -> [(String, Channel)] -> [(String, Int)]
+v32FuzzWith tune r conds =
+  [ (nm, errs) | (nm, ch) <- conds
+  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+        sig = applyChannel 8000 ch clean
+        got = v32DemodulateTrainedWith tune 8000 Answering r preSyms sig
+        errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
+                       | o <- [0 .. 300] ] ]
+  where payload = prbs (11, 9) 4000
+
+v32TimingSweep :: IO ()
+v32TimingSweep = do
+  let tel = telephoneChannel 25
+      hard = [ ("jit 3@5", tel { chJitter = SineJitter 3 5 })
+             , ("jit 5@2", tel { chJitter = SineJitter 5 2 })
+             , ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
+             , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
+             , ("clock +1%", tel { chRateOffset = 0.01 })
+             , ("clock +2%", tel { chRateOffset = 0.02 })
+             , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
+             , ("SNR 14", telephoneChannel 14) ]
+  forM_ [V32R4800, V32R9600] $ \r -> do
+    putStrLn ("=== " ++ show r)
+    forM_ [ (kp, ki) | kp <- [0.12, 0.25, 0.4], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) -> do
+      let res = v32FuzzWith (\c -> c { qrKp = kp, qrKi = ki }) r hard
+      putStrLn ("  kp=" ++ show kp ++ " ki=" ++ show ki ++ "  "
+                ++ unwords [ take 11 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ') | (nm, e) <- res ])
+
+v32CarrierSweep :: IO ()
+v32CarrierSweep = do
+  let tel = telephoneChannel 25
+      hard = [ ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
+             , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
+             , ("jit 3@5", tel { chJitter = SineJitter 3 5 })
+             , ("jit 2@2", tel { chJitter = SineJitter 2 2 })
+             , ("clock +1%", tel { chRateOffset = 0.01 })
+             , ("carrier +20", tel { chFreqOffsetHz = 20 })
+             , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
+             , ("SNR 14", telephoneChannel 14) ]
+      cell (nm, e) = take 14 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ')
+  forM_ [V32R4800, V32R9600T] $ \r -> do
+    putStrLn ("=== " ++ show r)
+    forM_ [ (kp, ki) | kp <- [0.03, 0.08, 0.15, 0.25], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) ->
+      putStrLn ("  thKp=" ++ show kp ++ " thKi=" ++ show ki ++ "  "
+                ++ concatMap cell (v32FuzzWith (\c -> c { qrThKp = kp, qrThKi = ki }) r hard))
+
+-- Watch the timing loop's sps estimate and the decision error through a
+-- clock offset, block by block.
+v32LoopTrace :: IO ()
+v32LoopTrace =
+  forM_ [ ("clock +1%", (telephoneChannel 25) { chRateOffset = 0.01 })
+        , ("clock -1%", (telephoneChannel 25) { chRateOffset = -0.01 })
+        , ("walk .02/5", (telephoneChannel 25) { chJitter = WalkJitter 0.02 5 }) ] $ \(nm, ch) -> do
+    let r = V32R4800
+        payload = prbs (11, 9) 4000
+        (clean, _) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+        sig = applyChannel 8000 ch clean
+        p = v32Params 8000
+        cfg = v32RxCfg V32R4800
+        walk st k acc s
+          | VS.null s = reverse acc
+          | otherwise =
+              let (c, rest) = VS.splitAt 800 s
+                  (st', _) = qamRxBlock p cfg c st
+                  row = (k, qamRxSps st', qamRxEvm st', qamRxFreq st' * 2400 / (2 * pi))
+              in walk st' (k + 1) (row : acc) rest
+    putStrLn ("=== " ++ nm ++ " (nominal sps 3.3333)")
+    forM_ (walk (qamRxInit p cfg) (0 :: Int) [] sig) $ \(k, sps, evm, hz) ->
+      putStrLn ("  block " ++ show k ++ "  sps " ++ show (fromIntegral (round (sps * 10000)) / 10000 :: Double)
+                ++ "  evm " ++ show (fromIntegral (round (evm * 1000)) / 1000 :: Double)
+                ++ "  carrier " ++ show (fromIntegral (round hz) :: Double) ++ " Hz")
+
+v32Survey :: IO ()
+v32Survey =
+  forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
+    let tel s = telephoneChannel s
+        axes =
+          [ ("SNR " ++ show s, tel s) | s <- [20, 16, 14, 12, 10, 8 :: Double] ] ++
+          [ ("sine jitter a=" ++ show a ++ " f=" ++ show f, (tel 25) { chJitter = SineJitter a f })
+          | (a, f) <- [(1, 2), (2, 2), (3, 2), (5, 2), (3, 5), (3, 10), (8, 1)] ] ++
+          [ ("walk jitter step=" ++ show st ++ " max=" ++ show mx, (tel 25) { chJitter = WalkJitter st mx })
+          | (st, mx) <- [(0.02, 5), (0.05, 10), (0.1, 20)] ] ++
+          [ ("slips every " ++ show e ++ "s of " ++ show k, (tel 25) { chJitter = Slips e k })
+          | (e, k) <- [(0.5, 2), (0.3, 4), (0.2, 8)] ] ++
+          [ ("clock " ++ show c, (tel 25) { chRateOffset = c }) | c <- [0.005, 0.01, 0.02, -0.01] ] ++
+          [ ("carrier " ++ show hz, (tel 25) { chFreqOffsetHz = hz }) | hz <- [10, 15, 20, -15] ] ++
+          [ ("delay dist " ++ show ms, (tel 25) { chDelayDist = ms }) | ms <- [1, 2, 3] ]
+    putStrLn ("=== " ++ show r)
+    forM_ (v32Fuzz r axes) $ \(nm, e) ->
+      putStrLn ("  " ++ take 30 (nm ++ repeat ' ') ++ (if e == 0 then "ok" else show e ++ " errors"))
