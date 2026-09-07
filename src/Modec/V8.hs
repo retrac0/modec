@@ -53,6 +53,7 @@ module Modec.V8
   , ansamBlock
   ) where
 
+import Data.Maybe (listToMaybe)
 import Data.Bits (setBit, shiftL, testBit, (.&.))
 import Data.List (foldl', intercalate, sort)
 import Data.Word (Word8)
@@ -82,9 +83,7 @@ callFunctionCode cf = case cf of
   CfData          -> (False, True,  True)
 
 callFunctionOf :: (Bool, Bool, Bool) -> Maybe CallFunction
-callFunctionOf c = case [ f | f <- [minBound .. maxBound], callFunctionCode f == c ] of
-  (f : _) -> Just f
-  [] -> Nothing
+callFunctionOf c = listToMaybe [ f | f <- [minBound .. maxBound], callFunctionCode f == c ]
 
 -- | Modulation modes (Table 4), in item-number order.  The item number
 -- decides the outcome: "the indicated modulation category modulation
@@ -156,9 +155,7 @@ describeMenu m = intercalate ", " (fn ++ mods ++ extras)
 
 -- | The mode both menus offer with the lowest item number (7.4).
 commonModulation :: V8Menu -> V8Menu -> Maybe Modulation
-commonModulation a b = case [ m | m <- [minBound .. maxBound], m `elem` v8Mods a, m `elem` v8Mods b ] of
-  (m : _) -> Just m
-  [] -> Nothing
+commonModulation a b = listToMaybe [ m | m <- [minBound .. maxBound], m `elem` v8Mods a, m `elem` v8Mods b ]
 
 -- | Which signal a sequence is; they differ only in the synchronization
 -- bits (Table 1).

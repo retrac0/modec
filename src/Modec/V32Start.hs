@@ -46,6 +46,7 @@ module Modec.V32Start
   , v32Bits
   ) where
 
+import Data.Maybe (listToMaybe)
 import qualified Data.Vector.Storable as VS
 
 import Modec.DSP (Signal)
@@ -335,14 +336,12 @@ isConditioning ts =
 -- offset has to be tried.
 detectRate :: [Bool] -> Maybe RateSeq
 detectRate bits =
-  case [ a | off <- [0 .. 15]
-           , let w = take 32 (drop off (reverse (take 64 bits)))
-           , length w == 32
-           , Just a <- [decodeRateSeq (take 16 w)]
-           , Just b <- [decodeRateSeq (drop 16 w)]
-           , a == b ] of
-    (a : _) -> Just a
-    [] -> Nothing
+  listToMaybe [ a | off <- [0 .. 15]
+                  , let w = take 32 (drop off (reverse (take 64 bits)))
+                  , length w == 32
+                  , Just a <- [decodeRateSeq (take 16 w)]
+                  , Just b <- [decodeRateSeq (drop 16 w)]
+                  , a == b ]
 
 -- | Signal E, which §5.3.2 sends exactly once.
 --
@@ -358,13 +357,11 @@ detectRate bits =
 -- slicing four points and undoing Table 1 -- cannot read at all.
 detectE :: [Bool] -> Maybe RateSeq
 detectE bits =
-  case [ e | off <- [0 .. 15]
-           , let w = take 32 (drop off (reverse (take 64 bits)))
-           , length w == 32
-           , Just _ <- [decodeRateSeq (take 16 w)]
-           , Just e <- [decodeESeq (drop 16 w)] ] of
-    (e : _) -> Just e
-    [] -> Nothing
+  listToMaybe [ e | off <- [0 .. 15]
+                  , let w = take 32 (drop off (reverse (take 64 bits)))
+                  , length w == 32
+                  , Just _ <- [decodeRateSeq (take 16 w)]
+                  , Just e <- [decodeESeq (drop 16 w)] ]
 
 -- | Points for one of the repeating sources.
 srcPoints :: V32Start -> TxSrc -> Int -> (V32Start, [Point])
@@ -503,9 +500,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
                 , vsRev600 = revRearm (vsRev600 s)
                 , vsRev3000 = revRearm (vsRev3000 s)
                 , vsRevAt = [] }
-    revAt f = case [ i | (g, i) <- vsRevAt st0, g == f ] of
-      (i : _) -> Just i
-      [] -> Nothing
+    revAt f = listToMaybe [ i | (g, i) <- vsRevAt st0, g == f ]
     heard :: Double -> Double
     heard f = revLevel (case f of { 1800 -> vsRev1800 st0; 600 -> vsRev600 st0; _ -> vsRev3000 st0 })
     -- the calling modem watches whichever of the two AC sidebands is

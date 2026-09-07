@@ -58,6 +58,7 @@ module Modec.Progress
   , callProgressWith
   ) where
 
+import Data.Maybe (listToMaybe)
 import Data.List (dropWhileEnd, foldl', maximumBy)
 import Data.Ord (comparing)
 import Text.Printf (printf)
@@ -204,9 +205,7 @@ defaultProgressParams = ProgressParams
 sigOfFrame :: ProgressParams -> ToneFrame -> Maybe Sig
 sigOfFrame pp fr
   | peak < ppSquelch pp = Nothing
-  | otherwise = case [ s | (s, on, off, tol) <- candidates, fits on off tol ] of
-      (s : _) -> Just s
-      [] -> Nothing
+  | otherwise = listToMaybe [ s | (s, on, off, tol) <- candidates, fits on off tol ]
   where
     amp = toneAmp fr
     peak = VU.maximum (tfAmps fr)
@@ -362,10 +361,9 @@ alternation segs = case trimmed of
                                     (reverse trimmed)))
         ons = [ segDur s | s <- run, segSig s == Just sig ]
         offs = [ segDur s | s <- run, segSig s == Nothing ]
-    if null ons then Nothing else Just (sig, maybe (segStart first) segStart (headMay run), ons, offs)
+    if null ons then Nothing else Just (sig, maybe (segStart first) segStart (listToMaybe run), ons, offs)
   where
     trimmed = dropWhileEnd ((== Nothing) . segSig) segs
-    headMay xs = case xs of { (x : _) -> Just x; [] -> Nothing }
 
 mean :: [Double] -> Double
 mean [] = 0
@@ -408,9 +406,7 @@ cadenced pp segs = do
     then Nothing
     else if double
       then Just (ProgressEvent Ringback start (Just (onM, maximum offs)))
-      else case plain of
-        (k : _) -> Just (ProgressEvent k start (Just (onM, offM)))
-        [] -> Nothing
+      else fmap (\k -> ProgressEvent k start (Just (onM, offM))) (listToMaybe plain)
 
 -- | Three rising tones in the three special-information bands, back to
 -- back, each about a third of a second.

@@ -91,6 +91,7 @@ module Modec.Handshake
   , v22LinkAt
   ) where
 
+import Data.Maybe (listToMaybe)
 import Modec.Detect
 import Modec.DSP (fromDb)
 import Modec.Hdlc (hdlcFrameBits)
@@ -457,9 +458,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       { v8Call = v8Call peer
       , v8Mods = [ m | m <- v8Mods peer, m `elem` ourV8Mods ]
       , v8ModOctets = v8ModOctets peer }
-    pickMode offered = case [ m | m <- ourModes, m `elem` offered ] of
-      (m : _) -> Just m
-      [] -> Nothing
+    pickMode offered = listToMaybe [ m | m <- ourModes, m `elem` offered ]
     toneSince = case (dom, hsToneSince st) of
       (Just f, Just (g, since)) | f == g -> Just (f, since)
       (Just f, _) -> Just (f, t)
@@ -503,9 +502,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       (s : _) -> s
       [] -> V21
     -- which Bell mode a 2225 Hz answer tone should be answered with
-    bellChoice = case [ s | s <- modes, s `elem` [Bell212A, Bell103], not (s == Bell212A && hsTried212 st) ] of
-      (s : _) -> Just s
-      [] -> Nothing
+    bellChoice = listToMaybe [ s | s <- modes, s `elem` [Bell212A, Bell103], not (s == Bell212A && hsTried212 st) ]
     enter p = st' { hsPhase = p, hsPhaseAt = t }
     -- V.22 signal detectors
     u11Seen = case v22 of

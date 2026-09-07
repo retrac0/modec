@@ -80,6 +80,7 @@ module Modec.V32
   , bestCommonRate
   ) where
 
+import Data.Maybe (listToMaybe)
 import Data.Bits (testBit, (.|.))
 import Control.Monad (replicateM)
 import Data.List (foldl')
@@ -668,9 +669,7 @@ decodeSeq lead bs = case bs of
 -- otherwise this is a V.32 call and 9600 is the ceiling, which is Note 1
 -- of Table 5 doing its work.
 bestCommonRate :: RateSeq -> RateSeq -> Maybe V32Rate
-bestCommonRate ours theirs = case filter usable allV32Rates of
-  (r : _) -> Just r
-  [] -> Nothing
+bestCommonRate ours theirs = listToMaybe (filter usable allV32Rates)
   where
     bis = rateSeqV32bis ours && rateSeqV32bis theirs
     usable r = has ours r && has theirs r
