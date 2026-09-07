@@ -51,12 +51,12 @@ data EchoConfig = EchoConfig
   , ecLeak  :: !Double   -- ^ tap leakage per sample
   } deriving (Eq, Show)
 
--- | 96 taps is 12 ms at 8 kHz, which covers the dispersion a hybrid adds
--- around its bulk delay without trying to cover the delay itself: that
--- is what 'echoSetFar' is for, once the start-up has measured it.
+-- | 256 taps is 32 ms at 8 kHz -- far wider than the few milliseconds a
+-- hybrid smears its return over, because the bulk delay is not known
+-- nearly as well as it looks.  See 'echoSetFar'.
 defaultEchoConfig :: EchoConfig
 defaultEchoConfig = EchoConfig
-  { ecTaps = 96, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7 }
+  { ecTaps = 256, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7 }
 
 data EchoState = EchoState
   { esRef    :: !Signal   -- ^ what we have transmitted, oldest first
@@ -70,6 +70,7 @@ data EchoState = EchoState
   , esTaps   :: !Signal
   , esEchoP  :: !Double   -- ^ tracked power before cancellation
   , esResP   :: !Double   -- ^ and after
+  , esOn     :: !Bool     -- ^ whether subtracting is worth doing
   }
 
 echoInit :: EchoConfig -> EchoState
@@ -77,7 +78,7 @@ echoInit cfg = EchoState
   { esRef = VS.empty, esRefEnd = 0, esRxAt = 0
   , esDelay = ecDelay cfg
   , esTaps = VS.replicate (ecTaps cfg) 0
-  , esEchoP = 0, esResP = 0 }
+  , esEchoP = 0, esResP = 0, esOn = False }
 
 -- | Remember a block we have just transmitted.  Called at the end of a
 -- modem step, with the audio that step produced.
@@ -100,13 +101,29 @@ echoPush cfg blk st = st
 echoRefDelay :: EchoState -> Int
 echoRefDelay st = esRxAt st - esRefEnd st
 
--- | Point the filter at a new bulk delay.  The start-up measures the
--- round trip (NT and MT in Figure 4\/V.32) and that measurement is what
--- belongs here: the filter then has to cover only the dispersion a
--- hybrid adds around it, not the delay itself.  The taps are dropped,
--- because they described a different place on the line.
+-- | Point the filter at a bulk delay derived from the measured round
+-- trip, and start its taps again, because they described a different
+-- place on the line.
+--
+-- The window reaches /back/ from the measurement rather than sitting on
+-- it, and that is not slack for its own sake.  NT and MT time the far
+-- modem's answer, and an answer contains that modem's own processing
+-- delay; the reflection off its hybrid does not, so the echo returns
+-- sooner than the measurement says -- by however long the far end takes
+-- to respond, which is nothing this end can know.  Aiming the filter at
+-- the measurement therefore looks straight past the echo: with the round
+-- trip at 320 samples and a hybrid 200 samples away, every tap sits
+-- behind the thing it is meant to cancel.
+--
+-- It never reaches back past 'ecDelay', because a modem produces its
+-- transmit block only after consuming the receive block: the reference
+-- is always at least one block old, and asking for less than that gets
+-- zeros -- silently, and differently for different block sizes.
 echoSetFar :: Int -> EchoState -> EchoState
-echoSetFar d st = st { esDelay = max 0 d, esTaps = VS.map (const 0) (esTaps st) }
+echoSetFar d st = st
+  { esDelay = max (esDelay st) (d - 3 * n `div` 4)
+  , esTaps = VS.map (const 0) (esTaps st) }
+  where n = VS.length (esTaps st)
 
 -- | Cancel our own echo out of a received block.  @adapt@ says whether
 -- the far end is silent, which is the only time the taps may move: with
@@ -136,8 +153,8 @@ echoBlock cfg adapt rx st0 = (st', out)
       let k = (esRxAt st0 + i - d) - (esRefEnd st0 - refLen)
       in if k < 0 || k >= refLen then 0 else VS.unsafeIndex ref k
 
-    go !i !w !ep !rp acc
-      | i >= n = (w, ep, rp, reverse acc)
+    go !i !w !ep !rp !on acc
+      | i >= n = (w, ep, rp, on, reverse acc)
       | otherwise =
           let xs = VS.generate taps (\k -> refAt i (esDelay st0 + k))
               y = VS.sum (VS.zipWith (*) w xs)
@@ -151,15 +168,29 @@ echoBlock cfg adapt rx st0 = (st', out)
                      else w
               ep' = 0.99 * ep + 0.01 * (d * d)
               rp' = 0.99 * rp + 0.01 * (e * e)
-              -- Subtract only while subtracting is measurably helping,
-              -- and decide that per sample rather than per block, so the
-              -- answer does not depend on where the audio was cut.
-              helping = ep' > 1e-18 && rp' < 0.95 * ep'
-          in go (i + 1) w' ep' rp' ((if helping then e else d) : acc)
+              -- Whether to subtract is decided only while the far end is
+              -- silent, and held the rest of the time.
+              --
+              -- That is the one moment the question can be answered.
+              -- With the far end talking, the received signal is mostly
+              -- its signal, and cancelling even a perfect -14 dB echo
+              -- only takes the total power down to 0.96 of what came in
+              -- -- indistinguishable from noise on the measurement.  With
+              -- the far end quiet, what arrives /is/ the echo, and
+              -- cancelling it drives the residual down by tens of dB.
+              -- Figure 4's half-duplex windows exist so that an echo
+              -- canceller can train; they are equally the only place it
+              -- can find out whether it has.
+              on' | not adapt = on
+                  | ep' <= 1e-18 = on
+                  | rp' < 0.5 * ep' = True
+                  | rp' > 0.9 * ep' = False
+                  | otherwise = on
+          in go (i + 1) w' ep' rp' on' ((if on' then e else d) : acc)
 
-    (w1, ep1, rp1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) []
+    (w1, ep1, rp1, on1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esOn st0) []
     out = VS.fromList outs
-    st' = st0 { esTaps = w1, esEchoP = ep1, esResP = rp1
+    st' = st0 { esTaps = w1, esEchoP = ep1, esResP = rp1, esOn = on1
               , esRxAt = esRxAt st0 + n }
 
 -- | Echo return loss enhancement, in dB: how much of what arrived has

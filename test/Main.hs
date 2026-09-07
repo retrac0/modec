@@ -556,19 +556,25 @@ modemTests = testGroup "full modem duplex"
       assertBool ("calling side return loss " ++ show erleO ++ " dB") (erleO > 12)
       assertBool ("answering side return loss " ++ show erleA ++ " dB") (erleA > 8)
 
-  , testCase "and a light echo is carried end to end" $ do
-      -- Where a V.32 call through an echo actually stops today.  A
-      -- reflection at -26 dB is carried; the same path 6 dB louder is
-      -- not, and the canceller is not what decides it -- it reaches 18 dB
-      -- of return loss there and the call still fails, exactly as it
-      -- failed when the canceller was doing nothing at all.  Whatever
-      -- breaks 9600 through an echo is upstream of the cancelling.
+  , testCase "text survives a hybrid from -26 dB to -10 dB" $ do
+      -- How loud a reflection a 9600 bit/s call carries.  The first tap
+      -- is the hybrid's own return and the other two its dispersion; the
+      -- gains run from a quiet ATA to a badly matched one.
+      --
+      -- The return loss the canceller reports rises with the echo rather
+      -- than staying flat, which is what it should do: it is measured
+      -- against everything that arrived, so a quiet echo leaves little to
+      -- take out and reads as a small number even when it is taking all
+      -- of it out.
       let cfg r = defaultModemConfig 8000 r [V32]
-          path = [(200, 0.05), (203.5, 0.025), (209.2, 0.01)]
-          (rxO, rxA, _, _, _, _) =
-            modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
-      assertEqual "text from answer to originate" textA rxO
-      assertEqual "text from originate to answer" textO rxA
+      forM_ [(0.05, 5), (0.10, 9), (0.20, 14), (0.30, 17)] $ \(g, wantErle) -> do
+        let path = [(200, g), (203.5, g / 2), (209.2, g / 5)]
+            (rxO, rxA, _, _, erleO, erleA) =
+              modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
+        assertEqual ("echo " ++ show g ++ ": answer to originate") textA rxO
+        assertEqual ("echo " ++ show g ++ ": originate to answer") textO rxA
+        assertBool ("echo " ++ show g ++ ": return loss " ++ show (erleO, erleA))
+          (erleO > wantErle && erleA > wantErle)
 
   , testCase "a V.32bis call held down to 7200 bit/s, text both ways" $ do
       -- 7200 is V.32bis's addition below 9600, for a line that will not
@@ -2049,11 +2055,11 @@ echoTests = testGroup "echo cancellation"
       -- and retargeted nothing -- a trap for whoever called it next.
       -- Nothing in the modem calls it today; this is what keeps it
       -- honest for when something does.
-      let far = 400
+      let far = 900
           tx = gaussianNoise 7 24000 0.3
           rx = echoPath [(fromIntegral far, 0.25)] tx
-          -- a filter aimed at the default 160 cannot see an echo at 400,
-          -- since 96 taps only reach 255
+          -- a filter aimed at the default 160 cannot see an echo at 900,
+          -- since 256 taps only reach 415
           (_, stNear) = runEcho defaultEchoConfig 160 tx rx
           aimed cfg blk = go 0 (echoSetFar far (echoInit cfg)) []
             where
