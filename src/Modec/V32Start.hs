@@ -630,10 +630,18 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       ATrainR2 -> case detectRate (vsBits s) of
         Just r2 | Just rate <- bestCommonRate (vsOffer s) r2 ->
           let (ps, sc, q) = conditioningRun dir 1400
+          -- No adapting here, unlike ACond.  The calling modem is still
+          -- sending the rate sequence it started in its own conditioning
+          -- period and does not stop until E, so this is not one of
+          -- Figure 4's half-duplex windows: a canceller told to adapt
+          -- through it learns the far end's signal instead of its own
+          -- echo and ends up injecting rather than removing.  The taps
+          -- from ACond, when the caller really was silent, are the ones
+          -- to keep.
           in enter ACond2 s { vsPeer = Just r2, vsRate = Just rate
                             , vsQueue = ps, vsTxScr = sc, vsTxQ = q
                             , vsSrc = TxCoded (cycle (rateSeqBits (chosen rate)))
-                            , vsAdapt = True }
+                            , vsAdapt = False }
         Just _ -> enter (V32Fail "no common rate") s
         Nothing | tooLong 80000 s -> enter (V32Fail "no rate signal R2") s
                 | otherwise -> s

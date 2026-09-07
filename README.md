@@ -41,9 +41,10 @@ them cannot yet be put on a call at all. Expect to read the source.
 The first six are what `--mode` chooses between and what automode
 negotiates. The text telephone is `modec encode`/`decode` only: it
 carries characters rather than bytes, so it has no place in a byte pipe.
-V.32 has a coding layer, a start-up and a data pump that all pass their
-tests, and no echo canceller, which is what a full-duplex modem sharing
-one band with the far end needs before it can go on a line.
+V.32 has a coding layer, a start-up, a data pump and an echo canceller.
+The canceller reaches about 18 dB of return loss on a call, but that is
+not yet what decides whether a call through an echo carries data: see
+the limits.
 
 ## What works
 
@@ -131,16 +132,22 @@ current.
   characters they hit, and clock offsets beyond ±3 % fail.
 - 2400 bit/s: re-acquisition after a jitter-buffer slip is slow, tens of
   bytes each, and heavy sinusoidal jitter breaks the coherent path.
-- 9600 bit/s: delay distortion past 1 ms and in-band echo both break it
-  where 4800 rides through them. The echo is the canceller's job rather
-  than the pump's.
+- 9600 bit/s: delay distortion past 1 ms breaks it where 4800 rides
+  through.
+- Echo on a V.32 call: a reflection at -26 dB is carried end to end; the
+  same path 6 dB louder is not. The canceller is not what decides that.
+  It reaches 18 dB of return loss at the louder setting and the call
+  still fails, exactly as it failed when the canceller was wired in but
+  switched off and removing nothing at all. Whatever breaks 9600 through
+  an echo is upstream of the cancelling, and finding it is the next
+  piece of work.
 - Offline `modec detect` names V.23's backward channel but not its
   forward one: at 1200 bit/s no analysis window can both separate
   1300 Hz from the Bell 103 mark 30 Hz away and stay short enough for a
   continuous-phase carrier to add up over it.
 
-Not yet: an echo canceller, and so V.32 on a call, in automode or in the
-`--mode` list; V.34 or anything else above 9600; SIP/RTP spoken directly
+Not yet: V.32 in automode -- it is reached by `--mode v32` or by V.8
+choosing it, but it is not in the probe rotation; V.34 or anything else above 9600; SIP/RTP spoken directly
 rather than through baresip; ring detection (a sound card carries no
 ringing, so ATS0 answers on sustained line energy instead); a native
 PipeWire node (pw-cat child processes are used instead); V.22bis guard

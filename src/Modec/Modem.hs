@@ -15,6 +15,7 @@ module Modec.Modem
   , modemConnected
   , modemV32Evm
   , modemEchoErle
+  , modemV32Phase
   , modemTxCmd
   , modemV22Rx
   , modemMnp
@@ -369,6 +370,13 @@ modemV22Rx st = (msV22Rx st, msRxRate st)
 modemEchoErle :: ModemState -> Maybe Double
 modemEchoErle = fmap echoErle . msEcho
 
+-- | Where the V.32 start-up has got to, for tracing.  'Nothing' once it
+-- is over, or if it never ran.
+modemV32Phase :: ModemState -> Maybe (V32Phase, Bool)
+modemV32Phase st = case msMode st of
+  Starting32 s32 -> Just (v32Phase s32, v32EchoAdapt s32)
+  _ -> Nothing
+
 -- | The V.32 receiver's decision error, for tracing.
 modemV32Evm :: ModemState -> Maybe Double
 modemV32Evm st = case msMode st of
@@ -485,7 +493,7 @@ modemStep cfg st0 rxBlock newBytes =
     Starting32 s32 ->
       let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
           (s32', audio, status) = v32StartStep s32 rxClean
-          st1 = st { msEcho = aimEcho s32 s32' (pushEcho audio echo') }
+          st1 = st { msEcho = pushEcho audio echo' }
       in case status of
            V32Busy -> (st1 { msMode = Starting32 s32' }, audio, [], [])
            V32Connected r ->
@@ -666,11 +674,12 @@ modemStep cfg st0 rxBlock newBytes =
 
     pushEcho audio = fmap (echoPush (mcEcho cfg) audio)
 
-    -- The start-up times the round trip (NT and MT in Figure 4) and that
-    -- measurement is where the filter belongs: it then has to cover only
-    -- the dispersion a hybrid adds around the delay, not the delay
-    -- itself.  Applied on the edge where it first becomes known, because
-    -- 'echoSetFar' drops the taps.
-    aimEcho before after = case (v32RoundTrip before, v32RoundTrip after) of
-      (Nothing, Just d) -> fmap (echoSetFar d)
-      _ -> id
+    -- 'echoSetFar' is deliberately not called from here.  The obvious
+    -- reading -- that the round trip the start-up measures (NT and MT)
+    -- is where the echo lives -- does not survive being tried: NT and MT
+    -- time the far modem's turnaround, which is its processing delay as
+    -- much as the line's, and retargeting on it drops the taps in the
+    -- middle of the one window that was training them.  Measured, it
+    -- took the calling modem from 17 dB of return loss to none.  The
+    -- filter spans 96 taps either side of a fixed bulk delay instead,
+    -- which is 12 ms and covers what a hybrid smears.

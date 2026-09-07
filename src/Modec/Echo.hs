@@ -62,7 +62,11 @@ data EchoState = EchoState
   { esRef    :: !Signal   -- ^ what we have transmitted, oldest first
   , esRefEnd :: !Int      -- ^ global index just past the last transmitted sample
   , esRxAt   :: !Int      -- ^ global index of the next sample to be received
-  , esDelay  :: !Int      -- ^ bulk delay in force, samples
+  , esDelay  :: !Int      -- ^ bulk delay in force, samples.  'ecDelay'
+                          -- seeds it and 'echoSetFar' moves it, and it is
+                          -- this rather than the config that the filter
+                          -- reads -- otherwise 'echoSetFar' drops the taps
+                          -- and retargets nothing.
   , esTaps   :: !Signal
   , esEchoP  :: !Double   -- ^ tracked power before cancellation
   , esResP   :: !Double   -- ^ and after
@@ -135,7 +139,7 @@ echoBlock cfg adapt rx st0 = (st', out)
     go !i !w !ep !rp acc
       | i >= n = (w, ep, rp, reverse acc)
       | otherwise =
-          let xs = VS.generate taps (\k -> refAt i (ecDelay cfg + k))
+          let xs = VS.generate taps (\k -> refAt i (esDelay st0 + k))
               y = VS.sum (VS.zipWith (*) w xs)
               d = VS.unsafeIndex rx i
               e = d - y

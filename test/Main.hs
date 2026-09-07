@@ -341,10 +341,10 @@ modemDuplexCut cfgO cfgA snr textO textA maxT cutAt = go 0 (modemInit cfgO) (mod
 -- clean reflection.
 modemDuplexEcho :: [(Double, Double)] -> ModemConfig -> ModemConfig -> Double
                 -> [Word8] -> [Word8] -> Double
-                -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+                -> ([Word8], [Word8], [ModemEvent], [ModemEvent], Double, Double)
 modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
   go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0)
-     (replicate hist quiet) (replicate hist quiet) False False [] [] [] []
+     (replicate hist quiet) (replicate hist quiet) False False [] [] [] [] 0 0
   where
     fs = mcRate cfgO
     blk = 160 :: Int
@@ -360,8 +360,8 @@ modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
           n0 = VS.length ext
       in VS.generate blk $ \i ->
            sum [ g * sampleAt ext (fromIntegral (n0 + i) - d) | (d, g) <- taps ]
-    go t so sa fromA fromO hO hA sentO sentA rxO rxA evO evA
-      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA)
+    go t so sa fromA fromO hO hA sentO sentA rxO rxA evO evA erO erA
+      | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA, erO, erA)
       | otherwise =
           let queueO = if modemConnected so && not sentO then textO else []
               queueA = if modemConnected sa && not sentA then textA else []
@@ -373,6 +373,7 @@ modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
                 (drop 1 hO ++ [audioO]) (drop 1 hA ++ [audioA])
                 (sentO || not (null queueO)) (sentA || not (null queueA))
                 (reverse bytesO ++ rxO) (reverse bytesA ++ rxA) (reverse eO ++ evO) (reverse eA ++ evA)
+                (maybe erO (max erO) (modemEchoErle so')) (maybe erA (max erA) (modemEchoErle sa'))
 
 -- | Like 'modemDuplex', but each side is offered @perBlock@ bytes of its
 -- text on every block once connected, rather than the whole of it in one
@@ -532,22 +533,43 @@ modemTests = testGroup "full modem duplex"
         (case evA of (EvConnected V32 (V32Link Answer V32R9600T) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
-  , testCase "a V.32 call through a hybrid that echoes, text both ways" $ do
-      -- The same echo path Modec.Echo's own tests use: three taps at
-      -- fractional delays, about -14 dB relative to the wanted signal.
-      -- Every other duplex case here runs on a line with no echo, which
-      -- is not a line any V.32 modem will meet -- both directions share
-      -- the 1800 Hz carrier, so a reflection lands exactly where the
-      -- receiver is listening and no filter can separate it.
+  , testCase "the echo canceller earns its place on a V.32 call" $ do
+      -- The same dispersive path Modec.Echo's own tests use.  What this
+      -- pins is that the canceller in a live call actually removes
+      -- something: it was wired in, and switched off, for as long as it
+      -- has existed -- the adapt flag hardcoded False, the reference
+      -- never fed once the call reached data, and the bulk delay the
+      -- start-up measures read from the config rather than the state.
+      -- Every one of those failed silently, and the tell is that the
+      -- return loss sat at exactly 0 dB.
+      --
+      -- It does not pin that a call survives echo.  It does not: see the
+      -- next case.
       let cfg r = defaultModemConfig 8000 r [V32]
           path = [(200, 0.20), (203.5, 0.10), (209.2, 0.04)]
-          (rxO, rxA, evO, evA) = modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
+          (_, _, evO, evA, erleO, erleA) =
+            modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
       assertBool ("originate events " ++ show evO)
         (case evO of (EvConnected V32 _ : _) -> True; _ -> False)
       assertBool ("answer events " ++ show evA)
         (case evA of (EvConnected V32 _ : _) -> True; _ -> False)
+      assertBool ("calling side return loss " ++ show erleO ++ " dB") (erleO > 12)
+      assertBool ("answering side return loss " ++ show erleA ++ " dB") (erleA > 8)
+
+  , testCase "and a light echo is carried end to end" $ do
+      -- Where a V.32 call through an echo actually stops today.  A
+      -- reflection at -26 dB is carried; the same path 6 dB louder is
+      -- not, and the canceller is not what decides it -- it reaches 18 dB
+      -- of return loss there and the call still fails, exactly as it
+      -- failed when the canceller was doing nothing at all.  Whatever
+      -- breaks 9600 through an echo is upstream of the cancelling.
+      let cfg r = defaultModemConfig 8000 r [V32]
+          path = [(200, 0.05), (203.5, 0.025), (209.2, 0.01)]
+          (rxO, rxA, _, _, _, _) =
+            modemDuplexEcho path (cfg Originate) (cfg Answer) 30 textO textA 45
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
+
   , testCase "a V.32bis call held down to 7200 bit/s, text both ways" $ do
       -- 7200 is V.32bis's addition below 9600, for a line that will not
       -- carry 9600: the rate signal names it in a bit V.32 had reserved,
@@ -2019,6 +2041,35 @@ echoTests = testGroup "echo cancellation"
           (out, _) = runEcho defaultEchoConfig 160 tx rx
       assertEqual "the received signal is handed on untouched"
         (VS.toList rx) (VS.toList out)
+
+  , testCase "echoSetFar moves the delay the filter actually reads" $ do
+      -- 'esDelay' is the bulk delay in force and 'echoSetFar' is the only
+      -- thing that moves it.  The filter used to take its offsets from
+      -- 'ecDelay' in the config instead, so echoSetFar dropped the taps
+      -- and retargeted nothing -- a trap for whoever called it next.
+      -- Nothing in the modem calls it today; this is what keeps it
+      -- honest for when something does.
+      let far = 400
+          tx = gaussianNoise 7 24000 0.3
+          rx = echoPath [(fromIntegral far, 0.25)] tx
+          -- a filter aimed at the default 160 cannot see an echo at 400,
+          -- since 96 taps only reach 255
+          (_, stNear) = runEcho defaultEchoConfig 160 tx rx
+          aimed cfg blk = go 0 (echoSetFar far (echoInit cfg)) []
+            where
+              n = VS.length rx
+              go i st acc
+                | i >= n = (VS.concat (reverse acc), st)
+                | otherwise =
+                    let take_ = min blk (n - i)
+                        (st1, clean) = echoBlock cfg True (VS.slice i take_ rx) st
+                        st2 = echoPush cfg (VS.slice i take_ tx) st1
+                    in go (i + take_) st2 (clean : acc)
+          (_, stFar) = aimed defaultEchoConfig 160
+      assertBool ("aimed at 160 it finds nothing: " ++ show (echoErle stNear))
+        (echoErle stNear < 3)
+      assertBool ("aimed at 400 it cancels: " ++ show (echoErle stFar))
+        (echoErle stFar > 20)
   ]
 
 -- The start-up signals, as they actually go on the line.
