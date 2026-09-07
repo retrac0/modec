@@ -1,224 +1,152 @@
 # modec
 
 A software audio modem written from scratch in Haskell. Audio in and out
-via PipeWire (later SIP/RTP with G.711), bytes in and out as telnet
-streams. Targets, in order: Bell 103, V.21, V.22, V.22bis, V.8bis link
-establishment.
+via PipeWire, or through a SIP softphone; bytes in and out as a telnet
+stream, on stdio, or to a terminal. It dials, reads what the network
+answers with, negotiates a modulation with the far end, and carries data
+over it, with error correction if the far end has any.
 
-See [SURVEY.md](SURVEY.md) for the survey of existing work and the design
-plan, [docs/line-interface.md](docs/line-interface.md) for hooking a real
-modem to a sound card, [docs/negotiation.md](docs/negotiation.md) for how modes are detected and
-negotiated, [docs/sip-options.md](docs/sip-options.md) for the VoIP/SIP plan,
-[docs/voipms.md](docs/voipms.md) for dialling out through voip.ms, and [docs/recordings/](docs/recordings/) for recorded handshakes
-with an annotated timeline.
+- [SURVEY.md](SURVEY.md) -- existing work, and the design plan
+- [docs/negotiation.md](docs/negotiation.md) -- how modes are detected and negotiated
+- [docs/mnp.md](docs/mnp.md), [docs/mnp-bench.md](docs/mnp-bench.md) -- error correction, and what is confirmed against real hardware
+- [docs/line-interface.md](docs/line-interface.md) -- hooking a real modem to a sound card
+- [docs/sip-options.md](docs/sip-options.md), [docs/voipms.md](docs/voipms.md) -- why the SIP path is built this way, and dialling out through voip.ms
+- [docs/robustness.md](docs/robustness.md) -- what recorded calls survive when the simulator degrades them
+- [docs/recordings/](docs/recordings/) -- recorded handshakes, with an annotated timeline
 
-## Status
+## Pre-alpha
 
-- Bell 103, V.21 and V.23 duplex asynchronous FSK modulator and
-  demodulator,
-- Receiver: band-pass prefilter, O(n) prefix-sum tone correlators,
-  adaptive slicer, UART-style framer with sub-sample start-edge location,
-  one timing correction per bit boundary, integrate-and-dump decisions and
-  a start-bit depth check over the middle 60 % of the bit (rejects the
-  switch-on transients of a strong adjacent channel).
-  Error free in the bench down to 6 dB SNR, ±3 % clock offset, ±30 Hz
-  carrier offset, jitter, slips and +20 dB adjacent channel.
-- Transmitter: continuous-phase FSK with transmit band limiting.
-- Channel simulator (`Modec.Channel`): telephone band-pass, AWGN by SNR,
-  clock offset, sinusoidal / random-walk / slip jitter, frequency offset,
-  dropouts, echo, clipping, hum, DC, level; deterministic from a seed.
-- Tone bank and detection (`Modec.Detect`): per-20 ms tone amplitudes,
-  dominant-tone runs, offline FSK standard/channel identification.
-- V.23 duplex (`--mode v23`): 1200 bit/s from the answering modem on
-  1300/2100 Hz, 75 bit/s back from the caller on 390/450 Hz. The only
-  asymmetric mode here, and the one viewdata boards answer with. Calling
-  one needs nothing special -- the 1300 Hz forward mark is unambiguous --
-  but answering one means measuring 390 Hz, which is one bin from the
-  V.8bis CRe tone at 400 Hz, so a V.23 answerer trades V.8bis for it
-  (`withModes` does the swap). Offline `modec detect` names the backward
-  channel but not the forward one: at 1200 bit/s no analysis window can
-  both separate 1300 Hz from the Bell 103 mark 30 Hz away and stay short
-  enough for a continuous-phase carrier to add up over it.
-- Text telephone, 5-bit Baudot (`--tty45` / `--tty50`, `Modec.Baudot`):
-  the TTY/TDD line deaf and hard-of-hearing users have had on the PSTN
-  since 1964, ITU-T V.18 Annex A and normatively ANSI/TIA-825. 1400 Hz
-  mark, 1800 Hz space, 45.45 baud (50 outside North America), one start
-  bit, five data bits and at least one and a half stop bits. Offline
-  `encode`/`decode` carry text, not bytes: `Modec.Baudot` holds V.18
-  Table A.1 and the ASCII folding of Table A.2, tracks the LTRS/FIGS
-  shift, opens with LTRS and re-sends the shift every 72 characters, and
-  deliberately does *not* unshift on space -- that is the RTTY
-  convention, and minimodem's `tdd` mode applies it by default, so a
-  cross-check against minimodem needs `-u 0`.
-  Text is exact through the telephone channel from 30 dB SNR down to
-  4 dB at both rates. The 45.45 and 50 baud lines are separate modes,
-  not a tolerance: 10 % apart, where this family of receivers gives up
-  around 3 %.
-  Validated against minimodem 0.24 in both directions at both rates:
-  its `tdd` preset on its own defaults reads 35 of 35 characters from
-  our transmitter with the clock 0.0 % fast, and we read its transmitter
-  byte for byte including CR and LF. Two findings came out of that.
-  We were sending V.18's *minimum* of 1.5 stop bits, which minimodem's
-  preset requires 2.0 of -- it lost 3 characters in 35 and read the
-  clock 3.9 % fast -- so the transmitter now sends 2 and the receiver
-  still asks for no more than a mark stop bit, since a far end sending
-  1.5 is correct. And minimodem 0.24 applies unshift-on-space
-  unconditionally (the `-u` switch does not exist in that release), so
-  after a space it stops re-sending FIGS: `HELLO GA 50 BAUD SK` comes
-  back from it as `HELLO GA 50 ?-7$ (`, which is precisely the figures
-  column. V.18, TIA-825, Asterisk and spandsp all agree there is no
-  unshift-on-space, and real TDD traffic depends on it -- `GA 555 1212`
-  has to stay in figures across its spaces -- so this is one to know
-  about rather than one to match.
-- The carrierless receiver (`fskBurstDeframer`): a text telephone sends
-  no carrier at all between characters, so a burst can begin with the
-  start bit itself and there is no idle mark to hunt in. `fskDeframer`
-  loses a third of the characters of a clean burst on that alone, so
-  this is a sibling rather than a flag on it, which also keeps five
-  measured and tuned modes out of the blast radius. It acquires on a
-  silence-to-space onset as well as on a mark-to-space crossing, and it
-  decides carrier on whether the band holds a *tone* -- the mean of
-  |decide| is one half on noise whatever the noise power, and one on a
-  tone -- rather than on energy against a threshold, which cannot be
-  made to work: every version of a tracked noise floor either latches on
-  after one spike or seeds itself shut. Energy still decides whether a
-  character already under way has a line to run on, because |decide|
-  dips at every bit transition. Getting those two roles the wrong way
-  round turned 30 characters into 55.
-- Call establishment (`Modec.Handshake`): V.25 answer sequence with
-  Bell 103, V.21, V.23, Bell 212A, V.22 and V.22bis on both sides, verified by
-  duplex simulations in the test suite. `--mode` chooses which of them
-  the modem will negotiate, in order of preference; see
-  [docs/negotiation.md](docs/negotiation.md) for the decision tree and a
-  walkthrough of what happens when each kind of modem calls in.
-- Live modem (`Modec.Modem`, `modec modem`): audio in and out through
-  PipeWire (`pw-cat`) or raw 8 kHz s16le pipes, data through a telnet
-  server or client (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
-  escaped) or stdio. Automode on both ends. `scripts/smoke-loopback.sh`
-  cross-connects two instances through FIFOs and pushes text both ways.
-- Bell 212A: the V.22 data pump and handshake timings announced with the
-  2225 Hz Bell answer tone instead of unscrambled binary 1, no guard tone
-  and no 2400 bit/s rate, exactly the substitution V.22 §6.3.1.1 notes. It
-  shares the Bell 103 probe tone, and the caller's reply tells the two
-  apart.
-- V.22 / V.22bis data pump (`Modec.V22`): 600 Bd on 1200/2400 Hz, RRC
-  75 % shaping, 1 + x^-14 + x^-17 scrambler, Gardner timing recovery.
-  1200 bit/s uses differential 4-PSK decisions; 2400 bit/s adds a coherent
-  path: AGC, decision-directed carrier phase/frequency loop (frequency
-  fed forward from the differential detector during training), a 15-tap
-  T/2 LMS equaliser, and 16-way decisions on the Figure 2/V.22bis
-  constellation in a quadrant-rotated frame. Handshake signal detectors
-  for unscrambled ones, S1 and scrambled ones at either rate. Error free
-  through the simulator: 1200 bit/s down to 8 dB SNR, 2400 bit/s down to
-  12 dB, ±7 Hz carrier offset, ±0.5 % clock offset, 3 ms delay distortion,
-  echo, +30 dB adjacent channel. Validated against spandsp's V.22bis test
-  program at both rates: handshake signals recognised in order, BERT data
-  decodes with zero PRBS-11 recurrence failures.
-- V.22/V.22bis call establishment (§6.3, including the S1 exchange, the
-  270 ms rate switch and the 32-ones completion) in the handshake and
-  the live modem. Automode probes V.22 first, then V.21, then Bell 103,
-  accepts a Bell 103 caller at any point, and falls back to 1200 bit/s
-  with a V.22-only peer. `--mode v22` disables 2400 on our side.
-- V.8bis capabilities exchange (`Modec.V8bis`, `Modec.Hdlc`): after the
-  billing delay the answerer sends CRe (dual tone 1375 + 2002 Hz, then
-  400 Hz), a V.8bis caller replies with ESr and a CL message over V.21
-  (HDLC frames with the ISO 3309 FCS, synchronous 300 bit/s), the answerer
-  selects the best common mode with MS, and the V.25 start-up follows with
-  the roles reversed as §9.9.3 requires (the MS receiver becomes the
-  answering modem). Peers without V.8bis get the classic start-up after
-  3 s. `--no-v8bis` skips it.
-- Call progress tones (`Modec.Progress`, `modec progress`): dial tone,
-  ringing, busy, congestion, the fax calling tone, the answer tone and
-  the special information tone that introduces a recorded announcement.
-  Frames of 60 ms name which tones are sounding; the cadence of those
-  frames names what they mean, which is the only thing that can, since
-  ITU-T E.180 country practice is one 425 Hz tone for dial tone,
-  ringing, busy and congestion alike and only the rhythm separates
-  them. North America's own pairs (350+440, 440+480, 480+620) and the
-  UK's double ring are read as well. A call modec places listens until
-  the modems connect and reports what it heard; busy, congestion and a
-  special information tone hang the call up with BUSY, since all three
-  mean the call was refused. `--ignore-busy` stays on the line instead.
-  Robust to 3 dB SNR and to 30 dB below full scale. Across the 221
-  recorded calls in `recordings/` it reports 36 ringings and 159 answer
-  tones and not one busy: the single false positive it started with was
-  a stretch of speech that produced two bursts near 400 Hz with the
-  spacing of congestion, which is why busy and congestion ask for a
-  third burst where ringing is content with two. The three segments of
-  a special information tone are reported as measured, not named:
-  Telcordia's table gives each combination of frequencies and durations
-  a meaning, the published copies of it disagree with one another, and
-  nothing here has yet heard a real one to check a name against.
-- DTMF detection (`Modec.Dtmf`, `modec dtmf`): the eight-Goertzel block
-  receiver of ITU-T Q.24, with its level, twist, relative-peak and
-  fraction-of-total-power tests. The last of those is what rejects
-  speech, since a vowel really does have energy at 770 and 1336 Hz but
-  spends most of its power elsewhere. How long a tone lasted is
-  measured rather than counted in blocks, and has to be: Q.24 wants
-  40 ms accepted and 23 ms rejected, which are 1.3 blocks apart, so
-  whatever number of blocks is demanded, one of the two requirements
-  fails at some alignments of the tone against the block grid. The
-  Goertzel is linear in coverage, so summing a run's levels and
-  dividing by the largest of them measures the tone to a few
-  milliseconds, and both requirements then hold at every alignment.
-  Digits survive the telephone channel to 3 dB SNR.
-- Hayes AT command mode (`Modec.Hayes`, `--hayes`): ATD (digits dialled as
-  DTMF, then originate), ATA, ATH, ATO, ATZ, AT&F, ATE/V/Q, ATI, ATS0
-  (auto-answer on a sustained calling signal), "+++" with guard times;
-  result codes OK, CONNECT 300/1200/2400, RING, NO CARRIER, BUSY, ERROR.
-  `scripts/smoke-hayes.sh` drives two instances through a full
-  dial/answer/data/escape/hang-up cycle over telnet.
-- SIP calls through baresip (`Modec.Baresip`, `--sip HOST:PORT`): modec
-  drives baresip's `ctrl_tcp` module (netstring-framed JSON) and maps
-  Hayes commands to it: ATD dials `sip:NUMBER@--sip-domain` (or a full
-  URI), ATA accepts, ATH hangs up, an incoming call rings the DTE, and the
-  modem starts in the right role when baresip reports the call established.
-  Audio reaches the softphone through a PipeWire loopback pair created by
-  `--audio-sip-loop` (see `docs/baresip/` for the baresip configuration).
-  `scripts/smoke-sip.sh` runs the whole control path against a fake
-  baresip pair, and [docs/voipms.md](docs/voipms.md) walks through a real
-  provider.
-- MNP error correction (`Modec.Mnp`, `Modec.MnpFrame`, `--mnp`): classes 2,
-  3 and 4 of ITU-T V.42 (10/96) Annex A, which is MNP de-branded. Frames
-  the data, checks it with CRC-16/ARC or the HDLC check sequence, and asks
-  again for what the line damaged; go-back-N with a credit window, the
-  timers of A.7.5, and both of A.7.2.2's fallbacks, including the silent
-  one that carries on unprotected when nothing answers. Class 3 drops the
-  start and stop bits between the modems, worth 21 % of the line on a
-  256-octet frame and 31 % on a 16-octet one; class 4 shortens the headers
-  and sizes the frames to the line. Through the simulator it delivers every
-  byte where the bare link is damaging 3 % of them, and comes up at 4 dB
-  where better than one byte in ten arrives damaged. See
-  [docs/mnp.md](docs/mnp.md), and
-  [docs/mnp-bench.md](docs/mnp-bench.md) for what is confirmed against real
-  hardware, what is not, and the order to test it in on the bench.
-- One command to place a call: `modec dial NUMBER` starts baresip if it
-  is not already up, finds the SIP domain in `~/.baresip/accounts`, dials,
-  and hands the call to the terminal in raw mode. `--listen PORT` puts it
-  on telnet instead, `--stay` keeps the AT prompt when the call ends.
-- Per-call recordings: every call, dialled or answered, writes
-  `recordings/<date>-<number>.wav` alongside a `.log` of what the modem
-  made of it, stamped in seconds from the start of the call, and a line
-  in `recordings/calls.log`. `--record-dir` moves them, `--no-record`
-  turns them off.
-- Session recording: `--record-rx` and `--record-tx` write everything
-  heard and sent to WAV files, which `modec probe` and `modec detect` read
-  back. The length fields are refreshed twice a second, so a recording is
-  usable even if the process is killed mid-call.
-- WAV reader (PCM 8/16/24/32, float 32) and 16-bit mono writer.
+This is pre-alpha software and the version number is honest. Nothing is
+stable: interfaces, subcommands and option names change from commit to
+commit, and there is no release, no packaging and no compatibility
+promise. What has been measured is marked below as measured -- through
+the channel simulator, against minimodem and spandsp, or over recorded
+calls -- and the rest has met nothing but itself. Several modulations
+here have never carried a byte over a real telephone line, and one of
+them cannot yet be put on a call at all. Expect to read the source.
 
-Known limits: V.21 tolerates an adjacent channel up to about +25 dB (its
-channels are only 470 Hz apart); Bell 103 to beyond +30 dB. Dropouts lose
-the characters they hit. Clock offsets beyond ±3 % fail.
+## Modulations
 
-Known 2400 bit/s limits: re-acquisition after jitter-buffer slips is slow
-(each slip costs tens of bytes) and heavy sinusoidal jitter breaks the
-coherent path.
+| Standard | Rate | Line signal | On a call |
+| --- | --- | --- | --- |
+| Bell 103 | 300 bit/s duplex | FSK, 1070/1270 Hz calling, 2025/2225 Hz answering | yes |
+| V.21 | 300 bit/s duplex | FSK, 980/1180 Hz (L), 1650/1850 Hz (H) | yes |
+| V.23 | 1200/75 bit/s asymmetric | FSK, 1300/2100 Hz forward, 390/450 Hz backward | yes |
+| Bell 212A | 1200 bit/s duplex | 600 Bd differential 4-PSK, 1200/2400 Hz, Bell answer tone | yes |
+| V.22 | 1200 bit/s duplex | 600 Bd differential 4-PSK, 1200/2400 Hz | yes |
+| V.22bis | 2400 bit/s duplex | 600 Bd 16-QAM on the same carriers | yes |
+| V.18 Annex A (TTY/TDD) | 45.45 or 50 baud half duplex | FSK, 1400/1800 Hz, 5-bit Baudot text | offline only |
+| V.32 | 4800 and 9600 bit/s, plain and trellis coded | 2400 Bd QAM on 1800 Hz | bench only |
 
-Not yet: SIP/RTP, ring detection (a sound card carries no ringing; ATS0
-answers on sustained line energy instead), native PipeWire node (pw-cat
-child processes are used instead), V.22bis guard tone by default, V.8bis
-MR/ESi-initiated transactions and the V.8 start-up variants.
+The first six are what `--mode` chooses between and what automode
+negotiates. The text telephone is `modec encode`/`decode` only: it
+carries characters rather than bytes, so it has no place in a byte pipe.
+V.32 has a coding layer, a start-up and a data pump that all pass their
+tests, and no echo canceller, which is what a full-duplex modem sharing
+one band with the far end needs before it can go on a line.
+
+## What works
+
+Measured through the channel simulator (`Modec.Channel`: telephone
+band-pass, AWGN by SNR, clock and carrier offset, sinusoidal /
+random-walk / slip jitter, dropouts, echo, clipping, hum, level, all
+deterministic from a seed). Error free means no byte in the payload
+wrong, not a bit error rate.
+
+| Mode | Error free through the simulator | Cross-checked against |
+| --- | --- | --- |
+| Bell 103, V.21, V.23 | 6 dB SNR, ±3 % clock, ±30 Hz carrier, jitter, slips, +20 dB adjacent channel | minimodem fixtures (Bell 103, V.21) |
+| V.18 TTY, 45.45 and 50 baud | 4 dB SNR, text exact | minimodem 0.24, both directions, both rates |
+| Bell 212A, V.22 | 8 dB SNR | spandsp's V.22bis test program |
+| V.22bis | 12 dB SNR, ±7 Hz carrier, ±0.5 % clock, 3 ms delay distortion, echo, +30 dB adjacent channel | spandsp, BERT with no PRBS-11 failure |
+| V.32 4800 | 12 dB SNR, and everything else the simulator offers, echo included | the Recommendation's own test vectors, on the coding layer |
+| V.32 9600 | 18 dB SNR, 16 dB trellis coded, ±7 Hz carrier, ±0.5 % clock | ditto |
+| MNP 2, 3 and 4 | every byte delivered where the bare link damages 3 % of them; links up at 4 dB | — |
+| DTMF | digits to 3 dB SNR | Q.24's own accept and reject limits |
+| Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
+
+## Protocols and signal path
+
+- **FSK** (`Modec.FSK`): continuous-phase transmitter with band
+  limiting; receiver of band-pass prefilter, O(n) prefix-sum tone
+  correlators, adaptive slicer and a UART framer that locates the start
+  edge to a fraction of a sample. `fskBurstDeframer` is its sibling for
+  the carrierless modes, where a burst can open with the start bit and
+  there is no idle mark to hunt in.
+- **V.22 pump** (`Modec.V22`): 600 Bd, RRC 75 % shaping, the
+  1 + x^-14 + x^-17 scrambler, Gardner timing recovery; differential
+  4-PSK at 1200 bit/s, and at 2400 a coherent path of AGC,
+  decision-directed carrier loop and a 15-tap T/2 LMS equaliser.
+- **V.32** (`Modec.V32`, `Modec.V32Pump`) on `Modec.QAM`, which is the
+  V.22 receiver with baud, carrier, shaping, tap count, loop gains and
+  constellation lifted out into arguments. The coding layer is free of
+  any sample rate, so its tables can be read against the Recommendation
+  with no DSP in the way.
+- **Call establishment** (`Modec.Handshake`): the V.25 answer sequence
+  and the fallback ladder, V.22 §6.3 with the S1 exchange and the 270 ms
+  rate switch, both roles, verified by duplex simulation.
+  `--mode` says which modes to negotiate and in what order;
+  [docs/negotiation.md](docs/negotiation.md) has the decision tree.
+- **V.8 and V.8bis** (`Modec.V8`, `Modec.V8bis`): ANSam and the CM/JM/CJ
+  menus (`--v8`); CRe, ESr, CL and MS over V.21 HDLC, with the roles
+  reversed for the start-up as §9.9.3 requires (`--no-v8bis` skips it).
+  A peer with neither gets the classic start-up after 3 s.
+- **Listening to the line** (`Modec.Progress`, `Modec.Dtmf`): 60 ms
+  frames name which tones are sounding, and their cadence names what it
+  means, which in most of the world is the only thing that can. Busy,
+  congestion and a special information tone hang the call up with BUSY
+  unless `--ignore-busy`. DTMF is Q.24's eight Goertzels, with the
+  duration of a tone measured rather than counted in blocks.
+- **MNP** (`Modec.Mnp`, `--mnp`): classes 2 to 4 of ITU-T V.42 (10/96)
+  Annex A. Go-back-N with a credit window, the timers of A.7.5, and both
+  of A.7.2.2's fallbacks including the silent one. Class 3 drops the
+  start and stop bits between the modems, worth a fifth of the line;
+  class 4 sizes the frames to it. See [docs/mnp.md](docs/mnp.md) and
+  [docs/mnp-bench.md](docs/mnp-bench.md).
+- **The line** (`Modec.Modem`, `Modec.Pipewire`, `Modec.Baresip`): audio
+  through `pw-cat` or raw 8 kHz s16le pipes, or through baresip for SIP;
+  data over telnet (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
+  escaped), stdio, or a terminal in raw mode. Hayes AT on the DTE side
+  (`--hayes`: ATD, ATA, ATH, ATO, ATZ, AT&F, ATS0, "+++" with its guard
+  times, and the CONNECT / RING / NO CARRIER / BUSY result codes), and
+  `modec dial NUMBER` for the whole thing in one command.
+- **Everything is recorded**: each call writes a WAV, a log of what the
+  modem made of it stamped from the start of the call, and a line in
+  `recordings/calls.log`; `--record-rx` / `--record-tx` keep a whole
+  session, and `modec probe`, `detect`, `progress` and `dtmf` read them
+  back through the WAV reader (PCM 8, 16, 24 and 32 bit, and float 32).
+  Length fields are refreshed twice a second, so a process killed
+  mid-call still leaves a playable file.
+
+Why each of these is built the way it is -- why the burst receiver
+decides carrier on whether the band holds a tone rather than on energy,
+why the progress window is 60 ms and not 100, what minimodem 0.24 does
+to a figures shift -- is in the module headers, which is where it stays
+current.
+
+## Limits
+
+- FSK: V.21 tolerates an adjacent channel to about +25 dB, its channels
+  being only 470 Hz apart; Bell 103 to beyond +30 dB. Dropouts lose the
+  characters they hit, and clock offsets beyond ±3 % fail.
+- 2400 bit/s: re-acquisition after a jitter-buffer slip is slow, tens of
+  bytes each, and heavy sinusoidal jitter breaks the coherent path.
+- 9600 bit/s: delay distortion past 1 ms and in-band echo both break it
+  where 4800 rides through them. The echo is the canceller's job rather
+  than the pump's.
+- Offline `modec detect` names V.23's backward channel but not its
+  forward one: at 1200 bit/s no analysis window can both separate
+  1300 Hz from the Bell 103 mark 30 Hz away and stay short enough for a
+  continuous-phase carrier to add up over it.
+
+Not yet: an echo canceller, and so V.32 on a call, in automode or in the
+`--mode` list; V.34 or anything else above 9600; SIP/RTP spoken directly
+rather than through baresip; ring detection (a sound card carries no
+ringing, so ATS0 answers on sustained line energy instead); a native
+PipeWire node (pw-cat child processes are used instead); V.22bis guard
+tone by default; V.8bis MR/ESi-initiated transactions and the V.8
+start-up variants beyond CM/JM/CJ. [SURVEY.md](SURVEY.md) §7 has these
+in the order they cost least.
 
 ## Usage
 
@@ -246,6 +174,8 @@ cabal run modec -- modem --originate --audio-pipewire --connect bbs.example.org 
 cabal run modec -- modem --answer --audio-pipewire --pw-in usb --mode bell103 --no-handshake --listen 2323
 # only the North American modes, best first
 cabal run modec -- modem --hayes --audio-pipewire --mode bell212a,bell103 --listen 2323
+# V.8: answer with ANSam and read the far end's menu before anything trains
+cabal run modec -- modem --answer --audio-pipewire --v8 --listen 2323
 # loop two instances through FIFOs with no sound card
 scripts/smoke-loopback.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
@@ -261,17 +191,14 @@ cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example 
 scripts/smoke-sip.sh
 ```
 
-With `--audio-pipewire` the PipeWire defaults are used. `modec devices`
-lists what is available, and `--pw-in` / `--pw-out` select an input and an
-output independently by node id, node name, or any unambiguous part of
-either (`--pw-in usb --pw-out analog`); `--pw-target` sets both at once.
-An unknown or ambiguous name is refused with a listing rather than
-guessed. On a machine with no capture device modec records the playback
-monitor instead and says so, which lets the modem hear its own tones;
-`--pw-monitor` forces that mode. If the capture stream stops (device
-unplugged, pw-cat killed) the modem reports NO CARRIER, restarts the
-audio and carries on, giving up after three attempts. To play with it
-live from a terminal:
+`--audio-pipewire` takes the PipeWire defaults; `--pw-in` / `--pw-out`
+select an input and an output by node id, node name or any unambiguous
+part of either (`--pw-in usb --pw-out analog`), and `--pw-target` sets
+both. An ambiguous name is refused with a listing rather than guessed.
+With no capture device modec records the playback monitor instead and
+says so, which lets the modem hear its own tones (`--pw-monitor` forces
+it). If the capture stream stops, it reports NO CARRIER and restarts the
+audio, giving up after three attempts. To play with it from a terminal:
 
 ```
 cabal run modec -- modem --hayes --audio-pipewire --pw-monitor --data-stdio
@@ -279,9 +206,11 @@ ATE0          # the terminal already echoes what you type
 ATA           # hear the V.8bis CRe and the 2100 Hz answer tone from the speakers
 ATH
 ATDT5551234   # hear DTMF, then the modem waits for an answer tone
-``` Telnet clients see the negotiation immediately;
-bytes flow once the log on stderr says `CONNECT`. `NO CARRIER` or a failed handshake ends the
-process.
+```
+
+Telnet clients see the negotiation as it happens; bytes flow once the
+log on stderr says `CONNECT`, and `NO CARRIER` or a failed handshake
+ends the process.
 
 ## Test fixtures
 
