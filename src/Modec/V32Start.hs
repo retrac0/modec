@@ -32,12 +32,16 @@ module Modec.V32Start
   , V32Status (..)
   , V32Start
   , v32StartInit
+  , v32StartAfterAnswerTone
   , v32StartStep
   , v32Phase
   , v32Elapsed
   , v32RoundTrip
   , v32EchoAdapt
   , v32Turns
+  , v32StartRx
+  , v32StartTx
+  , v32StartCoder
   , v32Bits
   ) where
 
@@ -104,6 +108,13 @@ data TxSrc
   | TxAltPair TrainState TrainState
   | TxPoints [Point]            -- ^ a fixed run, then whatever follows it
   | TxCoded [Bool]              -- ^ bits, scrambled and Table 1 encoded as they go
+  -- | Scrambled ones at the agreed rate and coding.  §5.4.1 is explicit
+  -- that what follows signal E is \"at the data rate and with the coding
+  -- called for in R3\", and it has to be: the far end has already pointed
+  -- its slicer at the data constellation, and a four-point signal
+  -- arriving instead is not merely undecodable but actively harmful --
+  -- its equaliser adapts to it and does not recover.
+  | TxData32 V32Rate
   deriving (Eq, Show)
 
 data V32Start = V32Start
@@ -124,6 +135,8 @@ data V32Start = V32Start
   , vsSwitch  :: Maybe (Int, [Point], TxSrc)  -- ^ at this symbol: these points, then this source
   , vsTxScr   :: !Scrambler     -- ^ our scrambler, running continuously
   , vsTxQ     :: !(Bool, Bool)  -- ^ the quadrant we last transmitted
+  , vsData    :: !TxCoder       -- ^ the data coder, once a rate is agreed
+  , vsAfterE  :: Maybe V32Rate  -- ^ change to this coding when E has gone out
   , vsAnsPh   :: !Double
   -- receive
   , vsRx      :: !QamRxState
@@ -166,10 +179,49 @@ v32EchoAdapt = vsAdapt
 v32Turns :: V32Start -> [Int]
 v32Turns = vsTurns
 
+-- | The receiver as the start-up leaves it: carrier locked, timing
+-- locked, equaliser trained on TRN.  Handing this to the data pump is
+-- the entire reason §5.2.3 spends 1280 symbols on TRN, and starting the
+-- data receiver cold instead throws that away at the moment it is worth
+-- most.
+v32StartRx :: V32Start -> QamRxState
+v32StartRx = vsRx
+
+-- | And the transmitter, whose symbol clock and carrier phase should
+-- likewise carry on rather than restart mid-signal.
+v32StartTx :: V32Start -> QamTxState
+v32StartTx = vsTx
+
+-- | The data coder the start-up was already using for the scrambled
+-- ones after signal E.
+--
+-- This has to carry across into data mode, and it is easy to miss why.
+-- The far end's descrambler is self-synchronising, which sounds like it
+-- makes the scrambler's state nobody's business -- but it comes into
+-- step over 23 bits, and until it has it emits whatever it likes.  A
+-- restart here therefore hands the far end 23 arbitrary bits at a moment
+-- when its framer is already armed, and a zero followed by ones in there
+-- is a start bit and a character.  One phantom byte, at the head of the
+-- session, from a scrambler that had no reason to restart.
+v32StartCoder :: V32Start -> TxCoder
+v32StartCoder = vsData
+
 
 -- | Recent descrambled bits, newest first.
 v32Bits :: V32Start -> [Bool]
 v32Bits = vsBits
+
+-- | Start the V.32 exchange with the answer tone already sent, as it has
+-- been if V.8 or V.8bis brought us here: ANSam served as the V.25 answer
+-- sequence, and §5.4.2's \"after the Recommendation V.25 answer
+-- sequence\" is already satisfied.  Sending a second one would only
+-- confuse a far end that has finished listening for it.
+v32StartAfterAnswerTone :: Double -> Direction -> RateSeq -> V32Start
+v32StartAfterAnswerTone fs dir offer =
+  let st = v32StartInit fs dir offer
+  in case vsRole st of
+       Answering' -> st { vsPhase = AAC, vsSrc = TxAltAC True }
+       Calling' -> st
 
 v32StartInit :: Double -> Direction -> RateSeq -> V32Start
 v32StartInit fs dir offer = V32Start
@@ -179,6 +231,7 @@ v32StartInit fs dir offer = V32Start
   , vsOffer = offer, vsPeer = Nothing, vsRate = Nothing
   , vsTx = qamTxInit, vsSrc = TxNothing, vsQueue = [], vsTxSym = 0
   , vsSwitch = Nothing, vsTxScr = scramblerInit, vsTxQ = (False, False)
+  , vsData = txCoderInit, vsAfterE = Nothing
   , vsAnsPh = 0
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
@@ -270,21 +323,26 @@ detectRate bits =
     (a : _) -> Just a
     [] -> Nothing
 
--- | Signal E, which §5.3.2 sends exactly once.  The two-identical-copies
--- rule cannot apply, and one 16-bit sequence with seven fixed bits in it
--- turns up in noise about once in 128 tries per alignment -- often
--- enough to matter.  What makes it safe is what follows: §5.4 has both
--- modems transmit scrambled binary ones immediately after E, so a
--- genuine E is backed by a run of descrambled ones and a coincidence is
--- not.
+-- | Signal E, which §5.3.2 sends exactly once.
+--
+-- The two-identical-copies rule of §5.3.1 cannot apply to something sent
+-- once, and one 16-bit sequence with seven fixed bits in it turns up in
+-- noise about once in 128 tries per alignment.  What makes it safe is
+-- where it sits: §5.3.2 has E follow a whole number of rate sequences,
+-- so a genuine E is preceded by one and a coincidence is not.
+--
+-- Looking at what comes /after/ E instead would be a mistake, though an
+-- inviting one: §5.4 does put scrambled ones there, but by then they are
+-- at the agreed data rate and coding, which the start-up receiver -- still
+-- slicing four points and undoing Table 1 -- cannot read at all.
 detectE :: [Bool] -> Maybe RateSeq
 detectE bits =
-  case [ a | off <- [0 .. 23]
-           , let w = take 24 (drop off (reverse (take 64 bits)))
-           , length w == 24
-           , Just a <- [decodeESeq (take 16 w)]
-           , and (drop 16 w) ] of
-    (a : _) -> Just a
+  case [ e | off <- [0 .. 15]
+           , let w = take 32 (drop off (reverse (take 64 bits)))
+           , length w == 32
+           , Just _ <- [decodeRateSeq (take 16 w)]
+           , Just e <- [decodeESeq (drop 16 w)] ] of
+    (e : _) -> Just e
     [] -> Nothing
 
 -- | Points for one of the repeating sources.
@@ -313,7 +371,18 @@ srcPoints st src k = case src of
   TxCoded bits ->
     let (want, rest) = splitAt (2 * k) bits
         (sc', q', ps) = codedPoints (dirOf st) (vsTxScr st) (vsTxQ st) want
-    in (st { vsSrc = TxCoded rest, vsTxScr = sc', vsTxQ = q' }, ps)
+        st1 = st { vsTxScr = sc', vsTxQ = q' }
+    in case (null rest, vsAfterE st) of
+         -- E has gone out; everything after it is data coded
+         (True, Just rate) ->
+           let st2 = st1 { vsSrc = TxData32 rate, vsAfterE = Nothing
+                         , vsData = txCoderFrom sc' q' }
+               (st3, more) = srcPoints st2 (TxData32 rate) (k - length ps)
+           in (st3, ps ++ more)
+         _ -> (st1 { vsSrc = TxCoded rest }, ps)
+  TxData32 rate ->
+    let (code', ps) = encodeSymbols (dirOf st) rate (replicate (k * rateBitsPerSymbol rate) True) (vsData st)
+    in (st { vsData = code' }, ps)
 
 -- | Produce @n@ samples.
 emit :: V32Start -> Int -> (V32Start, Signal)
@@ -479,7 +548,8 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       OR2 -> case detectRate (vsBits s) of
         Just r3 | Just rate <- bestCommonRate (vsOffer s) r3 ->
           enter OB1 s { vsRate = Just rate
-                      , vsSrc = TxCoded (eSeqBits (chosen rate) ++ repeat True) }
+                      , vsSrc = TxCoded (eSeqBits (chosen rate))
+                      , vsAfterE = Just rate }
         Just _ -> enter (V32Fail "no common rate") s
         Nothing | tooLong 80000 s -> enter (V32Fail "no rate signal R3") s
                 | otherwise -> s
@@ -543,8 +613,8 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | otherwise -> s
       AR3 -> case detectE (vsBits s) of
         Just _ | Just rate <- vsRate s ->
-          enter AE s { vsSrc = TxCoded (eSeqBits (chosen rate) ++ repeat True)
-                     , vsSince = 0 }
+          enter AE s { vsSrc = TxCoded (eSeqBits (chosen rate))
+                     , vsAfterE = Just rate, vsSince = 0 }
         _ | tooLong 80000 s -> enter (V32Fail "no E from the calling modem") s
           | otherwise -> s
       AE

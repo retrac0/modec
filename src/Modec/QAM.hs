@@ -74,6 +74,7 @@ data QamRxCfg = QamRxCfg
   , qrEqMu      :: !Double  -- ^ LMS step
   , qrEqTaps    :: !Int     -- ^ equaliser taps, T/2 spaced
   , qrEvmFreeze :: !Double  -- ^ stop adapting above this decision error power
+  , qrEvmGiveUp :: !Int     -- ^ symbols of bad decisions before starting over
   , qrPower     :: !Double  -- ^ mean square of the constellation (the AGC target)
   , qrSlice     :: (Double, Double) -> Int          -- ^ nearest point, as an index
   , qrPoint     :: Int -> (Double, Double)          -- ^ that index back to a point
@@ -95,7 +96,7 @@ defaultRxCfg slice point = QamRxCfg
   { qrKp = 0.12, qrKi = 0.0015, qrClamp = 2
   , qrThKp = 0.03, qrThKi = 0.0015
   , qrEqMu = 0.002, qrEqTaps = 31
-  , qrEvmFreeze = 0.4, qrPower = 1
+  , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrPower = 1
   , qrSlice = slice, qrPoint = point }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
@@ -215,6 +216,7 @@ data QamRxState = QamRxState
   , rxLineRe  :: !Signal
   , rxLineIm  :: !Signal
   , rxEvm_    :: !Double
+  , rxBad     :: !Int
   , rxRecent  :: [Int]
   }
 
@@ -228,7 +230,7 @@ qamRxInit p cfg = QamRxState
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxRecent = [] }
+  , rxEvm_ = 0, rxBad = 0, rxRecent = [] }
   where
     sps = samplesPerSymbol p
     taps = qrEqTaps cfg
@@ -246,7 +248,7 @@ qamRxReset _ cfg st = st
   , rxEqRe = VS.generate taps (\i -> if i == 2 * (taps `div` 4) then 1 else 0)
   , rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxRecent = [] }
+  , rxEvm_ = 0, rxBad = 0, rxRecent = [] }
   where taps = qrEqTaps cfg
 
 kernel :: QamParams -> VS.Vector Double
@@ -340,14 +342,25 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
               eqIm' = VS.zipWith3 (\w lr li -> w + mu * (errI * lr - errR * li)) (rxEqIm st) lineRe lineIm
 
+              -- The freeze above keeps a good equaliser from adapting on
+              -- rubbish; on its own it also keeps a bad one from ever
+              -- adapting back, because once the taps are wrong the
+              -- decisions are wrong and the error stays over the
+              -- threshold for good.  So count how long it has been bad
+              -- and, past that, start the coherent path over.  Without
+              -- this a receiver handed a signal it cannot read -- the far
+              -- end still finishing its start-up, say -- is ruined by it
+              -- permanently rather than for as long as it lasts.
+              bad = if locked && evm > qrEvmFreeze cfg then rxBad st + 1 else 0
               st1 = st { rxTau = tau'
                        , rxSps = max (0.9 * nominalSps) (min (1.1 * nominalSps) sps')
                        , rxPrevSym = (yr, yi), rxPower_ = pw
                        , rxTheta = theta', rxFreq = freq'
                        , rxEqRe = eqRe', rxEqIm = eqIm'
                        , rxLineRe = lineRe, rxLineIm = lineIm
-                       , rxEvm_ = evm, rxRecent = recent }
-          in go st1 (QamSym (ur, ui) idx err2 (yr, yi) : syms)
+                       , rxEvm_ = evm, rxBad = bad, rxRecent = recent }
+              st2 = if bad >= qrEvmGiveUp cfg then qamRxReset p cfg st1 else st1
+          in go st2 (QamSym (ur, ui) idx err2 (yr, yi) : syms)
 
     (stSym, symsOut) = go st0 []
     carry = VS.length (rxPrevRe st0)

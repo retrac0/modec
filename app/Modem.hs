@@ -40,6 +40,7 @@ import Modec.Progress
 import Modec.Hayes
 import Modec.Modem
 import Modec.Standards (fskBaud, fskName)
+import Modec.V32 (V32Rate (..), rateBitRate)
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
 import Modec.Pipewire
 import Modec.V8 (describeMenu)
@@ -329,7 +330,8 @@ runModem o = do
               rateOf link = case link of
                 FskLink {} -> 300
                 V22Link _ _ R1200 -> 1200
-                V22Link _ _ R2400 -> 2400 :: Int
+                V22Link _ _ R2400 -> 2400
+                V32Link _ r -> rateBitRate r :: Int
               carrierGone = do
                 modemEvent EvNoCarrier
                 writeIORef lineRef LineIdle
@@ -519,10 +521,18 @@ runModem o = do
                     | otherwise -> show (round (fskBaud rx) :: Int) ++ "/" ++ show (round (fskBaud tx) :: Int) ++ " bit/s"
       V22Link _ _ R1200 -> "1200 bit/s"
       V22Link _ _ R2400 -> "2400 bit/s"
+      V32Link _ r -> show (rateBitRate r) ++ " bit/s"
+    showV32Rate r = case r of
+      V32R4800 -> "4800 bit/s"
+      V32R9600 -> "9600 bit/s, 16 point"
+      V32R9600T -> "9600 bit/s, trellis coded"
     -- which way round the link runs, in the terms the standard uses
     describeChannels link = case link of
       FskLink tx rx -> "sending " ++ fskName tx ++ ", hearing " ++ fskName rx
       V22Link tx rx _ -> "sending " ++ show tx ++ ", hearing " ++ show rx
+      -- V.32 has one carrier and both ends on it, which is the whole
+      -- reason it needs an echo canceller and the others do not
+      V32Link role r -> "1800 Hz both ways, " ++ show role ++ ", " ++ showV32Rate r
     isFinal EvDropped = True
     isFinal (EvFailed _) = True
     isFinal _ = False

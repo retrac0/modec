@@ -13,6 +13,7 @@ module Modec.Modem
   , modemStep
   , modemStatus
   , modemConnected
+  , modemV32Evm
   , modemTxCmd
   , modemV22Rx
   , modemMnp
@@ -38,6 +39,10 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate)
+import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
+import Modec.V32Start
+import Modec.Echo
 import Modec.Hdlc
 import Modec.Mnp
 import Modec.V8
@@ -52,6 +57,7 @@ data ModemConfig = ModemConfig
   , mcSettle    :: Double        -- ^ seconds of idle mark after CONNECT before data flows
   , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
   , mcMnp       :: Maybe MnpConfig  -- ^ MNP error correction; 'Nothing' passes bytes straight through
+  , mcMaxEvmV32 :: Double  -- ^ the same, in V.32's unit-mean-power units
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -67,6 +73,10 @@ defaultModemConfig fs role modes = ModemConfig
   , mcSettle = 0.6
   , mcGuardTone = False
   , mcMnp = Nothing
+  -- V.22 measures its decision error in grid units where the mean
+  -- power is 10; V.32's constellations are normalised to unit mean
+  -- power, so the same fraction of the signal is a tenth of the number.
+  , mcMaxEvmV32 = 0.1
   , mcMaxEvm = 1.0
   }
 
@@ -177,8 +187,12 @@ unfoldExactN n f s0 = go 0 s0 []
 
 data Mode
   = Handshaking
+  -- | The V.32 start-up of Figure 4, which runs on the sample clock and
+  -- so cannot be driven by the handshake's 20 ms tick.
+  | Starting32 V32Start
   | DataFsk Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
   | DataV22 V22Channel V22Channel Rate AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
+  | DataV32 Role V32Rate V32Data AsyncRx Bool
   | Finished
 
 data ModemState = ModemState
@@ -193,6 +207,7 @@ data ModemState = ModemState
   , msV8      :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], V8Rx)
   , msAnsam   :: Ansam
   , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
+  , msEcho    :: Maybe EchoState  -- ^ echo canceller, for the modes that share a band
   , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
   , msSettled :: !Double     -- ^ seconds spent in data mode so far
@@ -203,6 +218,13 @@ data ModemState = ModemState
 
 modemInit :: ModemConfig -> ModemState
 modemInit cfg
+  -- V.32 has a start-up of its own and no probe rotation to join: an
+  -- answering V.32 modem sends the answer tone and then its alternating
+  -- AC, which no other mode here would make sense of.  So a modem
+  -- configured for V.32 goes straight into Figure 4, and reaches it
+  -- otherwise only when V.8 or V.8bis has picked it.
+  | [V32] <- hcModes hs =
+      base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
@@ -213,11 +235,24 @@ modemInit cfg
     fs = mcRate cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200 0 0 0 HsBusy
-             [] Nothing
+             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200
+             echo0 0 0 0 HsBusy [] Nothing
+    -- Only V.32 shares a band with the far end, so only V.32 needs its
+    -- own signal taken back out of what returns.
+    echo0 = if V32 `elem` hcModes hs then Just (echoInit defaultEchoConfig) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
+      V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
+
+-- | Which V.32 rates we will accept.  4800 and both 9600 alternatives;
+-- 2400 is "for further study" in §2.4.3 and exists in no modem.
+v32Offer :: ModemConfig -> RateSeq
+v32Offer _ = RateSeq False True True True
+
+dirOfRole :: Role -> Direction
+dirOfRole Originate = Calling
+dirOfRole Answer = Answering
 
 -- | The line rate of an established link, for the protocol layer's timers.
 -- On an asymmetric link the slow direction is the one that governs: an
@@ -227,6 +262,7 @@ linkBitRate :: Link -> Double
 linkBitRate (FskLink tx rx) = min (fskBaud tx) (fskBaud rx)
 linkBitRate (V22Link _ _ R1200) = 1200
 linkBitRate (V22Link _ _ R2400) = 2400
+linkBitRate (V32Link _ r) = fromIntegral (rateBitRate r)
 
 -- | Whether the link can carry bit-oriented framing.  Only the V.22 data
 -- pump can: dropping the start and stop bits at 300 bit/s would buy 20 %
@@ -234,6 +270,7 @@ linkBitRate (V22Link _ _ R2400) = 2400
 -- than framing limited anyway.
 linkSyncable :: Link -> Bool
 linkSyncable V22Link {} = True
+linkSyncable V32Link {} = True
 linkSyncable FskLink {} = False
 
 -- | Which end starts the protocol.  This reads the established link, not
@@ -243,6 +280,8 @@ linkSyncable FskLink {} = False
 mnpRoleOf :: Link -> MnpRole
 mnpRoleOf (V22Link LowChannel _ _) = MnpInitiator
 mnpRoleOf (V22Link HighChannel _ _) = MnpResponder
+mnpRoleOf (V32Link Originate _) = MnpInitiator
+mnpRoleOf (V32Link Answer _) = MnpResponder
 mnpRoleOf (FskLink tx _)
   | fskName tx `elem` [fskName bell103Originate, fskName v21Channel1, fskName v23Backward] = MnpInitiator
   | otherwise = MnpResponder
@@ -284,6 +323,9 @@ txOctetsPending st = length (txQueue st) + v22TxQueued (txV22 st)
 
 dataCmd :: Link -> TxCmd
 dataCmd (FskLink tx _) = TxData tx
+-- V.32 makes its own audio from Modec.V32Pump; these say which of the
+-- two things it should be doing, not what signal to make.
+dataCmd (V32Link _ _) = TxV32Data
 dataCmd (V22Link tx _ r) = TxV22 tx r TxScrambledData
 
 -- | The same link carrying bit-oriented framing.  Only the V.22 data pump
@@ -296,6 +338,7 @@ syncCmd l = dataCmd l
 -- | Idle-mark command for a link (used while settling after CONNECT).
 markCmd :: Link -> TxCmd
 markCmd (FskLink tx _) = TxMark tx
+markCmd (V32Link _ _) = TxV32Idle
 markCmd (V22Link tx _ r) = TxV22 tx r TxScrambledOnes
 
 modemStatus :: ModemState -> HsStatus
@@ -313,10 +356,17 @@ modemMnp = msMnp
 modemV22Rx :: ModemState -> (Maybe (V22Channel, V22RxState), Rate)
 modemV22Rx st = (msV22Rx st, msRxRate st)
 
+-- | The V.32 receiver's decision error, for tracing.
+modemV32Evm :: ModemState -> Maybe Double
+modemV32Evm st = case msMode st of
+  DataV32 _ _ pump _ armed -> Just (if armed then negate (v32DataEvm pump) else v32DataEvm pump)
+  _ -> Nothing
+
 modemConnected :: ModemState -> Bool
 modemConnected st = case msMode st of
   DataFsk {} -> True
   DataV22 {} -> True
+  DataV32 {} -> True
   _ -> False
 
 -- | Process one block of received audio and newly queued bytes.  Returns
@@ -394,10 +444,19 @@ modemStep cfg st0 rxBlock newBytes =
              let mode = case link of
                    FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
                    V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
+                   V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
                  st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0
                            , msMnp = mnpFor cfg link }
                  (txSt, audio) = transmit (markCmd link) st2
              in (st2 { msTx = txSt }, audio, [], v8Menus ++ [EvConnected s link])
+           -- V.8 chose V.32.  The answer tone has already been sent -- that
+           -- is what ANSam was -- so the start-up begins at the answering
+           -- modem's alternating AC rather than repeating it.
+           HsStartV32 ->
+             let s32 = v32StartAfterAnswerTone fs (dirOfRole (hcRole hs)) (v32Offer cfg)
+                 st2 = st1 { msMode = Starting32 s32
+                           , msEcho = Just (echoInit defaultEchoConfig) }
+             in (st2, VS.replicate n 0, [], v8Menus)
            HsFailed why ->
              (st1 { msMode = Finished, msStatus = status, msTxCmd = TxSilence }, VS.replicate n 0, [], v8Menus ++ [EvFailed why])
            HsDropped ->
@@ -410,6 +469,53 @@ modemStep cfg st0 rxBlock newBytes =
           (framer', bytes) = stepStage framer d
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
       in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) (LineOctets bytes)
+    Starting32 s32 ->
+      let (echo', rxClean) = cancelEcho st n rxBlock
+          (s32', audio, status) = v32StartStep s32 rxClean
+          st1 = st { msEcho = pushEcho cfg (v32EchoAdapt s32') audio echo' }
+      in case status of
+           V32Busy -> (st1 { msMode = Starting32 s32' }, audio, [], [])
+           V32Connected r ->
+             let link = V32Link (hcRole hs) r
+                 -- carry the receiver the start-up trained and the
+                 -- transmitter's symbol clock, rather than restarting both
+                 -- mid-signal
+                 pump = v32DataFrom (v32StartRx s32') (v32StartTx s32') (v32StartCoder s32')
+                                    (v32DataInit fs r)
+                 st2 = st1 { msMode = DataV32 (hcRole hs) r pump (asyncRxInit (mcFraming cfg)) False
+                           , msStatus = HsConnected V32 link, msSettled = 0
+                           , msMnp = mnpFor cfg link }
+             in (st2, audio, [], [EvConnected V32 link])
+           V32Failed why ->
+             (st1 { msMode = Finished, msStatus = HsFailed why }, audio, [], [EvFailed why])
+    DataV32 role rate pump framer armed ->
+      let (echo', rxClean) = cancelEcho st n rxBlock
+          -- receive only; what goes on the line is decided further down,
+          -- once the protocol layer has had its say
+          (pump', gotBits) = v32DataRx fs (dirOfRole role) rate pump rxClean
+          trust = v32DataEvm pump' < mcMaxEvmV32 cfg
+          -- Arm on a *run* of descrambled ones -- the idle both ends send
+          -- between characters -- and not on a count of them, since noise
+          -- is half ones and counting arms the framer on nothing at all.
+          -- The run has to outlast the descrambler coming into step as
+          -- well: for its first 23 bits it emits whatever it likes, and a
+          -- zero followed by ones in there is a start bit and a character
+          -- as far as the framer can tell.  A settle window of scrambled
+          -- ones makes 64 free.
+          onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
+          armed' = armed || (onesRun' >= 64 && trust)
+          sync = case msMnp st of
+            Just m -> mnpFraming m == FramingBit
+            Nothing -> False
+          (framer', line)
+            | sync = (framer, LineBits (if trust then gotBits else []))
+            | otherwise =
+                let (f', bs) = if armed && trust then asyncRxBits framer gotBits else (framer, [])
+                in (f', LineOctets bs)
+          st1 = st { msEcho = echo', msZeros = onesRun' }
+      in finishDataWith (v32Audio role rate pump') st1
+           (DataV32 role rate pump' framer' armed') (V32Link role rate)
+           (v32DataEvm pump' < 1e3) line
     DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
             Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)
@@ -442,8 +548,15 @@ modemStep cfg st0 rxBlock newBytes =
           st1 = st { msV22Rx = Just (rx, rxSt'), msRxRate = rate }
       in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) line
   where
-    -- common tail of the data modes: carrier watchdog, settle time, transmit
-    finishData st mode link present line =
+    -- common tail of the data modes: carrier watchdog, settle time,
+    -- error correction, transmit.  How the audio is made is a parameter
+    -- because V.32 does not make it from a TxCmd: its pump carries the
+    -- bits itself, on a carrier shared with the far end.
+    finishData = finishDataWith cmdAudio
+    cmdAudio n tx1 cmd mode =
+      let (txSt, audio) = txBlock (mcRate cfg) (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n tx1
+      in (txSt, audio, mode)
+    finishDataWith mkAudio st mode link present line =
       let fs = mcRate cfg
           n = VS.length rxBlock
           blockSec = fromIntegral n / fs
@@ -486,8 +599,8 @@ modemStep cfg st0 rxBlock newBytes =
           cmd | settled < mcSettle cfg = markCmd link
               | wantSync && txOctetsPending tx1 == 0 = syncCmd link
               | otherwise = dataCmd link
-          (txSt, audio) = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n tx1
-          st1 = st { msMode = mode, msTx = txSt, msTxCmd = cmd, msLost = lost, msSettled = settled
+          (txSt, audio, mode') = mkAudio n tx1 cmd mode
+          st1 = st { msMode = mode', msTx = txSt, msTxCmd = cmd, msLost = lost, msSettled = settled
                    , msMnp = mnp'
                    , msDte = if isJust (msMnp st) && ran then [] else msDte st }
           evs = map EvMnp mnpEvs
@@ -500,3 +613,29 @@ modemStep cfg st0 rxBlock newBytes =
 
     lineOctets (LineOctets os) = os
     lineOctets (LineBits _) = []
+
+    -- V.32's transmitter: the octets the protocol layer queued, framed
+    -- and handed to the pump as bits.  Whatever will not fit in this
+    -- block stays in the coder, so nothing has to be pushed back.
+    v32Audio role rate pump0 n' tx1 cmd' mode =
+      let -- during the settle window send nothing but the scrambled ones
+          -- the pump idles on, so the far end's framer has something to
+          -- arm on before the first character arrives
+          bits | cmd' == TxV32Idle = []
+               | otherwise = concatMap (\b -> frameBits (mcFraming cfg) [b]) (txQueue tx1) ++ txSync tx1
+          (pump', audio) = v32DataTx (mcRate cfg) (dirOfRole role) rate (mcTxAmp cfg) n' bits pump0
+          mode' = case mode of
+            DataV32 r rt _ fr ar -> DataV32 r rt pump' fr ar
+            other -> other
+      in (if cmd' == TxV32Idle then tx1 else tx1 { txQueue = [], txSync = [] }, audio, mode')
+
+    -- Take our own signal back out of what arrived, and remember what we
+    -- sent so the next block can be cleaned too.  Only V.32 needs this;
+    -- for every other mode msEcho is Nothing and this is the identity.
+    cancelEcho st' n' blk = case msEcho st' of
+      Nothing -> (Nothing, blk)
+      Just e -> let (e', clean) = echoBlock defaultEchoConfig False blk e
+                in (Just e', if n' == 0 then blk else clean)
+
+    pushEcho _ adapt audio = fmap (\e -> echoPush defaultEchoConfig audio (adaptMark adapt e))
+    adaptMark _ e = e

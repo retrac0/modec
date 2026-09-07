@@ -473,7 +473,19 @@ mnpModemTests = testGroup "MNP over the data pump"
 
 modemTests :: TestTree
 modemTests = testGroup "full modem duplex"
-  [ testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
+  [ testCase "a V.32 call: Figure 4, then 9600 bit/s trellis coded, text both ways" $ do
+      -- Two whole modems this time, not just the start-up machine: the
+      -- V.32 exchange, the handover to the data pump, the echo canceller
+      -- in the path, and MNP over the top of it.
+      let cfg r = defaultModemConfig 8000 r [V32]
+          (rxO, rxA, evO, evA) = modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
+      assertBool ("originate events " ++ show evO)
+        (case evO of (EvConnected V32 (V32Link Originate V32R9600T) : _) -> True; _ -> False)
+      assertBool ("answer events " ++ show evA)
+        (case evA of (EvConnected V32 (V32Link Answer V32R9600T) : _) -> True; _ -> False)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
+  , testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
       let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 18
       -- the station that received MS (the caller) becomes the answering modem on the high channel
       assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22bis (V22Link HighChannel LowChannel R2400) : _) -> True; _ -> False)
@@ -2041,9 +2053,61 @@ v32StartDuplex snr maxT blk = go 0 o0 a0 quiet quiet V32Busy V32Busy []
     done V32Busy = False
     done _ = True
 
+-- Two V.32 data pumps cross-connected, with the training the start-up
+-- would have given them.
+v32PumpDuplex :: V32Rate -> Int -> [Bool] -> ([Bool], Double)
+v32PumpDuplex r blocks payload = go 0 (v32DataInit fs r) (v32DataInit fs r) quiet payload []
+  where
+    fs = 8000
+    quiet = VS.replicate 160 0
+    per = rateBitsPerSymbol r * 48
+    go i po pa fromA bits acc
+      | i >= blocks = (concat (reverse acc), v32DataEvm po)
+      | otherwise =
+          let (po1, got) = v32DataRx fs Calling r po fromA
+              (pa1, _) = v32DataRx fs Answering r pa quiet
+              (pa2, audA) = v32DataTx fs Answering r 0.5 160 (take per bits) pa1
+              (po2, _) = v32DataTx fs Calling r 0.5 160 [] po1
+          in go (i + 1) po2 pa2 audA (drop per bits) (got : acc)
+
 v32StartTests :: TestTree
 v32StartTests = testGroup "V.32 start-up per Figure 4"
-  [ testCase "two V.32 modems reach 9600 trellis" $ do
+  [ testCase "the data pump carries bits between two of itself" $ do
+      -- first: the block receiver against the offline modulator, which
+      -- the pump tests already trust
+      forM_ [V32R4800, V32R9600T] $ \r -> do
+        let payload = prbs (11, 9) 6000
+            sig = v32Modulate 8000 Answering r 0.5 payload
+            step (st, acc) blk = let (st', bs) = v32DataRx 8000 Calling r st blk
+                                 in (st', acc ++ bs)
+            (_, got) = foldl step (v32DataInit 8000 r, []) (chunksOf 160 sig)
+            best = minimum [ (length (filter id (zipWith (/=) (drop 500 payload) (drop o got))), o)
+                           | o <- [0 .. 800] ]
+        assertBool ("block receiver, " ++ show r ++ ": " ++ show (length got) ++ " bits, best " ++ show best)
+          (fst best == 0)
+      -- then: the block transmitter, demodulated offline
+      forM_ [V32R4800, V32R9600T] $ \r -> do
+        let payload = prbs (11, 9) 6000
+            step (st, acc) chunk =
+              let (st', a) = v32DataTx 8000 Answering r 0.5 160 chunk st
+              in (st', acc ++ [a])
+            perBlock = rateBitsPerSymbol r * 48
+            chunks = takeWhile (not . null) (map (\i -> take perBlock (drop (i * perBlock) payload)) [0 .. 60])
+            (_, blocks) = foldl step (v32DataInit 8000 r, []) chunks
+            got = v32Demodulate 8000 Calling r (VS.concat blocks)
+            best = minimum [ (length (filter id (zipWith (/=) (drop 500 payload) (drop o got))), o)
+                           | o <- [0 .. 800] ]
+        assertBool ("block transmitter, " ++ show r ++ ": " ++ show (length got) ++ " bits, best " ++ show best)
+          (fst best == 0)
+      forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
+        let payload = prbs (11, 9) 4000
+            (got, evm) = v32PumpDuplex r 90 payload
+            at o = length (filter id (zipWith (/=) (drop 500 payload) (drop o got)))
+            best = minimum [ (at o, o) | o <- [0 .. 3000] ]
+        assertBool (show r ++ ": EVM " ++ show evm ++ ", " ++ show (length got)
+                    ++ " bits, best " ++ show best)
+          (fst best == 0)
+  , testCase "two V.32 modems reach 9600 trellis" $ do
       let (so, sa, trace, nt, mt) = v32StartDuplex 25 20 160
       assertEqual ("calling side (trace " ++ show trace ++ ")")
         (V32Connected V32R9600T) so

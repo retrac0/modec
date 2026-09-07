@@ -14,14 +14,24 @@ module Modec.V32Pump
     -- * Coding to and from symbols
   , TxCoder
   , txCoderInit
+  , txCoderFrom
   , encodeSymbols
   , RxCoder
   , rxCoderInit
   , decodeSymbols
+  , codedQuads
+  , decodeQuads
     -- * Start-up signalling
   , conditioningSymbols
   , stateSymbols
   , modulatePointsFor
+    -- * A duplex data pump
+  , V32Data
+  , v32DataInit
+  , v32DataFrom
+  , v32DataRx
+  , v32DataTx
+  , v32DataEvm
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
@@ -78,6 +88,13 @@ data TxCoder = TxCoder
 txCoderInit :: TxCoder
 txCoderInit = TxCoder scramblerInit (False, False) convInit []
 
+-- | A data coder that carries on the scrambler the start-up was already
+-- running.  §5.4.1 changes the coding at signal E but not the scrambler,
+-- and sets the convolutional encoder's delay elements to zero -- so this
+-- takes the one and resets the other.
+txCoderFrom :: Scrambler -> (Bool, Bool) -> TxCoder
+txCoderFrom sc q = TxCoder sc q convInit []
+
 -- | Scramble and code as many whole symbols as the given bits allow,
 -- keeping the remainder for next time.
 encodeSymbols :: Direction -> V32Rate -> [Bool] -> TxCoder -> (TxCoder, [Point])
@@ -123,27 +140,47 @@ rxCoderInit = RxCoder scramblerInit (False, False)
 -- The far end scrambles with the polynomial of /its/ direction, so the
 -- descrambler here is given the other one.
 decodeSymbols :: Direction -> V32Rate -> [QamSym] -> RxCoder -> (RxCoder, [Bool])
-decodeSymbols dir r syms st0 = (st1 { rcDescr = descr' }, dataBits)
+decodeSymbols dir r syms st = decodeQuads dir r (codedQuads r syms) st
+
+-- | Decided symbols to the coded bits they carry, before any of the
+-- undoing: on the trellis alternative that is the Viterbi decoder's job
+-- and needs a run of symbols, on the others it is one slicing per
+-- symbol.
+--
+-- This is separate from 'decodeQuads' because the two have opposite
+-- needs at a block boundary.  A trellis decoder wants the previous
+-- block's last symbols back, to keep its path metrics continuous; a
+-- descrambler must see every line bit exactly once, and showing it the
+-- overlap a second time puts it out of step with the far end -- which
+-- looks like a receiver that locks perfectly and then decodes noise.
+codedQuads :: V32Rate -> [QamSym] -> [(Bool, Bool, Bool, Bool)]
+codedQuads V32R9600T syms = viterbiDecode 16 (map qsPoint syms)
+codedQuads V32R9600 syms =
+  [ let i = qsIndex sym
+        (y1, y2) = unpair (i `div` 4)
+        (q3, q4) = unpair (i `mod` 4)
+    in (y1, y2, q3, q4)
+  | sym <- syms ]
+codedQuads V32R4800 syms =
+  [ let (y1, y2) = dibitOfState (toEnum (qsIndex sym)) in (y1, y2, False, False)
+  | sym <- syms ]
+
+-- | Coded bits to data bits: undo the differential encoding, then the
+-- scrambler.  Stateful, and advanced exactly once per symbol.
+--
+-- The far end scrambles with the polynomial of /its/ direction, so the
+-- descrambler here is given the other one.
+decodeQuads :: Direction -> V32Rate -> [(Bool, Bool, Bool, Bool)] -> RxCoder -> (RxCoder, [Bool])
+decodeQuads dir r quads st0 = (st1 { rcDescr = descr' }, dataBits)
   where
     far = case dir of { Calling -> Answering; Answering -> Calling }
-    (st1, coded) = case r of
-      V32R9600T ->
-        let quads = viterbiDecode 16 (map qsPoint syms)
-        in foldlAcc (\st (y1, y2, q3, q4) ->
-             let (q1, q2) = diffDecode2 (y1, y2) (rcPrev st)
-             in (st { rcPrev = (y1, y2) }, [q1, q2, q3, q4])) st0 quads
-      V32R9600 ->
-        foldlAcc (\st sym ->
-          let i = qsIndex sym
-              y = unpair (i `div` 4)
-              (q3, q4) = unpair (i `mod` 4)
-              (q1, q2) = diffDecode1 y (rcPrev st)
-          in (st { rcPrev = y }, [q1, q2, q3, q4])) st0 syms
-      V32R4800 ->
-        foldlAcc (\st sym ->
-          let y = dibitOfState (toEnum (qsIndex sym))
-              (q1, q2) = diffDecode1 y (rcPrev st)
-          in (st { rcPrev = y }, [q1, q2])) st0 syms
+    diff = case r of { V32R9600T -> diffDecode2; _ -> diffDecode1 }
+    (st1, coded) = foldlAcc (\st (y1, y2, q3, q4) ->
+      let (q1, q2) = diff (y1, y2) (rcPrev st)
+          out = case r of
+            V32R4800 -> [q1, q2]
+            _ -> [q1, q2, q3, q4]
+      in (st { rcPrev = (y1, y2) }, out)) st0 quads
     (descr', dataBits) = descrambleRun far (rcDescr st0) coded
 
 unpair :: Int -> (Bool, Bool)
@@ -257,3 +294,85 @@ runBlocks p cfg sig st0 = go st0 (chunksOf 160 sig)
       let (st', out) = qamRxBlock p cfg c st
           (more, stF) = go st' cs
       in (out ++ more, stF)
+
+-- | A V.32 data pump for the connected state: a block of audio in, a
+-- block out, bits both ways.
+data V32Data = V32Data
+  { vdTx    :: !QamTxState
+  , vdCode  :: !TxCoder
+  , vdRx    :: !QamRxState
+  , vdDec   :: !RxCoder
+  , vdPend  :: [QamSym]   -- ^ symbols held back for the decoder's traceback
+  , vdBits  :: [Bool]     -- ^ data bits not yet coded onto symbols
+  }
+
+v32DataInit :: Double -> V32Rate -> V32Data
+v32DataInit fs r = V32Data
+  { vdTx = qamTxInit, vdCode = txCoderInit
+  , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
+  , vdPend = [], vdBits = [] }
+
+-- | A data pump that inherits a receiver and transmitter the start-up
+-- has already brought into lock.
+v32DataFrom :: QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
+v32DataFrom rx tx code st = st { vdRx = rx, vdTx = tx, vdCode = code }
+
+v32DataEvm :: V32Data -> Double
+v32DataEvm = qamRxEvm . vdRx
+
+-- | How many symbols of context the decoder needs behind it.  A trellis
+-- decoder judges a sequence, so restarting it at every block boundary
+-- would throw away the very thing it is for; carrying the last few
+-- symbols forward and decoding them again keeps the path metrics
+-- continuous across a seam the far end knows nothing about.
+vdOverlap :: Int
+vdOverlap = 40
+
+-- | Receive one block.
+--
+-- Transmit and receive are separate calls on purpose.  A modem does both
+-- every block, but not at the same point in the block: the receiver runs
+-- at the top, on audio that has arrived, and the transmitter at the
+-- bottom, on bits the protocol layer has by then decided to send.  One
+-- function doing both has to be handed a dummy for whichever half the
+-- caller does not mean, and it then advances that half's state anyway --
+-- which is silent, and costs every byte on the link.
+v32DataRx :: Double -> Direction -> V32Rate -> V32Data -> Signal -> (V32Data, [Bool])
+v32DataRx fs dir r st rx = (st', out)
+  where
+    p = v32Params fs
+    (rx', syms) = qamRxBlock p (v32RxCfg r) rx (vdRx st)
+    both = vdPend st ++ syms
+    -- the decoder sees the overlap for its path metrics; the descrambler
+    -- below sees only what is new
+    fresh = drop (length (vdPend st)) (codedQuads r both)
+    (dec', out) = decodeQuads dir r fresh (vdDec st)
+    st' = st { vdRx = rx', vdDec = dec', vdPend = lastN vdOverlap both }
+
+-- | Transmit @n@ samples, carrying as many of @bits@ as will fit.  What
+-- does not fit stays in the coder, so nothing has to be handed back.
+v32DataTx :: Double -> Direction -> V32Rate -> Double -> Int -> [Bool] -> V32Data
+          -> (V32Data, Signal)
+v32DataTx fs dir r amp n bits st = (st { vdTx = tx', vdCode = code', vdBits = keep }, audio)
+  where
+    p = v32Params fs
+    want = qamTxSymbolsFor p n (vdTx st)
+    needed = want * rateBitsPerSymbol r
+    -- Code exactly the symbols this block will carry, and no more.
+    -- encodeSymbols will happily turn every bit it is given into a
+    -- symbol, and qamTxBlock takes only the ones it has room for and
+    -- hands the surplus back -- so a burst larger than one block, which
+    -- is any burst at all at 9600 bit/s, is coded and then dropped on
+    -- the floor.  Holding the bits here instead means the queue drains
+    -- over as many blocks as it takes.
+    pendingAll = vdBits st ++ bits
+    (send, keep) = splitAt needed pendingAll
+    -- Idle on scrambled ones when there is nothing to say: that is what
+    -- keeps the far end's carrier, timing and equaliser alive between
+    -- characters.
+    idle = replicate (max 0 (needed - length send)) True
+    (code', pts) = encodeSymbols dir r (send ++ idle) (vdCode st)
+    (tx', audio, _) = qamTxBlock p amp n pts (vdTx st)
+
+lastN :: Int -> [a] -> [a]
+lastN k xs = drop (max 0 (length xs - k)) xs

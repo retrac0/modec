@@ -150,7 +150,7 @@ commands st cmds acts out = case cmds of
   ('L' : rest) -> let (_, rest') = digits rest in commands st rest' acts out
   ('M' : rest) -> let (_, rest') = digits rest in commands st rest' acts out
   ('I' : rest) -> let (_, rest') = digits rest
-                  in commands st rest' acts (out <> crlf <> BC.pack "modec software modem: Bell 103, V.21, V.22, V.22bis, V.8bis" <> crlf)
+                  in commands st rest' acts (out <> crlf <> BC.pack "modec software modem: Bell 103, V.21, V.22, V.22bis, V.32, V.8bis" <> crlf)
   ('S' : rest) ->
     let (reg, rest1) = digits rest
     in case rest1 of
@@ -180,7 +180,7 @@ hayesEvent st ev = case ev of
     | hsQuiet st || not (hsVerbose st) -> (st, B.empty)
     | otherwise -> (st, crlf <> BC.pack ("PROTOCOL: " ++ name) <> crlf)
   where
-    connectCode r = case r of { 300 -> 1; 1200 -> 5; 2400 -> 10; _ -> 1 }
+    connectCode r = case r of { 300 -> 1; 1200 -> 5; 2400 -> 10; 4800 -> 11; 9600 -> 12; _ -> 1 }
 
 -- | Time passes: completes a "+++" escape once the trailing guard time
 -- has elapsed.  Returns bytes for the DTE.

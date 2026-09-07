@@ -71,6 +71,7 @@ module Modec.Handshake
   ( Standard (..)
   , allStandards
   , isV22Family
+  , isV32
   , Role (..)
   , Link (..)
   , HsConfig (..)
@@ -96,6 +97,7 @@ import Modec.Hdlc (hdlcFrameBits)
 import Modec.Standards
 import Modec.Stream
 import Modec.V22 (Rate (..), TxMode (..), V22Channel (..))
+import Modec.V32 (V32Rate (..))
 import Modec.V8
 import Modec.V8bis
 import Data.Word (Word8)
@@ -108,7 +110,7 @@ import Data.Word (Word8)
 -- 'V23' is V.23 duplex: 1200 bit/s from the answering modem, 75 bit/s
 -- back from the calling one.  It is the only asymmetric mode here, and
 -- the only one whose two directions run at different rates.
-data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis deriving (Eq, Show, Enum, Bounded)
+data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis | V32 deriving (Eq, Show, Enum, Bounded)
 
 -- | Every mode, best first; the default configuration.  V.23 is not in
 -- it: 75 bit/s upstream is worse than V.21 for anything but viewdata, so
@@ -120,6 +122,14 @@ allStandards = [V22bis, V22, Bell212A, V21, Bell103]
 isV22Family :: Standard -> Bool
 isV22Family s = s `elem` [Bell212A, V22, V22bis]
 
+-- | V.32 is the one mode here that does not take turns by frequency.
+-- Both directions share the whole band on an 1800 Hz carrier, its
+-- start-up is the sample-accurate exchange of "Modec.V32Start" rather
+-- than anything this tick-driven machine can drive, and it is the only
+-- mode that needs an echo canceller.
+isV32 :: Standard -> Bool
+isV32 = (== V32)
+
 data Role = Originate | Answer deriving (Eq, Show)
 
 -- | The channels of an established connection: our transmit side and
@@ -127,6 +137,9 @@ data Role = Originate | Answer deriving (Eq, Show)
 data Link
   = FskLink FskSpec FskSpec
   | V22Link V22Channel V22Channel Rate
+  -- | V.32 is symmetric -- one carrier, one rate, the same both ways --
+  -- so a link is just which end we are and what was settled on.
+  | V32Link Role V32Rate
   deriving (Eq, Show)
 
 -- | The link a standard runs on, at its own rate.
@@ -143,6 +156,7 @@ linkFor Answer V23 = FskLink v23Forward v23Backward
 linkFor role Bell212A = v22LinkAt role R1200
 linkFor role V22 = v22LinkAt role R1200
 linkFor role V22bis = v22LinkAt role R2400
+linkFor role V32 = V32Link role V32R9600T
 
 v22LinkAt :: Role -> Rate -> Link
 v22LinkAt Originate r = V22Link LowChannel HighChannel r
@@ -204,6 +218,13 @@ data TxCmd
   | TxDual Double Double Double   -- ^ two tones at the given amplitude factor (V.8bis segment 1)
   | TxBits FskSpec [Bool]         -- ^ queue these bits on the FSK channel, then idle mark
   | TxAnsam              -- ^ V.8 modified answer tone
+  -- | V.32 makes its own audio from its own pump, so these two carry no
+  -- signal description -- only which of the two things the pump should
+  -- be doing.  The idle one matters: a far end's start-stop framer arms
+  -- on a run of scrambled ones, and a modem that starts sending
+  -- characters the instant it connects never gives it one.
+  | TxV32Idle
+  | TxV32Data
   deriving (Eq, Show)
 
 -- | What a V.22 receiver listening to the remote channel currently sees.
@@ -248,6 +269,10 @@ data HsOut = HsOut
 data HsStatus
   = HsBusy
   | HsConnected Standard Link
+  -- | V.32 was selected.  This is not a connection: V.32 has a start-up
+  -- of its own, on the sample clock, so the modem hands the line to
+  -- "Modec.V32Start" rather than straight to a data pump.
+  | HsStartV32
   | HsDropped
   | HsFailed String
   deriving (Eq, Show)
@@ -289,6 +314,8 @@ data Phase
   | OV22Ones1200                 -- ^ remote S1 seen (112 ON); scrambled ones at 1200 until 600 ms
   | OV22Ones2400                 -- ^ scrambled ones at 2400, waiting for 32 of the remote's
   | Connected Standard Rate
+  -- | V.8 chose V.32; the line is about to change hands.
+  | V32Handover
   | V8NoMode                     -- ^ V.8 ran but found nothing in common
   | Done
   deriving (Eq, Show)
@@ -323,9 +350,11 @@ fskTx, fskRx :: Role -> Standard -> FskSpec
 fskTx role s = case linkFor role s of
   FskLink t _ -> t
   V22Link {} -> error "fskTx: V.22"
+  V32Link {} -> error "fskTx: V.32"
 fskRx role s = case linkFor role s of
   FskLink _ r -> r
   V22Link {} -> error "fskRx: V.22"
+  V32Link {} -> error "fskRx: V.32"
 
 -- 1200 bit/s: 155 ms of unscrambled ones = 93 symbols; 270 ms = 324 bits;
 -- S1 lasts 100 ms = 60 symbols, half of it is enough to recognise it
@@ -407,10 +436,16 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       -- whole menu; nothing it then selects will be runnable, which is
       -- the price of asking.
       | hcV8OfferAll cfg = [minBound .. maxBound]
-      | otherwise = [ MV22 | any (`elem` modes) [V22, V22bis] ]
+      | otherwise = [ MV32 | V32 `elem` modes ]
+                    ++ [ MV22 | any (`elem` modes) [V22, V22bis] ]
                     ++ [ MV23Duplex | v23Allowed ]
                     ++ [ MV21 | V21 `elem` modes ]
     canRun m = case m of
+      -- V.8 has one codepoint for the whole family (Table 4 item 3,
+      -- printed as "V.32bis/V.32"); which rate is used is settled by the
+      -- R1/R2/R3 exchange inside V.32's own start-up, exactly as the S1
+      -- exchange settles 1200 against 2400 for V.22.
+      MV32 -> V32 `elem` modes
       MV22 -> any (`elem` modes) [V22, V22bis]
       MV23Duplex -> v23Allowed
       MV21 -> V21 `elem` modes
@@ -515,6 +550,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
     remoteAlive s = case linkFor role s of
       FskLink _ rx -> t - lastToneOf rx <= hcDrop cfg
       V22Link {} -> True
+      V32Link {} -> True
       where lastToneOf spec = case toneSince of
               Just (g, _) | g == fskMark spec || g == fskSpace spec -> t
               _ -> hsLastTone st
@@ -562,6 +598,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
         | inPhase >= 3 -> enter AV8Gap
       AV8Gap
         | inPhase >= 0.075 -> case hsV8Mod st of
+            Just MV32 | canRun MV32 -> enter V32Handover
             Just MV22 | canRun MV22 -> enter (AProbe V22)
             Just MV21 | canRun MV21 -> enter (AProbe V21)
             _ -> enter V8NoMode
@@ -645,6 +682,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
             -- V.8 does not separate V.22 from V.22bis: the answerer now
             -- sends unscrambled binary 1 and the rate is settled by the
             -- usual S1 exchange
+            Just MV32 | canRun MV32 -> enter V32Handover
             Just MV22 | canRun MV22 -> enter OAfterAns
             Just MV23Duplex | canRun MV23Duplex -> enter (OReply V23)
             Just MV21 | canRun MV21 -> enter (OReply V21)
@@ -701,6 +739,8 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
     clBits = replicate 30 True ++ hdlcFrameBits 3 2 (encodeMessage (CL ourModes))
     msBits m = replicate 30 True ++ hdlcFrameBits 3 2 (encodeMessage (MS m))
     tx = case hsPhase st'' of
+      -- the V.32 start-up puts its own signals on the line from here
+      V32Handover -> TxSilence
       ABilling -> TxSilence
       A8Dual -> TxDual 1375 2002 v8Level
       A8Tone -> TxTone 400
@@ -742,9 +782,13 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       OV22Settle -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Ones1200 -> TxV22 LowChannel R1200 TxScrambledOnes
       OV22Ones2400 -> TxV22 LowChannel R2400 TxScrambledOnes
+      -- V.32 never reaches here: once it is selected the modem hands the
+      -- line to Modec.V32Start, which runs on the sample clock rather
+      -- than on this machine's 20 ms tick.
+      Connected V32 _ -> TxSilence
       Connected s r | isV22Family s -> case v22LinkAt (hsRole st'') r of
         V22Link txc _ _ -> TxV22 txc r TxScrambledData
-        FskLink {} -> TxSilence
+        _ -> TxSilence
       Connected s _ -> TxData (fskTx (hsRole st'') s)
       Done -> TxSilence
       V8NoMode -> TxSilence
@@ -781,6 +825,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       (_, V8NoMode) -> HsFailed (case hsV8Mod st'' of
         Just m -> "V.8: far end selected " ++ modName m ++ ", which this modem does not run"
         Nothing -> "V.8: no modulation in common")
+      (_, V32Handover) -> HsStartV32
       (_, Connected s r) | isV22Family s -> HsConnected s (v22LinkAt (hsRole st'') r)
       (_, Connected s _) -> HsConnected s (linkFor (hsRole st'') s)
       _ -> HsBusy
