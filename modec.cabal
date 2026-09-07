@@ -27,6 +27,7 @@ library
                       Modec.V22
                       Modec.Scrambler
                       Modec.QAM
+                      Modec.Echo
                       Modec.V32
                       Modec.V32Pump
                       Modec.Hdlc

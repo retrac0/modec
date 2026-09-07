@@ -26,8 +26,9 @@ import Modec.Telnet
 import Modec.Async
 import Modec.V22
 import Modec.V32
-import Modec.V32Pump
 import Modec.QAM
+import Modec.V32Pump
+import Modec.Echo
 import qualified Modec.V32 as V32
 import Modec.Hdlc
 import Modec.MnpFrame
@@ -1793,6 +1794,91 @@ v32PumpTests = testGroup "V.32 data pump"
     fastPlain = fast ++ [ jitter ]
     fastCoded = fast ++ [ ("SNR 16 dB", tel 16) ]
 
+-- | An echo path with several taps at fractional delays -- what a
+-- hybrid actually returns.  Modec.Channel's chEcho is a single real tap
+-- at a whole number of samples, which a linear FIR cancels exactly; a
+-- canceller measured against that reports a number it will not repeat on
+-- a telephone line.
+echoPath :: [(Double, Double)] -> Signal -> Signal
+echoPath taps x = VS.generate (VS.length x) $ \i ->
+  sum [ g * sampleAt x (fromIntegral i - d) | (d, g) <- taps ]
+
+-- Run the canceller the way Modec.Modem will: cancel the received block
+-- first, then remember the block we transmitted.  A modem produces its
+-- transmit audio only after consuming the receive block, so the
+-- reference is always a block behind, and the test has to honour that or
+-- it is measuring a canceller that could not exist.
+runEcho :: EchoConfig -> Int -> Signal -> Signal -> (Signal, EchoState)
+runEcho cfg blk tx rx = go 0 (echoInit cfg) []
+  where
+    n = VS.length rx
+    go i st acc
+      | i >= n = (VS.concat (reverse acc), st)
+      | otherwise =
+          let take_ = min blk (n - i)
+              (st1, clean) = echoBlock cfg True (VS.slice i take_ rx) st
+              st2 = echoPush cfg (VS.slice i take_ tx) st1
+          in go (i + take_) st2 (clean : acc)
+
+echoTests :: TestTree
+echoTests = testGroup "echo cancellation"
+  [ testCase "a dispersive hybrid return is cancelled by 30 dB" $ do
+      let tx = gaussianNoise 5 24000 0.3
+          rx = echoPath [(200, 0.20), (203.5, 0.10), (209.2, 0.04)] tx
+          cfg = defaultEchoConfig
+          (out, st) = runEcho cfg 160 tx rx
+          tailOf v = VS.drop (VS.length v - 6000) v
+          p v = VS.sum (VS.map (\a -> a * a) v) / fromIntegral (VS.length v)
+          erle = 10 * logBase 10 (p (tailOf rx) / p (tailOf out))
+      assertBool ("converged ERLE " ++ show erle ++ " dB") (erle > 30)
+      assertBool ("tracked ERLE " ++ show (echoErle st) ++ " dB") (echoErle st > 25)
+
+  , testCase "it does not move the taps while the far end is talking" $ do
+      -- With both ends transmitting, the far end's signal lands in the
+      -- error term and drives the filter away from the echo path.  The
+      -- start-up of Figure 4/V.32 is half duplex so this never has to be
+      -- guessed at, and the canceller simply refuses to adapt unless it
+      -- is told the line is ours.
+      let tx = gaussianNoise 5 16000 0.3
+          far = gaussianNoise 99 16000 0.3
+          rx = VS.zipWith (+) (echoPath [(200, 0.2), (203.5, 0.1)] tx) far
+          cfg = defaultEchoConfig
+          frozen = echoInit cfg
+          (_, stNo) = foldl (\(i, st) _ ->
+              let sl = VS.slice i 160 rx
+                  (st1, _) = echoBlock cfg False sl st
+              in (i + 160, echoPush cfg (VS.slice i 160 tx) st1))
+            (0, frozen) [1 .. 90 :: Int]
+      assertEqual "a frozen canceller subtracts nothing"
+        0 (round (1e9 * echoErle stNo) :: Int)
+
+  , testCase "the answer does not depend on how the audio is cut up" $ do
+      let tx = gaussianNoise 5 12000 0.3
+          rx = echoPath [(200, 0.2), (203.5, 0.1)] tx
+          cfg = defaultEchoConfig
+          (a, _) = runEcho cfg 160 tx rx
+          (b, _) = runEcho cfg 80 tx rx
+          worst = VS.maximum (VS.map abs (VS.zipWith (-) a b))
+      assertBool ("largest difference " ++ show worst) (worst < 1e-12)
+
+  , testCase "adapting with nothing to cancel costs a little, in proportion to the step" $ do
+      -- A least-mean-squares filter adapting against a signal it cannot
+      -- predict does not sit still: it wanders, and adds a fraction of
+      -- the step size back as noise.  That is not a fault to be tuned
+      -- out, it is why the step is only taken when the line is ours --
+      -- and why Figure 4/V.32 is built out of half-duplex periods.
+      let tx = gaussianNoise 5 12000 0.3
+          rx = gaussianNoise 42 12000 0.2
+          p v = VS.sum (VS.map (\a -> a * a) v) / fromIntegral (VS.length v)
+          cost mu = let (out, _) = runEcho defaultEchoConfig { ecMu = mu } 160 tx rx
+                    in p out / p rx - 1
+          fast = cost 0.3
+          slow = cost 0.05
+      assertBool ("at mu 0.3 it added " ++ show fast) (fast > 0 && fast < 0.25)
+      assertBool ("at mu 0.05 it added " ++ show slow) (slow > 0 && slow < 0.05)
+      assertBool "a smaller step wanders less" (slow < fast)
+  ]
+
 -- | The shared self-synchronising scrambler.  V.22 and V.32 used to
 -- carry a copy each; these pin the behaviour both copies had.
 scramblerTests :: TestTree
@@ -1880,7 +1966,7 @@ toneFrameTests = testGroup "tone frames carry their own bank"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
