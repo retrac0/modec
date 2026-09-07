@@ -45,7 +45,7 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, v32Rates, v32bisRates)
-import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
+import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm, v32DataPower)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Hdlc
@@ -65,6 +65,7 @@ data ModemConfig = ModemConfig
   , mcV32Rates  :: Maybe RateSeq -- ^ rates to offer; 'Nothing' takes them from the modes
   , mcEcho      :: EchoConfig    -- ^ echo canceller tuning, for the modes that need one
   , mcMaxEvmV32 :: Double  -- ^ stop passing bytes when the decision error exceeds this much of the constellation's own margin
+  , mcMinPowerV32 :: Double  -- ^ below this received power the V.32 carrier is gone
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -86,6 +87,10 @@ defaultModemConfig fs role modes = ModemConfig
   , mcV32Rates = Nothing
   , mcEcho = defaultEchoConfig
   , mcMaxEvmV32 = 0.5
+  -- Measured: a connected V.32 receiver sits around 4e-3 of this and a
+  -- silent line at 1e-9.  Anywhere between is a threshold; this is two
+  -- orders below the one and far above the other.
+  , mcMinPowerV32 = 1e-5
   , mcMaxEvm = 1.0
   }
 
@@ -615,7 +620,7 @@ modemStep cfg st0 rxBlock newBytes =
           st1 = st { msEcho = echo', msZeros = onesRun' }
       in finishDataWith (v32Audio role rate pump') st1
            (DataV32 role rate pump' framer' armed') (V32Link role rate)
-           (v32DataEvm pump' < 1e3) line
+           (v32DataPower pump' > mcMinPowerV32 cfg) line
     DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
             Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)

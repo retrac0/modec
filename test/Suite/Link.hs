@@ -190,6 +190,21 @@ modemTests = testGroup "full modem duplex" $
                   ++ show (length rxA') ++ " the other, which should be almost none"
                   ++ " until the receiver is good enough to carry it")
         (length rxO' < 8 && length rxA' < 8)
+  , testCase "a V.32 call notices when the far end stops" $ do
+      -- It could not.  The carrier watchdog was handed "the decision
+      -- error is under 1e3", which is an EWMA of a squared error on a
+      -- unit-power constellation: it settles near 0.005 and its own
+      -- give-up threshold is 0.4, so the test was true for ever and
+      -- msLost never grew.  The far end could hang up and the modem
+      -- would sit there transmitting into a dead line until the process
+      -- was killed, reporting nothing.  V.22 has always had a real
+      -- energy test; V.32 has one now.
+      let cfg role = defaultModemConfig 8000 role [V32]
+          (_, _, evO, _) = modemDuplexCut (cfg Originate) (cfg Answer) 30 textO textA 30 12
+      assertBool ("originate events " ++ show evO)
+        (any (\e -> case e of EvConnected V32 _ -> True; _ -> False) evO)
+      assertBool ("expected a drop after the line went quiet, got " ++ show evO)
+        (EvDropped `elem` evO)
   , testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
       let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 18
       -- the station that received MS (the caller) becomes the answering modem on the high channel

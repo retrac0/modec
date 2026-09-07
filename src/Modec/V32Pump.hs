@@ -33,6 +33,7 @@ module Modec.V32Pump
   , v32DataRx
   , v32DataTx
   , v32DataEvm
+  , v32DataPower
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
@@ -372,6 +373,12 @@ v32DataFrom rx tx code st = st { vdRx = rx, vdTx = tx, vdCode = code }
 
 v32DataEvm :: V32Data -> Double
 v32DataEvm = qamRxEvm . vdRx
+
+-- | The received signal power the receiver is working from: an average
+-- of the raw symbol magnitude before the AGC touches it, so it goes to
+-- nothing when the far end does.
+v32DataPower :: V32Data -> Double
+v32DataPower = qamRxPower . vdRx
 
 -- | How many symbols of context the decoder needs behind it.  A trellis
 -- decoder judges a sequence, so restarting it at every block boundary
