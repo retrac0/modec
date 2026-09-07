@@ -72,10 +72,9 @@ data Message
 revision :: Word8
 revision = 2
 
-typeMS, typeCL, typeCLR, typeACK1, typeNAK1 :: Word8
+typeMS, typeCL, typeACK1, typeNAK1 :: Word8
 typeMS = 1
 typeCL = 2
-typeCLR = 3
 typeACK1 = 4
 typeNAK1 = 8
 

@@ -507,7 +507,6 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       (s : _) -> Just s
       [] -> Nothing
     enter p = st' { hsPhase = p, hsPhaseAt = t }
-    justEntered = hsPhaseAt st == t
     -- V.22 signal detectors
     u11Seen = case v22 of
       Just r -> vrU11Run r >= u11Symbols && vrAngleErr r < 8

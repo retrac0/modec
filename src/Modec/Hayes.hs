@@ -138,8 +138,8 @@ commands st cmds acts out = case cmds of
   ('A' : rest) -> commands st rest (acts ++ [ActAnswer]) out
   ('H' : rest) -> let (_, rest') = digits rest
                   in commands st { hsMode = Command, hsConnected = False } rest' (acts ++ [ActHangup]) out
-  ('O' : rest) -> let (_, rest') = digits rest
-                  in if hsConnected st then (st { hsMode = Online }, out, acts ++ [ActOnline]) else (st, out <> err st, acts)
+  ('O' : _) ->
+    if hsConnected st then (st { hsMode = Online }, out, acts ++ [ActOnline]) else (st, out <> err st, acts)
   ('Z' : rest) -> let (_, rest') = digits rest in commands (reset st) rest' (acts ++ [ActHangup]) out
   ('&' : 'F' : rest) -> let (_, rest') = digits rest in commands (reset st) rest' acts out
   ('&' : _ : rest) -> let (_, rest') = digits rest in commands st rest' acts out
@@ -160,7 +160,15 @@ commands st cmds acts out = case cmds of
          _ -> (st, out <> err st, acts)
   _ -> (st, out <> err st, acts)
   where
-    digits s = let (ds, rest) = span isDigit s in (if null ds then 0 else read ds, rest)
+    -- Read through Integer and clamp, rather than straight to Int: the
+    -- digits come from whatever the terminal typed, and ATS0=<twenty
+    -- digits> should be a silly register value and not an overflow.
+    -- The signature matters too -- without it every one of the dozen
+    -- call sites defaults its own numeric type.
+    digits :: String -> (Int, String)
+    digits s = let (ds, rest) = span isDigit s
+                   v = if null ds then 0 else read ds :: Integer
+               in (fromIntegral (max 0 (min 999 v)), rest)
     pad3 n = let s = show n in replicate (3 - length s) '0' ++ s
     reset s = s { hsEcho = True, hsVerbose = True, hsQuiet = False, hsS0 = 0, hsMode = Command, hsConnected = False }
 

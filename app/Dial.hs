@@ -21,7 +21,7 @@ module Dial
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, bracket, bracket_, try)
-import Control.Monad (unless, when)
+import Control.Monad (unless)
 import Data.Char (isSpace)
 import Data.List (isInfixOf, isPrefixOf)
 import Network.Socket

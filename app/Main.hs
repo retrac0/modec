@@ -158,10 +158,6 @@ cmdP = hsubparser
             (long "mode" <> metavar "LIST"
              <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32 (default: all but v32)")
       <|> pure H.allStandards
-    mnpP =
-          flag' (Just 4) (long "mnp" <> help "MNP error correction (ITU-T V.42 Annex A), classes 2 to 4")
-      <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, but offering only up to class N")
-      <|> pure Nothing
     -- Dialling asks for error correction the way a modem with its
     -- factory settings does.  An unprotected call over a VoIP trunk
     -- delivers the odd corrupt character in the direction it transmits,

@@ -13,7 +13,7 @@ module Modem
 
 import Control.Concurrent
 import Numeric (showFFloat)
-import Control.Exception (IOException, bracket, finally, throwTo, try)
+import Control.Exception (IOException, bracket, finally, try)
 import Control.Monad
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Builder as BB

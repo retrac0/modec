@@ -41,7 +41,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), allRates, defaultRates, rateBitRate)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), defaultRates, rateBitRate)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
 import Modec.V32Start
 import Modec.Echo
