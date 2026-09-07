@@ -626,21 +626,13 @@ rateSeqV32bis r = rsCan2400 r && rsTrellis r
 -- | Table 6/V.32 and Table 5/V.32 bis: the 16 bits of a rate sequence,
 -- B0 first.  B0-B3, B7, B11 and B15 are there to synchronise on.
 rateSeqBits :: RateSeq -> [Bool]
-rateSeqBits r =
-  [ False, False, False, False
-  , rsCan2400 r, rsCan4800 r, rsCan9600 r, True
-  , rsTrellis r, rsCan7200 r, rsCan12000 r, True
-  , rsCan14400 r, False, False, True ]
+rateSeqBits = seqBits False
 
 -- | Table 7/V.32: signal E, which ends a rate signal and names the rate
 -- and coding of the scrambled ones that follow it.  B0-B3 are ones
 -- rather than zeros, which is what tells it from a rate sequence.
 eSeqBits :: RateSeq -> [Bool]
-eSeqBits r =
-  [ True, True, True, True
-  , rsCan2400 r, rsCan4800 r, rsCan9600 r, True
-  , rsTrellis r, rsCan7200 r, rsCan12000 r, True
-  , rsCan14400 r, False, False, True ]
+eSeqBits = seqBits True
 
 decodeRateSeq :: [Bool] -> Maybe RateSeq
 decodeRateSeq = decodeSeq False
@@ -653,6 +645,16 @@ decodeESeq = decodeSeq True
 -- are read but not checked: Table 5 Note 2 reserves them and says to
 -- ignore them on reception, so a modem that insisted on their value
 -- would refuse a conformant signal from a later modem.
+-- | The sixteen bits of a rate sequence or of E, which differ only in
+-- the four that lead them: R1/R2/R3 open with four zeros and E with four
+-- ones.  'decodeSeq' takes the same argument for the same reason.
+seqBits :: Bool -> RateSeq -> [Bool]
+seqBits lead r =
+  replicate 4 lead ++
+  [ rsCan2400 r, rsCan4800 r, rsCan9600 r, True
+  , rsTrellis r, rsCan7200 r, rsCan12000 r, True
+  , rsCan14400 r, False, False, True ]
+
 decodeSeq :: Bool -> [Bool] -> Maybe RateSeq
 decodeSeq lead bs = case bs of
   [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, _, _, b15]
