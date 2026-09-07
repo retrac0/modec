@@ -277,13 +277,17 @@ segFreq band s
 -- | Frames to runs.  A frame is taken to cover the hop beginning at
 -- its window centre, so a run's boundaries fall at the midpoints of
 -- the transitions rather than a whole window late.
-runsOf :: [ToneFrame] -> [(Maybe Sig, Double)] -> [Seg]
-runsOf frames named = foldr add [] (zip named frames)
+runsOf :: ProgressParams -> [ToneFrame] -> [Seg]
+runsOf pp = foldr add []
   where
     hop = tbHopSec progressToneBank
-    add ((s, t), fr) (nxt : rest)
-      | segSig nxt == s = nxt { segStart = t, segAmps = addAmps (tfAmps fr) (segAmps nxt) } : rest
-    add ((s, t), fr) acc = Seg s t (t + hop) (tfAmps fr) : acc
+    add fr acc = case acc of
+      (nxt : rest) | segSig nxt == s ->
+        nxt { segStart = t, segAmps = addAmps (tfAmps fr) (segAmps nxt) } : rest
+      _ -> Seg s t (t + hop) (tfAmps fr) : acc
+      where
+        s = sigOfFrame pp fr
+        t = tfTime fr - tbWindowSec progressToneBank / 2
 
 -- | Absorb any run too short to be an element of a cadence into the
 -- run before it, then join runs that have become the same.  One frame
@@ -468,8 +472,7 @@ progressRxBlock pp st chunk =
   (st { prBank = bank', prRaw = kept, prSeen = seen', prLast = last' }, reverse out)
   where
     (bank', frames) = stepStage (prBank st) chunk
-    named = [ (sigOfFrame pp fr, tfTime fr - tbWindowSec progressToneBank / 2) | fr <- frames ]
-    raw = joinRuns (prRaw st) (runsOf frames named)
+    raw = joinRuns (prRaw st) (runsOf pp frames)
     n = length raw
     (last', out) = foldl' step (prLast st, []) [ view pp (take k raw) | k <- [max 1 (prSeen st) .. n] ]
     step (prev, acc) segs = case classify pp segs of

@@ -412,3 +412,39 @@ tracking down the area code and dialling -- a community that already
 reasons carefully about POTS versus VoIP on a real modem bank is a good
 match for what modec is trying to test against -- but not yet a candidate
 that can be called from what's on hand.
+
+10. 2600.network -- dialled and confirmed
+-----------------------------------------
+
+A public dial-up service (2600.network) whose stated purpose is to let
+old hardware dial real systems with real modems, reachable from any PSTN
+line in the US and Canada. It publishes a regional number list at
+2600.network/numbers, written with the letter o standing in for the zero
+in 2600, and gives two numbers per region on two different carriers --
+one routed through Twilio, one through BulkVS -- which makes it the
+first target here that can separate a board's behaviour from its
+carrier's.
+
+Three were dialled on 6 September 2026, one of each routing:
+
+    +1 929 470 2600  New York City NY   Twilio   CONNECT V.22bis 2400
+    +1 838 270 2600  Troy NY            BulkVS   CONNECT V.22bis 2400
+    +1 564 244 2600  Clark WA           Twilio   CONNECT V.22bis 2400
+
+All three answered in 8 to 11 s and completed the V.22bis start-up in
+5.3 to 6.1 s, and all three are the same system behind it:
+
+    https://2600.network - Patton 3120 #1
+    uSerNaME:
+
+A Patton 3120 access server, and the alternating case is the service's
+own styling rather than anything the line did to it -- the rest of the
+banner arrives in the case it was sent in. No login was attempted.
+
+This is a better bench target than any single board. It answers at once,
+it answers the same way every time, it is meant to be dialled by
+machines, and the two carriers per region give a controlled comparison:
+the same far end, the same modulation, a different path. The banner is
+short and fixed, which makes it a weak oracle for byte errors -- weaker
+than ACTS, which sends a documented time code once a second -- but it is
+a fixed string, which is more than a BBS banner offers.

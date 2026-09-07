@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """Dial a list of BBS numbers with modec and record each call.
 
-One call at a time.  For every call baresip is started fresh and killed
-again afterwards, so a call cannot outlive the driver's own timer no
-matter how the modem side behaves: the hard cap on connected time is
-enforced by killing the user agent, not by asking it nicely.
+One call at a time, through one baresip that is started once and kept
+registered for the whole sweep.
 
-baresip is started first because modec connects to its control port at
-startup; the PipeWire loopback nodes modec then creates are in place well
-before any call needs them, since baresip's audio module only opens the
-device when media comes up.
+It used to be started fresh for every call, which made the hard cap on
+call length easy -- killing the user agent ends the call whatever the
+modem side is doing -- but it also meant one SIP REGISTER per call, and
+a trunk that answers the first dozen of those will start dropping them.
+On a sweep of twenty numbers, six in a row came back "no answer" with
+nothing dialled at all: REGISTER had timed out and the calls were never
+placed.  So registration happens once, and the cap is enforced by
+killing modec and then telling baresip to hang up over its own control
+port, which clears the line without touching the registration.
+
+baresip is started before modec because modec connects to its control
+port at startup; the PipeWire loopback nodes modec then creates are in
+place well before any call needs them, since baresip's audio module only
+opens the device when media comes up.
 """
-import os, re, signal, struct, subprocess, sys, time, datetime, json
+import os, re, signal, socket, struct, subprocess, sys, time, datetime, json
 import math
 
 ROOT = "/home/joel/modec"
@@ -26,6 +34,14 @@ CTRL = 4444
 # written.  Ringing costs the far end nothing, so it is not counted, but
 # it is still bounded.
 ANSWER_CAP = float(os.environ.get("BBS_HOLD", "20"))   # seconds on the line once answered
+# baresip has to finish registering before a number can be dialled, or
+# it answers the dial with "could not find UA" and the call is scored as
+# a no-answer that was never placed.  Waited for rather than slept
+# through: a fixed pause is a guess, and the guess was wrong on a cold
+# start.
+REG_WAIT = float(os.environ.get("BBS_REG_WAIT", "40"))  # seconds to wait for registration
+GAP = float(os.environ.get("BBS_GAP", "0"))             # seconds between calls
+BARESIP_LOG = os.environ.get("BBS_BARESIP_LOG", "/tmp/bbs-baresip.log")
 NUDGE = 4.0             # seconds between bare returns once connected
 RING_CAP = 32.0         # give up if no answer tone by then
 TOTAL_CAP = ANSWER_CAP + RING_CAP + 10        # backstop on the whole call
@@ -127,6 +143,94 @@ class AnswerWatch:
         return False
 
 
+def ctrl_send(cmd, params=""):
+    """One command down baresip's ctrl_tcp socket, netstring-framed JSON.
+
+    Used only between calls, when modec has exited and is no longer
+    holding the port: it is how a call that outlived its budget is
+    cleared without restarting the user agent and losing the
+    registration with it.
+    """
+    msg = json.dumps({"command": cmd, "params": params, "token": "sweep"})
+    payload = ("%d:%s," % (len(msg), msg)).encode()
+    try:
+        s = socket.create_connection(("127.0.0.1", CTRL), timeout=3)
+        s.sendall(payload)
+        time.sleep(0.3)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+class Agent:
+    """One baresip, started once and kept registered for the sweep."""
+
+    def __init__(self, path=BARESIP_LOG):
+        self.path = path
+        self.proc = None
+        self.mark = 0
+
+    def _lines(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.mark)
+                return f.read().decode(errors="replace").splitlines()
+        except OSError:
+            return []
+
+    def registered(self):
+        # baresip prints the registrar's answer; 200 OK is a registration
+        # that took.  Failures are left to the timeout rather than
+        # matched, since what baresip prints for them varies.
+        return any("200 OK" in l for l in self._lines())
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self):
+        self.stop()
+        killall(["baresip"])
+        time.sleep(0.5)
+        self.mark = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+        f = open(self.path, "ab")
+        self.proc = subprocess.Popen(["baresip"], stdout=f, stderr=subprocess.STDOUT,
+                                     stdin=subprocess.DEVNULL)
+        t0 = time.time()
+        while time.time() - t0 < REG_WAIT:
+            if self.registered():
+                log("  baresip registered after %.1f s" % (time.time() - t0))
+                return True
+            if not self.alive():
+                break
+            time.sleep(0.5)
+        log("  baresip did not register within %.0f s" % REG_WAIT)
+        for l in self._lines()[-5:]:
+            log("    %s" % l)
+        return False
+
+    def ensure(self):
+        """Registered and running, restarting with backoff if not."""
+        if self.alive() and self.registered():
+            return True
+        for wait in (0, 15, 45):
+            if wait:
+                log("  waiting %.0f s before trying to register again" % wait)
+                time.sleep(wait)
+            if self.start():
+                return True
+        return False
+
+    def stop(self):
+        if self.proc is not None:
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            self.proc = None
+
+
 def send(proc, data):
     try:
         proc.stdin.write(data); proc.stdin.flush()
@@ -134,9 +238,9 @@ def send(proc, data):
         pass
 
 
-def place_call(binpath, number, label, rate, outdir):
+def place_call(agent, binpath, number, label, rate, outdir):
     """Returns a dict describing what happened."""
-    killall(["baresip", "modec", "pw-loopback", "pw-cat"])
+    killall(["modec", "pw-loopback", "pw-cat"])
     time.sleep(1.0)
     ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     safe = re.sub(r"[^A-Za-z0-9]+", "-", label).strip("-").lower()
@@ -147,9 +251,9 @@ def place_call(binpath, number, label, rate, outdir):
            "connect_seconds": None, "v8": None,
            "mnp": None, "mnp_seconds": None, "mnp_outcome": None}
 
-    baresip = subprocess.Popen(["baresip"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    time.sleep(3.5)                            # let it register
+    if not agent.ensure():
+        res["outcome"] = "not dialled: SIP registration failed"
+        return res, "baresip would not register\n"
     modec = subprocess.Popen(
         [binpath, "modem", "--sip", "127.0.0.1:%d" % CTRL, "--sip-domain", DOMAIN,
          "--audio-sip-loop", "modec"]
@@ -181,6 +285,15 @@ def place_call(binpath, number, label, rate, outdir):
             res["outcome"] = "modec did not start"
             return res, err.decode(errors="replace")
 
+        # A registration that failed is not a BBS that did not answer.
+        # Telling the two apart is the whole value of the sweep: a
+        # number scored "no answer" when nothing was ever dialled is
+        # worse than no result, because it looks like a result.
+        pump()
+        if b"REGISTER_FAIL" in err:
+            res["outcome"] = "not dialled: SIP registration failed"
+            return res, err.decode(errors="replace")
+
         modec.stdin.write(b"ATDT%s\r" % number.encode())
         modec.stdin.flush()
         log("  dialled %s" % number)
@@ -190,14 +303,20 @@ def place_call(binpath, number, label, rate, outdir):
         dialled = time.time(); watch = AnswerWatch(wav); up = None
         while time.time() - dialled < RING_CAP:
             pump()
-            if b"NO CARRIER" in out or b"BUSY" in out:
+            if b"BUSY" in out:
+                res["outcome"] = "busy, congestion or special information tone"; break
+            if b"NO CARRIER" in out:
                 res["outcome"] = "busy or rejected"; break
+            if b"REGISTER_FAIL" in err or b"could not find UA" in err:
+                res["outcome"] = "not dialled: SIP registration failed"; break
             if watch.answered() or re.search(rb"CONNECT \d+", out):
                 up = time.time(); break
             time.sleep(0.1)
         if up is None:
             res["ring_seconds"] = round(time.time() - dialled, 1)
-            if res["outcome"] == "no answer":
+            if res["outcome"].startswith("not dialled"):
+                log("  %s" % res["outcome"])
+            elif res["outcome"] == "no answer":
                 log("  no answer tone after %.0f s" % res["ring_seconds"])
             return res, err.decode(errors="replace")
         res["ring_seconds"] = round(up - dialled, 1)
@@ -232,15 +351,15 @@ def place_call(binpath, number, label, rate, outdir):
             pass
         pump()
     finally:
-        if baresip:
-            baresip.send_signal(signal.SIGTERM)
-            try: baresip.wait(3)
-            except subprocess.TimeoutExpired: baresip.kill()
         modec.send_signal(signal.SIGTERM)
         try: modec.wait(4)
         except subprocess.TimeoutExpired: modec.kill()
-        killall(["baresip", "modec", "pw-loopback", "pw-cat"])
+        killall(["modec", "pw-loopback", "pw-cat"])
         pump()
+        # modec is gone and cannot have sent a BYE, so make sure the
+        # line is down before the next number is dialled.  The port is
+        # free now that modec has exited.
+        ctrl_send("hangup")
 
     # printable text the far end sent
     txt = re.sub(rb"\xff[\xfa-\xfe].", b"", out)
@@ -284,10 +403,12 @@ if __name__ == "__main__":
     offset = int(os.environ.get("BBS_OFFSET", "0"))
     plan = ([(t, rates[(i + offset) % len(rates)]) for i, t in enumerate(targets)]
             if rotate else [(t, r) for t in targets for r in rates])
-    for t, rate in plan:
+    agent = Agent()
+    try:
+      for t, rate in plan:
         if True:
             log("%s  %s  @%s" % (t["name"], t["number"], rate))
-            r, errlog = place_call(binpath, t["number"], t["name"], rate, REC)
+            r, errlog = place_call(agent, binpath, t["number"], t["name"], rate, REC)
             log("  -> %s%s" % (r["outcome"], (" " + r["standard"]) if r["standard"] else ""))
             if r["v8"]:
                 log("  V.8: %s" % r["v8"])
@@ -299,4 +420,9 @@ if __name__ == "__main__":
                 f.write(errlog)
             results.append(r)
             json.dump(results, open(outjson, "w"), indent=1)
+            if GAP:
+                time.sleep(GAP)
+    finally:
+      agent.stop()
+      killall(["baresip", "modec", "pw-loopback", "pw-cat"])
     log("done, %d calls" % len(results))
