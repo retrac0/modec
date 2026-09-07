@@ -386,18 +386,6 @@ data RxOut = RxOut
   , roOnes2400 :: !Int                 -- ^ consecutive 16-way-decided descrambled ones
   }
 
--- | Four-point cubic (Catmull-Rom) interpolation at fractional index t.
-cubicAt :: Signal -> Double -> Double
-cubicAt v t =
-  let i = floor t :: Int
-      mu = t - fromIntegral i
-      p0 = VS.unsafeIndex v (i - 1); p1 = VS.unsafeIndex v i
-      p2 = VS.unsafeIndex v (i + 1); p3 = VS.unsafeIndex v (i + 2)
-      a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
-      a1 = p0 - 2.5 * p1 + 2 * p2 - 0.5 * p3
-      a2 = -0.5 * p0 + 0.5 * p2
-  in ((a0 * mu + a1) * mu + a2) * mu + p1
-
 -- | Quadrant (0..3) of a point.
 quadrantOf :: Double -> Double -> Int
 quadrantOf x y

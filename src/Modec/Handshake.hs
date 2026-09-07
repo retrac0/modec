@@ -140,7 +140,9 @@ linkFor Answer V21 = FskLink v21Channel2 v21Channel1
 -- say, has it the other way round.
 linkFor Originate V23 = FskLink v23Backward v23Forward
 linkFor Answer V23 = FskLink v23Forward v23Backward
-linkFor role s = v22LinkAt role (if s == V22bis then R2400 else R1200)
+linkFor role Bell212A = v22LinkAt role R1200
+linkFor role V22 = v22LinkAt role R1200
+linkFor role V22bis = v22LinkAt role R2400
 
 v22LinkAt :: Role -> Rate -> Link
 v22LinkAt Originate r = V22Link LowChannel HighChannel r

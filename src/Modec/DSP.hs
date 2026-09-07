@@ -21,9 +21,10 @@ module Modec.DSP
   , rms
   , db
   , fromDb
-    -- * Noise
+    -- * Noise and test sources
   , gaussianNoise
   , addNoise
+  , prbs
     -- * FIR filters
   , firLowpass
   , firBandpass
@@ -32,13 +33,18 @@ module Modec.DSP
   , firCentered
   , firStream
   , delayDistortionKernel
+    -- * Pulse shaping
+  , rrcPulse
+  , rrcKernel
     -- * Interpolation and time warping
   , sampleAt
+  , cubicAt
   , resampleBy
   , variableDelay
   , frequencyShift
   ) where
 
+import Data.Bits (shiftL, testBit, (.&.), (.|.))
 import qualified Data.Vector.Storable as VS
 
 -- | Real-valued sample stream, nominally in [-1, 1].
@@ -153,6 +159,23 @@ gaussianNoise seed n sigma = VS.unfoldrN n step (fromIntegral seed * 2654435761 
 addNoise :: Int -> Double -> Signal -> Signal
 addNoise seed sigma x = VS.zipWith (+) x (gaussianNoise seed (VS.length x) sigma)
 
+-- | Maximal-length pseudo-random binary sequence from the generating
+-- polynomial @1 + x^-q + x^-p@: a @p@-stage Fibonacci shift register
+-- tapped at stages @p@ and @q@, started at all ones.  ITU-T O.152, the
+-- test pattern the reference implementations use, is @(11, 9)@ and
+-- repeats every 2047 bits.
+--
+-- Deterministic, so a test can compare a demodulated stream against the
+-- pattern that produced it without carrying the bits around.
+prbs :: (Int, Int) -> Int -> [Bool]
+prbs (p, q) n = take n (go mask)
+  where
+    mask = (1 `shiftL` p) - 1 :: Int
+    go !reg =
+      let b = testBit reg (p - 1) /= testBit reg (q - 1)
+          reg' = ((reg `shiftL` 1) .|. (if b then 1 else 0)) .&. mask
+      in b : go reg'
+
 sinc :: Double -> Double
 sinc t
   | t == 0 = 1
@@ -238,6 +261,27 @@ delayDistortionKernel fs edgeMs taps0 = VS.zipWith (*) (blackman taps) raw
           s = sum [ cos (2 * pi * f * n / fs - phase f) | j <- [0 .. nf - 1], let f = fromIntegral j * fs / 2 / fromIntegral nf ]
       in s / fromIntegral nf
 
+-- | Root-raised-cosine impulse response with roll-off @b@, at time @t@
+-- in symbol periods.  The two removable singularities (t = 0 and
+-- t = 1\/4b) are given their limits.
+rrcPulse :: Double -> Double -> Double
+rrcPulse b t
+  | abs t < 1e-9 = 1 - b + 4 * b / pi
+  | abs (abs t - 1 / (4 * b)) < 1e-9 =
+      b / sqrt 2 * ((1 + 2 / pi) * sin (pi / (4 * b)) + (1 - 2 / pi) * cos (pi / (4 * b)))
+  | otherwise =
+      (sin (pi * t * (1 - b)) + 4 * b * t * cos (pi * t * (1 + b))) / (pi * t * (1 - (4 * b * t) ^ (2 :: Int)))
+
+-- | Sampled root-raised-cosine kernel for a matched filter, unit energy:
+-- @rrcKernel fs baud rollOff span@, spanning @span@ symbols each side.
+rrcKernel :: Double -> Double -> Double -> Double -> VS.Vector Double
+rrcKernel fs baud rollOff span_ = VS.map (/ norm) raw
+  where
+    sps = fs / baud
+    half = round (span_ * sps) :: Int
+    raw = VS.generate (2 * half + 1) (\i -> rrcPulse rollOff (fromIntegral (i - half) / sps))
+    norm = sqrt (VS.sum (VS.map (\v -> v * v) raw))
+
 -- | Band-limited interpolation at fractional index @t@ (Lanczos, a = 6).
 -- Samples outside the vector read as zero.
 sampleAt :: Signal -> Double -> Double
@@ -255,6 +299,21 @@ sampleAt x t = go (-5) 0
               u = fromIntegral k - fr
               l = if abs u < a then sinc u * sinc (u / a) else 0
           in go (k + 1) (acc + v * l)
+
+-- | Four-point cubic (Catmull-Rom) interpolation at fractional index
+-- @t@.  Unlike 'sampleAt' this reads without bounds checks, so the
+-- caller must keep one sample before and two after @t@ in range; that is
+-- what makes it cheap enough for a per-symbol timing loop.
+cubicAt :: Signal -> Double -> Double
+cubicAt v t =
+  let i = floor t :: Int
+      mu = t - fromIntegral i
+      p0 = VS.unsafeIndex v (i - 1); p1 = VS.unsafeIndex v i
+      p2 = VS.unsafeIndex v (i + 1); p3 = VS.unsafeIndex v (i + 2)
+      a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+      a1 = p0 - 2.5 * p1 + 2 * p2 - 0.5 * p3
+      a2 = -0.5 * p0 + 0.5 * p2
+  in ((a0 * mu + a1) * mu + a2) * mu + p1
 
 -- | Read the signal at a rate @ratio@ times the original: @ratio > 1@
 -- shortens the signal (as seen by a receiver whose clock runs slow).

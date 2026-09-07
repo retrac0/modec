@@ -1359,10 +1359,77 @@ pipewireTests = testGroup "PipeWire device discovery"
       , PwNode 29 "Dummy-Driver" "" (PwOther "") ]
     nodes = take 3 expected
 
+-- The shared primitives V.32 will be built on.  'cubicAt' needs no test
+-- of its own: it moved out of Modec.V22 unchanged, and the V.22 pump's
+-- exact-zero bit error assertions are a tighter check than anything
+-- written here would be.
+dspTests :: TestTree
+dspTests = testGroup "shared DSP primitives"
+  [ testCase "the lifted RRC kernel is the one V.22 has been using" $
+      -- Modec.V22 keeps its own 600 Bd / 0.75 roll-off kernel; the
+      -- parameterised one must agree with it tap for tap, or the lift
+      -- changed a tuned mode.
+      assertEqual "taps" (VS.toList (rrcTaps 8000)) (VS.toList (rrcKernel 8000 600 0.75 6))
+
+  , testCase "the RRC kernel has unit energy and is symmetric" $
+      forM_ [(8000, 600, 0.75, 6), (8000, 2400, 0.25, 8), (48000, 2400, 0.5, 6)] $
+        \(fs, bd, ro, sp) -> do
+          let k = rrcKernel fs bd ro sp
+              e = VS.sum (VS.map (\v -> v * v) k)
+          assertBool "odd length" (odd (VS.length k))
+          assertBool ("unit energy: " ++ show e) (abs (e - 1) < 1e-9)
+          assertBool "symmetric" (VS.toList k == reverse (VS.toList k))
+
+  , testCase "root raised cosine squares up to a Nyquist pulse" $ do
+      -- RRC convolved with itself is a raised cosine, which is zero at
+      -- every non-zero multiple of the symbol period.  That is the
+      -- property the matched filter exists to provide, and it catches a
+      -- wrong roll-off or a mis-scaled time axis.
+      -- 9600/2400 gives exactly 4 samples per symbol, so the zeros land
+      -- on samples and the check is not blunted by where we sample.
+      let sps = 4 :: Int
+          k = rrcKernel 9600 2400 0.5 10
+          n = VS.length k
+          rc d = sum [ VS.unsafeIndex k i * VS.unsafeIndex k (i + d)
+                     | i <- [0 .. n - 1 - d] ]
+          peak = rc 0
+      forM_ [1 .. 4 :: Int] $ \m -> do
+        let v = abs (rc (m * sps) / peak)
+        assertBool ("symbol " ++ show m ++ " leaks " ++ show v) (v < 1e-3)
+
+  , testCase "the singularities of the RRC pulse are their limits" $
+      forM_ [0.25, 0.5, 0.75] $ \b -> do
+        let near t = rrcPulse b t
+            lim t = (rrcPulse b (t - 1e-7) + rrcPulse b (t + 1e-7)) / 2
+        assertBool "t = 0" (abs (near 0 - lim 0) < 1e-6)
+        assertBool "t = 1/4b" (abs (near (1 / (4 * b)) - lim (1 / (4 * b))) < 1e-6)
+
+  , testCase "O.152 is a maximal-length sequence of 2047 bits" $ do
+      let bits = prbs (11, 9) 6141          -- three periods
+          period = take 2047 bits
+      assertEqual "repeats after 2047" (period ++ period ++ period) bits
+      assertBool "no shorter period" $
+        and [ take (2047 - k) (drop k bits) /= take (2047 - k) bits
+            | k <- [1, 2, 3, 7, 23, 89, 1023] ]
+
+  , testCase "O.152 is balanced and runs no longer than the register" $ do
+      let period = prbs (11, 9) 2047
+          ones = length (filter id period)
+          runs b = maximum (map length (filter (all (== b)) (groupRuns period)))
+      -- A maximal-length 11-stage sequence has 2^10 ones and 2^10 - 1
+      -- zeros, one run of 11 ones and none of more than 10 zeros.
+      assertEqual "ones" 1024 ones
+      assertEqual "longest run of ones" 11 (runs True)
+      assertEqual "longest run of zeros" 10 (runs False)
+  ]
+  where
+    groupRuns [] = []
+    groupRuns (x:xs) = let (a, b) = span (== x) xs in (x : a) : groupRuns b
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
