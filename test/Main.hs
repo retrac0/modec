@@ -28,6 +28,7 @@ import Modec.V22
 import Modec.V32
 import Modec.QAM
 import Modec.V32Pump
+import Modec.V32Start
 import Modec.Echo
 import qualified Modec.V32 as V32
 import Modec.Hdlc
@@ -1879,6 +1880,53 @@ echoTests = testGroup "echo cancellation"
       assertBool "a smaller step wanders less" (slow < fast)
   ]
 
+-- The start-up signals, as they actually go on the line.
+v32SignalTests :: TestTree
+v32SignalTests = testGroup "V.32 start-up signals"
+  [ testCase "AA and AC land where the Recommendation says to listen" $ do
+      -- The calling modem's steady state A is a tone at the carrier;
+      -- the answering modem's alternating A and C is that carrier
+      -- switched 180 degrees every symbol, which puts its energy at
+      -- 1800 +/- 1200 Hz.  Those are the 600 and 3000 Hz that 5.4.1 has
+      -- the calling modem listen for, and they fall out of the
+      -- constellation rather than being stated anywhere.
+      let aa = modulateStates 600 [StA]
+          ac = modulateStates 600 [StA, StC]
+          at f x = goertzel 8000 f (VS.drop 800 x)
+      assertBool "AA is a tone at 1800" (at 1800 aa > 20 * at 600 aa && at 1800 aa > 20 * at 3000 aa)
+      assertBool "AC has no energy at 1800" (at 1800 ac < 0.05 * at 600 ac)
+      assertBool "AC sits at 600 and 3000" (at 600 ac > 10 * at 1800 ac && at 3000 ac > 10 * at 1800 ac)
+
+  , testCase "a phase reversal is found to the sample" $ do
+      -- 5.4.1 fixes the turnaround from hearing a reversal to sending
+      -- one at 64 +/- 2 symbol periods: 26.67 +/- 0.83 ms, or +/- 6.7
+      -- samples at 8 kHz.  A 20 ms handshake tick cannot express that,
+      -- so the receiver has to timestamp the event itself.
+      forM_ [ ("AA to CC at 1800 Hz", 1800, [StA], [StC])
+            , ("AC to CA at 600 Hz", 600, [StA, StC], [StC, StA])
+            , ("AC to CA at 3000 Hz", 3000, [StA, StC], [StC, StA]) ] $
+        \(nm, f, before, after) -> do
+          let n = 400
+              sig = modulateStates2 n before n after
+              want = round (fromIntegral n * 8000 / 2400 :: Double) :: Int
+              (_, revs) = revBlock sig (revInit 8000 f)
+              near = [ r | r <- revs, abs (r - want) < 40 ]
+          assertBool (nm ++ ": found " ++ show revs ++ ", wanted near " ++ show want)
+            (length near == 1)
+          let got = head near
+          assertBool (nm ++ ": off by " ++ show (got - want) ++ " samples")
+            (abs (got - want) <= 7)
+  ]
+
+-- A run of one state, then a run of another, through the real pump.
+modulateStates2 :: Int -> [TrainState] -> Int -> [TrainState] -> Signal
+modulateStates2 n1 a n2 b =
+  modulatePointsFor (take n1 (cycle (map statePoint a)) ++ take n2 (cycle (map statePoint b)))
+
+modulateStates :: Int -> [TrainState] -> Signal
+modulateStates n a = modulatePointsFor (take n (cycle (map statePoint a)))
+
+
 -- | The shared self-synchronising scrambler.  V.22 and V.32 used to
 -- carry a copy each; these pin the behaviour both copies had.
 scramblerTests :: TestTree
@@ -1963,10 +2011,56 @@ toneFrameTests = testGroup "tone frames carry their own bank"
       assertBool "diagnostic bank does" (amp diagnosticToneBank > 0.4)
   ]
 
+-- Two V.32 modems talking to each other through a noisy, attenuated
+-- line, one block of transport delay in each direction -- the same
+-- arrangement modemDuplex uses for the other modes.  The round trip that
+-- the start-up measures for itself is that delay, so a test can check
+-- the modem's own answer against a number it knows.
+v32StartDuplex :: Double -> Double -> Int -> (V32Status, V32Status, [(Double, (V32Phase, V32Phase))], Maybe Int, Maybe Int)
+v32StartDuplex snr maxT blk = go 0 o0 a0 quiet quiet V32Busy V32Busy []
+  where
+    fs = 8000
+    quiet = VS.replicate blk 0
+    offer = RateSeq False True True True
+    o0 = v32StartInit fs Calling offer
+    a0 = v32StartInit fs Answering offer
+    impair k t x = addNoise (k * 100003 + t) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.7) x)
+    go t so sa fromA fromO stO stA trace
+      | fromIntegral t * fromIntegral blk / fs > maxT = (stO, stA, reverse trace, v32RoundTrip so, v32RoundTrip sa)
+      | otherwise =
+          let (so', audO, s1) = v32StartStep so (impair 1 t fromA)
+              (sa', audA, s2) = v32StartStep sa (impair 2 t fromO)
+              secs = fromIntegral t * fromIntegral blk / fs
+              here = (v32Phase so', v32Phase sa')
+              trace' = if null trace || snd (head trace) /= here
+                         then (secs, here) : trace else trace
+          in case (s1, s2) of
+               (V32Busy, V32Busy) -> go (t + 1) so' sa' audA audO s1 s2 trace'
+               _ | done s1 && done s2 -> (s1, s2, reverse trace', v32RoundTrip so', v32RoundTrip sa')
+                 | otherwise -> go (t + 1) so' sa' audA audO s1 s2 trace'
+    done V32Busy = False
+    done _ = True
+
+v32StartTests :: TestTree
+v32StartTests = testGroup "V.32 start-up per Figure 4"
+  [ testCase "two V.32 modems reach 9600 trellis" $ do
+      let (so, sa, trace, nt, mt) = v32StartDuplex 25 20 160
+      assertEqual ("calling side (trace " ++ show trace ++ ")")
+        (V32Connected V32R9600T) so
+      assertEqual "answering side" (V32Connected V32R9600T) sa
+      -- the harness delays each direction by one block, so the round
+      -- trip the modem measures for itself should be about two of them
+      case (nt, mt) of
+        (Just a, Just b) -> do
+          assertBool ("NT " ++ show a ++ " samples") (a > 100 && a < 1200)
+          assertBool ("MT " ++ show b ++ " samples") (b > 100 && b < 1200)
+        _ -> assertFailure ("round trip not measured: " ++ show (nt, mt))
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"

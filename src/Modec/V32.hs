@@ -50,6 +50,8 @@ module Modec.V32
     -- * Differential encoding (Tables 1 and 2)
   , diffEncode1
   , diffDecode1
+  , dibitOfTurn
+  , turnOfDibit
   , diffEncode2
   , diffDecode2
     -- * Trellis coding (Figure 2)
@@ -264,6 +266,15 @@ turnOf (False, False) = 1
 turnOf (False, True) = 0
 turnOf (True, False) = 2
 turnOf (True, True) = 3
+
+-- | The input dibit that asks for this many quarter turns, and back.
+-- Table 1 is a table of quadrant /changes/, so a receiver that has
+-- measured the change has already done the work.
+dibitOfTurn :: Int -> (Bool, Bool)
+dibitOfTurn = turnBack
+
+turnOfDibit :: (Bool, Bool) -> Int
+turnOfDibit = turnOf
 
 turnBack :: Int -> (Bool, Bool)
 turnBack k = case k `mod` 4 of

@@ -21,6 +21,7 @@ module Modec.V32Pump
     -- * Start-up signalling
   , conditioningSymbols
   , stateSymbols
+  , modulatePointsFor
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
@@ -190,6 +191,11 @@ v32ModulateTrained fs dir r amp trn bits = (modulatePoints fs amp (pre ++ pts), 
   where
     pre = conditioningSymbols dir trn
     (_, pts) = encodeSymbols dir r bits txCoderInit
+
+-- | Points on the line at 8 kHz and the usual level, for tests and
+-- for generating the start-up signals offline.
+modulatePointsFor :: [Point] -> Signal
+modulatePointsFor = modulatePoints 8000 0.5
 
 modulatePoints :: Double -> Double -> [Point] -> Signal
 modulatePoints fs amp pts0 = go qamTxInit pts0 []

@@ -30,6 +30,7 @@ library
                       Modec.Echo
                       Modec.V32
                       Modec.V32Pump
+                      Modec.V32Start
                       Modec.Hdlc
                       Modec.MnpFrame
                       Modec.Mnp
