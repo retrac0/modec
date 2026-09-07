@@ -37,6 +37,7 @@ module Modec.V32Start
   , v32Phase
   , v32Elapsed
   , v32RoundTrip
+  , v32Bis
   , v32EchoAdapt
   , v32Turns
   , v32StartRx
@@ -213,6 +214,12 @@ v32StartCoder = vsData
 -- | Recent descrambled bits, newest first.
 v32Bits :: V32Start -> [Bool]
 v32Bits = vsBits
+
+-- | Whether this turned out to be a V.32bis call: Table 5 Note 1 makes
+-- it V.32bis only if both rate signals announce it, so both halves of
+-- the exchange are asked.  Meaningless before R1 or R2 has been read.
+v32Bis :: V32Start -> Bool
+v32Bis s = rateSeqV32bis (vsOffer s) && maybe False rateSeqV32bis (vsPeer s)
 
 -- | Start the V.32 exchange with the answer tone already sent, as it has
 -- been if V.8 or V.8bis brought us here: ANSam served as the V.25 answer

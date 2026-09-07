@@ -86,7 +86,7 @@ cmdP = hsubparser
       <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
       <*> (option (maybeReader modesReader)
              (long "mode" <> metavar "LIST"
-              <> help "comma-separated modes to negotiate, best first: bell103,v21,bell212a,v22,v22bis,v32 (default: all but v32)")
+              <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32,v32bis (default: all but v32 and v32bis)")
                 <|> pure H.allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
@@ -165,7 +165,7 @@ cmdP = hsubparser
     modesP =
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"
-             <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32 (default: all but v32)")
+             <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32,v32bis (default: all but v32 and v32bis)")
       <|> pure H.allStandards
     -- Dialling asks for error correction the way a modem with its
     -- factory settings does.  An unprotected call over a VoIP trunk
@@ -198,6 +198,7 @@ cmdP = hsubparser
       "v22" -> Just H.V22
       "v22bis" -> Just H.V22bis
       "v32" -> Just H.V32
+      "v32bis" -> Just H.V32bis
       _ -> Nothing
     splitOn c s = case break (== c) s of
       (a, []) -> [a]

@@ -653,16 +653,16 @@ modemTests = testGroup "full modem duplex"
       -- 7200 is V.32bis's addition below 9600, for a line that will not
       -- carry 9600: the rate signal names it in a bit V.32 had reserved,
       -- so a V.32 modem on the other end would simply not see it.
-      let cfg role = (defaultModemConfig 8000 role [V32]) { mcV32Rates = chosen V32R7200 }
+      let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosen V32R7200) }
           (rxO, rxA, evO, _) = modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
       assertBool ("originate events " ++ show evO)
-        (case evO of (EvConnected V32 (V32Link Originate V32R7200) : _) -> True; _ -> False)
+        (case evO of (EvConnected V32bis (V32Link Originate V32R7200) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
-      -- The other direction arrives, but behind a dozen bytes of rubbish
-      -- the framer finds while the descrambler is still coming into step.
-      -- That is why 7200 is not in the default offer: the rate works, the
-      -- head of the session does not.
-      assertBool ("text from originate to answer: " ++ show rxA) (textO `isSuffixOf` rxA)
+      -- Both directions exactly, head of the session included.  This
+      -- used to arrive behind a dozen bytes of rubbish, which was not
+      -- the descrambler coming into step but the receiver acquiring the
+      -- data constellation on the carrier loop's tracking gain.
+      assertEqual "text from originate to answer" textO rxA
   , testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
       let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 18
       -- the station that received MS (the caller) becomes the answering modem on the high channel

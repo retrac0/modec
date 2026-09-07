@@ -71,6 +71,8 @@ module Modec.V32
   , noRates
   , allRates
   , defaultRates
+  , v32Rates
+  , v32bisRates
   , rateSeqV32bis
   , rateSeqBits
   , eSeqBits
@@ -607,9 +609,33 @@ allRates = RateSeq True True True True True True True
 -- for 128.  Raising it means a better interpolator, not a better
 -- channel.  'allRates' offers the lot, for measuring exactly that.
 defaultRates :: RateSeq
-defaultRates = noRates
-  { rsCan2400 = True, rsTrellis = True
-  , rsCan4800 = True, rsCan9600 = True }
+defaultRates = v32Rates
+
+-- | What a V.32 call offers: 4800, and 9600 with the trellis and
+-- without.  B4 stays clear, which is how Note 1 has a modem say it is
+-- not speaking V.32bis; B8 is set because V.32 has a trellis of its own.
+v32Rates :: RateSeq
+v32Rates = noRates
+  { rsTrellis = True, rsCan4800 = True, rsCan9600 = True }
+
+-- | What a V.32bis call offers: V.32's rates, 7200, and the B4 that
+-- announces the Recommendation.
+--
+-- 7200 is in now that the receiver acquires the data constellation
+-- instead of trying to track it: a call at 7200 delivers both
+-- directions exactly, head of the session included.  12000 and 14400
+-- are not.  They are implemented, they negotiate, and they carry a
+-- telephone channel in the impairment tests, and they still do not
+-- survive a whole call -- 12000 manages one direction of two and 14400
+-- neither.  For 14400 the ceiling is the receiver's own noise floor
+-- rather than the line's: cubic interpolation at 3.3 samples per symbol
+-- and a root raised cosine cut at 12 symbols leave about 25 dB of
+-- implementation signal to noise, enough for 32 points and not for 128.
+-- Raising it means a better interpolator, not a better channel.  Ask
+-- for either by name and you get it; offering one that then damages the
+-- session is worse than not offering it.
+v32bisRates :: RateSeq
+v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True }
 
 rateSeqCleardown :: RateSeq -> Bool
 rateSeqCleardown r = not (or [ rsCan2400 r, rsCan4800 r, rsCan9600 r

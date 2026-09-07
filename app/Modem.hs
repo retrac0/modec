@@ -912,5 +912,7 @@ drain buf = B.concat . reverse <$> atomicModifyIORef' buf (\xs -> ([], xs))
 -- default, or the single rate @--v32-rate@ pins it to.  Pinning is how
 -- 7200, 12000 and 14400 are reached, since they are not in the default
 -- offer, and how a rate can be held down to see what a line will carry.
-v32Offered :: ModemOpts -> V32.RateSeq
-v32Offered o = maybe V32.defaultRates V32.chosenRate (moV32Rates o)
+-- | Nothing means take the rates from the modes, which is what --mode
+-- v32 and --mode v32bis are for; --v32-rate overrides both.
+v32Offered :: ModemOpts -> Maybe V32.RateSeq
+v32Offered o = fmap V32.chosenRate (moV32Rates o)

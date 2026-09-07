@@ -43,7 +43,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), defaultRates, rateBitRate)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, v32Rates, v32bisRates)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm)
 import Modec.V32Start
 import Modec.Echo
@@ -61,7 +61,7 @@ data ModemConfig = ModemConfig
   , mcSettle    :: Double        -- ^ seconds of idle mark after CONNECT before data flows
   , mcGuardTone :: Bool          -- ^ V.22 high channel 1800 Hz guard tone
   , mcMnp       :: Maybe MnpConfig  -- ^ MNP error correction; 'Nothing' passes bytes straight through
-  , mcV32Rates  :: RateSeq -- ^ the V.32 and V.32bis rates we will accept
+  , mcV32Rates  :: Maybe RateSeq -- ^ rates to offer; 'Nothing' takes them from the modes
   , mcEcho      :: EchoConfig    -- ^ echo canceller tuning, for the modes that need one
   , mcMaxEvmV32 :: Double  -- ^ the same, in V.32's unit-mean-power units
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
@@ -82,7 +82,7 @@ defaultModemConfig fs role modes = ModemConfig
   -- V.22 measures its decision error in grid units where the mean
   -- power is 10; V.32's constellations are normalised to unit mean
   -- power, so the same fraction of the signal is a tenth of the number.
-  , mcV32Rates = defaultRates
+  , mcV32Rates = Nothing
   , mcEcho = defaultEchoConfig
   , mcMaxEvmV32 = 0.1
   , mcMaxEvm = 1.0
@@ -231,7 +231,7 @@ modemInit cfg
   -- AC, which no other mode here would make sense of.  So a modem
   -- configured for V.32 goes straight into Figure 4, and reaches it
   -- otherwise only when V.8 or V.8bis has picked it.
-  | [V32] <- hcModes hs =
+  | [s] <- hcModes hs, isV32 s =
       base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
@@ -247,7 +247,7 @@ modemInit cfg
              echo0 0 0 0 HsBusy [] Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
-    echo0 = if V32 `elem` hcModes hs then Just (echoInit (mcEcho cfg)) else Nothing
+    echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -257,8 +257,18 @@ modemInit cfg
 -- signal says so (Table 5\/V.32 bis Note 1) and the exchange settles on
 -- 9600 or below without either end being told which Recommendation to
 -- speak.
+-- Which rates go out is the difference between the two modes, so it
+-- follows the modes unless a rate was asked for by name.  V.32bis is
+-- announced by B4 and B8 together, and a V.32 call has to leave B4
+-- clear or a V.32bis modem on the other end will read Note 1 the other
+-- way and offer 14400 to a modem that cannot take it.
 v32Offer :: ModemConfig -> RateSeq
-v32Offer = mcV32Rates
+v32Offer cfg = case mcV32Rates cfg of
+  Just r -> r
+  Nothing
+    | V32bis `elem` modes -> v32bisRates
+    | otherwise -> v32Rates
+  where modes = hcModes (mcHandshake cfg)
 
 dirOfRole :: Role -> Direction
 dirOfRole Originate = Calling
@@ -518,15 +528,16 @@ modemStep cfg st0 rxBlock newBytes =
            V32Busy -> (st1 { msMode = Starting32 s32' }, audio, [], [])
            V32Connected r ->
              let link = V32Link (hcRole hs) r
+                 std = if v32Bis s32' then V32bis else V32
                  -- carry the receiver the start-up trained and the
                  -- transmitter's symbol clock, rather than restarting both
                  -- mid-signal
                  pump = v32DataFrom (v32StartRx s32') (v32StartTx s32') (v32StartCoder s32')
                                     (v32DataInit fs r)
                  st2 = st1 { msMode = DataV32 (hcRole hs) r pump (asyncRxInit (mcFraming cfg)) False
-                           , msStatus = HsConnected V32 link, msSettled = 0
+                           , msStatus = HsConnected std link, msSettled = 0
                            , msMnp = mnpFor cfg link }
-             in (st2, audio, [], [EvConnected V32 link])
+             in (st2, audio, [], [EvConnected std link])
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsFailed why }, audio, [], [EvFailed why])
     DataV32 role rate pump framer armed ->
@@ -543,8 +554,42 @@ modemStep cfg st0 rxBlock newBytes =
           -- zero followed by ones in there is a start bit and a character
           -- as far as the framer can tell.  A settle window of scrambled
           -- ones makes 64 free.
+          --
+          -- 64 is not enough here, though, and the reason is the
+          -- handover rather than the descrambler.  The receiver arrives
+          -- in data mode with the equaliser the start-up trained on four
+          -- points and a decision error around 0.28, and takes about
+          -- 160 ms to converge on the thirty-two it now has to read.  A
+          -- fixed ceiling lets it through at 0.065 -- comfortably inside
+          -- 'mcMaxEvmV32', and thirteen times the 0.005 it settles at --
+          -- so the framer armed on a receiver that was still acquiring
+          -- and handed the terminal a page of noise.  Asking for a run
+          -- four times as long asks the right question instead of a
+          -- better-tuned version of the wrong one: a run of ones this
+          -- long is itself the evidence the line is being read
+          -- correctly, since a receiver that is still converging puts a
+          -- zero in and starts the count again.  §5.4.2's B1 is 128
+          -- symbol intervals of scrambled ones, which is 512 bits at
+          -- 9600, so there is room for it.
+          --
+          -- 64 is enough for the descrambler and not for the handover.
+          -- The receiver arrives in data mode with the equaliser the
+          -- start-up trained on four points, a decision error around
+          -- 0.28, and about 160 ms of converging to do on the thirty-two
+          -- points it now has to read.  A fixed ceiling lets it through
+          -- at 0.065 -- comfortably inside 'mcMaxEvmV32', and thirteen
+          -- times the 0.005 it settles at -- so the framer armed on a
+          -- receiver that was still acquiring and handed the terminal a
+          -- page of noise before the first real byte.
+          --
+          -- So arming asks for a converged receiver and not merely a
+          -- usable one, which is the ordinary split between acquiring a
+          -- signal and tracking it: hard to catch, easy to keep.  The
+          -- half second is for the line that never gets that good, where
+          -- passing bits with errors in them still beats passing none.
+          acquired = v32DataEvm pump' < mcMaxEvmV32 cfg / 4 || msSettled st > 0.5
           onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
-          armed' = armed || (onesRun' >= 64 && trust)
+          armed' = armed || (onesRun' >= 64 && trust && acquired)
           sync = case msMnp st of
             Just m -> mnpFraming m == FramingBit
             Nothing -> False

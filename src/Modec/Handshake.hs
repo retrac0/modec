@@ -112,7 +112,7 @@ import Data.Word (Word8)
 -- 'V23' is V.23 duplex: 1200 bit/s from the answering modem, 75 bit/s
 -- back from the calling one.  It is the only asymmetric mode here, and
 -- the only one whose two directions run at different rates.
-data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis | V32 deriving (Eq, Show, Enum, Bounded)
+data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis | V32 | V32bis deriving (Eq, Show, Enum, Bounded)
 
 -- | Every mode, best first; the default configuration.  V.23 is not in
 -- it: 75 bit/s upstream is worse than V.21 for anything but viewdata, so
@@ -130,7 +130,7 @@ isV22Family s = s `elem` [Bell212A, V22, V22bis]
 -- than anything this tick-driven machine can drive, and it is the only
 -- mode that needs an echo canceller.
 isV32 :: Standard -> Bool
-isV32 = (== V32)
+isV32 s = s == V32 || s == V32bis
 
 data Role = Originate | Answer deriving (Eq, Show)
 
@@ -159,6 +159,7 @@ linkFor role Bell212A = v22LinkAt role R1200
 linkFor role V22 = v22LinkAt role R1200
 linkFor role V22bis = v22LinkAt role R2400
 linkFor role V32 = V32Link role V32R9600T
+linkFor role V32bis = V32Link role V32R9600T
 
 v22LinkAt :: Role -> Rate -> Link
 v22LinkAt Originate r = V22Link LowChannel HighChannel r
@@ -442,7 +443,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       -- whole menu; nothing it then selects will be runnable, which is
       -- the price of asking.
       | hcV8OfferAll cfg = [minBound .. maxBound]
-      | otherwise = [ MV32 | V32 `elem` modes ]
+      | otherwise = [ MV32 | any isV32 modes ]
                     ++ [ MV22 | any (`elem` modes) [V22, V22bis] ]
                     ++ [ MV23Duplex | v23Allowed ]
                     ++ [ MV21 | V21 `elem` modes ]
@@ -451,7 +452,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       -- printed as "V.32bis/V.32"); which rate is used is settled by the
       -- R1/R2/R3 exchange inside V.32's own start-up, exactly as the S1
       -- exchange settles 1200 against 2400 for V.22.
-      MV32 -> V32 `elem` modes
+      MV32 -> any isV32 modes
       MV22 -> any (`elem` modes) [V22, V22bis]
       MV23Duplex -> v23Allowed
       MV21 -> V21 `elem` modes
@@ -807,7 +808,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcLi
       -- V.32 never reaches here: once it is selected the modem hands the
       -- line to Modec.V32Start, which runs on the sample clock rather
       -- than on this machine's 20 ms tick.
-      Connected V32 _ -> TxSilence
+      Connected s _ | isV32 s -> TxSilence
       Connected s r | isV22Family s -> case v22LinkAt (hsRole st'') r of
         V22Link txc _ _ -> TxV22 txc r TxScrambledData
         _ -> TxSilence

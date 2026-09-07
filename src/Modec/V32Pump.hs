@@ -89,6 +89,29 @@ v32RxCfg r
     -- gain does both jobs: the fast one costs the trellis symbols at
     -- 30 dB, the slow one cannot acquire a 1 % clock offset at all.
 
+-- | The receiver's configuration for the symbols just after the
+-- handover, which is the fast gain again.
+--
+-- "Inherits that receiver already locked" is true of a start-up that
+-- went well and not of one that did not, and the tracking gain cannot
+-- tell the difference: it will hold a lock it is handed and cannot find
+-- one it is not.  A handover landing badly left the decision error at
+-- 0.031 for a whole call -- six times what the same link settles at,
+-- plenty to make the thirty-two point decisions wrong, and flat, so no
+-- amount of waiting helped.  Acquiring and tracking want different
+-- gains, which the comment above already says; they want them at
+-- different times as well.
+v32AcqCfg :: V32Rate -> QamRxCfg
+v32AcqCfg r = defaultRxCfg (slicePoint r) (constellation r)
+
+-- | How long that lasts.  §5.4.2's B1 is 128 symbol intervals of
+-- scrambled ones between E and the data, put there so a receiver can
+-- settle on the constellation it has just been handed; twice that
+-- covers the far end starting early without reaching far into anything
+-- the tracking gain would rather be holding.
+v32AcqSymbols :: Int
+v32AcqSymbols = 256
+
 -- | Scrambler, differential encoder and (on the trellis alternative)
 -- convolutional encoder, with any bits left over from the last block.
 data TxCoder = TxCoder
@@ -315,13 +338,14 @@ data V32Data = V32Data
   , vdPend  :: [QamSym]   -- ^ symbols held back for the decoder's traceback
   , vdWait  :: [QamSym]   -- ^ symbols decoded but held back for traceback
   , vdBits  :: [Bool]     -- ^ data bits not yet coded onto symbols
+  , vdAcq   :: !Int       -- ^ symbols of acquisition gain left to run
   }
 
 v32DataInit :: Double -> V32Rate -> V32Data
 v32DataInit fs r = V32Data
   { vdTx = qamTxInit, vdCode = txCoderInit
   , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
-  , vdPend = [], vdWait = [], vdBits = [] }
+  , vdPend = [], vdWait = [], vdBits = [], vdAcq = v32AcqSymbols }
 
 -- | A data pump that inherits a receiver and transmitter the start-up
 -- has already brought into lock.
@@ -357,7 +381,8 @@ v32DataRx :: Double -> Direction -> V32Rate -> V32Data -> Signal -> (V32Data, [B
 v32DataRx fs dir r st rx = (st', out)
   where
     p = v32Params fs
-    (rx', syms) = qamRxBlock p (v32RxCfg r) rx (vdRx st)
+    cfg = if vdAcq st > 0 then v32AcqCfg r else v32RxCfg r
+    (rx', syms) = qamRxBlock p cfg rx (vdRx st)
     -- A Viterbi decoder is only sure of a symbol once it has seen the
     -- traceback's worth of symbols after it.  Emitting a block's newest
     -- symbols the moment they arrive therefore hands out precisely the
@@ -373,7 +398,8 @@ v32DataRx fs dir r st rx = (st', out)
     (dec', out) = decodeQuads dir r fresh (vdDec st)
     st' = st { vdRx = rx', vdDec = dec'
              , vdWait = drop emitTo stream
-             , vdPend = lastN vdOverlap (take emitTo stream) }
+             , vdPend = lastN vdOverlap (take emitTo stream)
+             , vdAcq = max 0 (vdAcq st - length syms) }
 
 -- | Transmit @n@ samples, carrying as many of @bits@ as will fit.  What
 -- does not fit stays in the coder, so nothing has to be handed back.

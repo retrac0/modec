@@ -107,3 +107,35 @@ window. What that cannot show is the connection completing: in replay
 our transmissions go nowhere, because the far end's audio is fixed. The
 recording proves the diagnosis and the fix addresses it; only another
 call will prove the connection.
+
+## live-v32-9600-heard.wav — the second call, and V.32 at 9600
+
+Same number, dialled the same way, and this time the far end had V.8 and
+V.32 both: `V.8 far end offers: data, V.32bis/V.32, V.22bis/V.22, V.21`
+at 13.07 s, and `CONNECT V32 9600 bit/s ... trellis coded` at 41.51 s.
+The first live V.32 connection, and it held for the ninety seconds the
+call was given.
+
+It also delivered nothing, and the 41 s is why. Figure 4 should be done
+by 24. The bit history was capped at 96 bits with the detectors looking
+at 64 of them, while one 20 ms block carries 96 bits at 4800 bit/s and
+192 at 9600 -- so every block put in more than was ever looked at. A
+rate signal repeats until it is answered and so was always caught in the
+end; E is sent exactly once, and this call put it in the gap. The modem
+sat in B1 for seventeen seconds, took a noise coincidence for E, and
+arrived in data mode long after the far end had finished its banner.
+
+Replayed against the fix it reaches data at 24.40 s and reads it:
+
+    https://2600.network - Patton 3120 #1
+    uSerNaME:
+
+The rubbish after that is the far end reacting to a modem that was still
+sending E at it, and a fixed recording cannot show what it would have
+done instead. That still wants another call.
+
+Note what this call does *not* verify. It never reached the V.22 phase
+the first call failed in -- V.8 picked V.32 immediately -- so the
+unscrambled binary 1 fix above is still unconfirmed against a real
+modem. This number answers with different hardware on different calls;
+it gave V.23 at 1200/75 an hour earlier.
