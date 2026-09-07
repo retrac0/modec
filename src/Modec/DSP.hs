@@ -15,6 +15,7 @@ module Modec.DSP
   , windowDot
   , toneEnergy
   , toneEnergyW
+  , mixDownAt
   , goertzel
   , toneAmplitude
   , toneAmplitudeW
@@ -108,9 +109,21 @@ toneEnergyW fs f w x = VS.zipWith (\a b -> a * a + b * b) (windowDot w re) (wind
   where
     (re, im) = mixTone fs f x
 
+-- | Mix a block down to complex baseband against a tone of @w@ radians
+-- per sample, starting from global sample index @n0@: multiply by
+-- @exp(-j w n)@ and return the in-phase and quadrature parts.
+--
+-- The offset is the point of it.  A streaming receiver takes the phase
+-- of its own local carrier from the running sample count, so a block
+-- boundary is not an event it can see -- and every receiver here that
+-- does so had written these two lines out by hand.
+mixDownAt :: Double -> Int -> Signal -> (Signal, Signal)
+mixDownAt w n0 x =
+  ( VS.imap (\i v -> v * cos (w * fromIntegral (n0 + i))) x
+  , VS.imap (\i v -> negate v * sin (w * fromIntegral (n0 + i))) x )
+
 mixTone :: Double -> Double -> Signal -> (Signal, Signal)
-mixTone fs f x = (VS.imap (\n v -> v * cos (w * fromIntegral n)) x, VS.imap (\n v -> v * sin (w * fromIntegral n)) x)
-  where w = 2 * pi * f / fs
+mixTone fs f = mixDownAt (2 * pi * f / fs) 0
 
 -- | Squared magnitude of one DFT bin at @f@ over a whole block, by
 -- Goertzel's recurrence: one multiply and two adds per sample, and no

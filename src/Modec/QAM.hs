@@ -284,8 +284,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
     n0 = rxN st0
     -- Phase continuity across blocks comes from the global sample index,
     -- so a block boundary is not an event the receiver can see.
-    mixRe = VS.imap (\i v -> v * cos (wc * fromIntegral (n0 + i))) chunk
-    mixIm = VS.imap (\i v -> negate v * sin (wc * fromIntegral (n0 + i))) chunk
+    (mixRe, mixIm) = mixDownAt wc n0 chunk
     hrev = VS.reverse (kernel p)
     (mfRe, histRe') = firStream hrev (rxHistRe st0) mixRe
     (mfIm, histIm') = firStream hrev (rxHistIm st0) mixIm

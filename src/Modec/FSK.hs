@@ -169,8 +169,7 @@ data DiscState = DiscState !Int !Signal !Signal
 rectCorr :: Double -> Int -> Int -> Int -> Signal -> (Signal, Signal)
 rectCorr w n0 l nOut ext = (out pr, out pim)
   where
-    re = VS.imap (\i v -> v * cos (w * fromIntegral (n0 + i))) ext
-    im = VS.imap (\i v -> negate v * sin (w * fromIntegral (n0 + i))) ext
+    (re, im) = mixDownAt w n0 ext
     pr = VS.scanl' (+) 0 re
     pim = VS.scanl' (+) 0 im
     out p = VS.generate nOut (\i -> VS.unsafeIndex p (i + l) - VS.unsafeIndex p i)
