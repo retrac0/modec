@@ -576,6 +576,25 @@ modemTests = testGroup "full modem duplex"
         assertBool ("echo " ++ show g ++ ": return loss " ++ show (erleO, erleA))
           (erleO > wantErle && erleA > wantErle)
 
+  , testCase "V.8 picks V.32 out of a list, and the start-up follows without a second answer tone" $ do
+      -- The path a live V.32 call actually takes.  A modem configured for
+      -- V.32 alone goes straight into Figure 4; one configured for V.32
+      -- among others runs V.8 first, offers V.32 in its menu (Table 4
+      -- item 3), and only on the far end selecting it hands the line to
+      -- the V.32 start-up -- which must begin at the answering modem's
+      -- AC, because ANSam has already been the answer tone.
+      let cfg r = withV8 (defaultModemConfig 8000 r [V32, V22bis, V22])
+          withV8 c = c { mcHandshake = (mcHandshake c) { hcV8 = True, hcV8bis = False } }
+          (rxO, rxA, evO, evA) = modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
+      -- the far end's menu is reported first, and must name V.32
+      assertBool ("originate events " ++ show evO)
+        (any (\e -> case e of EvV8Menu m -> MV32 `elem` v8Mods m; _ -> False) evO)
+      assertBool ("originate events " ++ show evO)
+        (EvConnected V32 (V32Link Originate V32R9600T) `elem` evO)
+      assertBool ("answer events " ++ show evA)
+        (EvConnected V32 (V32Link Answer V32R9600T) `elem` evA)
+      assertEqual "text from answer to originate" textA rxO
+      assertEqual "text from originate to answer" textO rxA
   , testCase "a V.32bis call held down to 7200 bit/s, text both ways" $ do
       -- 7200 is V.32bis's addition below 9600, for a line that will not
       -- carry 9600: the rate signal names it in a bit V.32 had reserved,
@@ -2272,6 +2291,105 @@ v32CallEvm cfgO cfgA maxT = go 0 (modemInit cfgO) (modemInit cfgA) quiet quiet N
                                              Just e -> Just (abs e)
                                              Nothing -> best)
 
+-- Fuzz the trained V.32 receiver along each impairment axis and report
+-- where it breaks, per rate.  A survey, not an assertion.
+v32Fuzz :: V32Rate -> [(String, Channel)] -> [(String, Int)]
+v32Fuzz r conds =
+  [ (nm, errs) | (nm, ch) <- conds
+  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+        sig = applyChannel 8000 ch clean
+        got = v32DemodulateTrained 8000 Answering r preSyms sig
+        errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
+                       | o <- [0 .. 300] ] ]
+  where payload = prbs (11, 9) 4000
+
+v32FuzzWith :: (QamRxCfg -> QamRxCfg) -> V32Rate -> [(String, Channel)] -> [(String, Int)]
+v32FuzzWith tune r conds =
+  [ (nm, errs) | (nm, ch) <- conds
+  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+        sig = applyChannel 8000 ch clean
+        got = v32DemodulateTrainedWith tune 8000 Answering r preSyms sig
+        errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
+                       | o <- [0 .. 300] ] ]
+  where payload = prbs (11, 9) 4000
+
+v32FuzzTests :: TestTree
+v32FuzzTests = testGroup "V.32 fuzz survey"
+  [ testCase "timing loop sweep" $ do
+      let tel = telephoneChannel 25
+          hard = [ ("jit 3@5", tel { chJitter = SineJitter 3 5 })
+                 , ("jit 5@2", tel { chJitter = SineJitter 5 2 })
+                 , ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
+                 , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
+                 , ("clock +1%", tel { chRateOffset = 0.01 })
+                 , ("clock +2%", tel { chRateOffset = 0.02 })
+                 , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
+                 , ("SNR 14", telephoneChannel 14) ]
+      forM_ [V32R4800, V32R9600] $ \r -> do
+        putStrLn ("=== " ++ show r)
+        forM_ [ (kp, ki) | kp <- [0.12, 0.25, 0.4], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) -> do
+          let res = v32FuzzWith (\c -> c { qrKp = kp, qrKi = ki }) r hard
+          putStrLn ("  kp=" ++ show kp ++ " ki=" ++ show ki ++ "  "
+                    ++ unwords [ take 11 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ') | (nm, e) <- res ])
+  , testCase "carrier loop sweep" $ do
+      let tel = telephoneChannel 25
+          hard = [ ("walk .02/5", tel { chJitter = WalkJitter 0.02 5 })
+                 , ("walk .05/10", tel { chJitter = WalkJitter 0.05 10 })
+                 , ("jit 3@5", tel { chJitter = SineJitter 3 5 })
+                 , ("jit 2@2", tel { chJitter = SineJitter 2 2 })
+                 , ("clock +1%", tel { chRateOffset = 0.01 })
+                 , ("carrier +20", tel { chFreqOffsetHz = 20 })
+                 , ("slips .5/2", tel { chJitter = Slips 0.5 2 })
+                 , ("SNR 14", telephoneChannel 14) ]
+          cell (nm, e) = take 14 (nm ++ ":" ++ (if e == 0 then "ok" else show e) ++ repeat ' ')
+      forM_ [V32R4800, V32R9600T] $ \r -> do
+        putStrLn ("=== " ++ show r)
+        forM_ [ (kp, ki) | kp <- [0.03, 0.08, 0.15, 0.25], ki <- [0.0015, 0.005, 0.015] ] $ \(kp, ki) ->
+          putStrLn ("  thKp=" ++ show kp ++ " thKi=" ++ show ki ++ "  "
+                    ++ concatMap cell (v32FuzzWith (\c -> c { qrThKp = kp, qrThKi = ki }) r hard))
+  , testCase "loop trace" $ do
+      -- watch the timing loop's sps estimate and the decision error
+      -- through a clock offset, block by block
+      forM_ [ ("clock +1%", (telephoneChannel 25) { chRateOffset = 0.01 })
+            , ("clock -1%", (telephoneChannel 25) { chRateOffset = -0.01 })
+            , ("walk .02/5", (telephoneChannel 25) { chJitter = WalkJitter 0.02 5 }) ] $ \(nm, ch) -> do
+        let r = V32R4800
+            payload = prbs (11, 9) 4000
+            (clean, _) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+            sig = applyChannel 8000 ch clean
+            p = v32Params 8000
+            cfg = v32RxCfg V32R4800
+            walk st k acc s
+              | VS.null s = reverse acc
+              | otherwise =
+                  let (c, rest) = VS.splitAt 800 s
+                      (st', _) = qamRxBlock p cfg c st
+                      row = (k, qamRxSps st', qamRxEvm st', qamRxFreq st' * 2400 / (2 * pi))
+                  in walk st' (k + 1) (row : acc) rest
+        putStrLn ("=== " ++ nm ++ " (nominal sps 3.3333)")
+        forM_ (walk (qamRxInit p cfg) (0 :: Int) [] sig) $ \(k, sps, evm, hz) ->
+          putStrLn ("  block " ++ show k ++ "  sps " ++ show (fromIntegral (round (sps * 10000)) / 10000 :: Double)
+                    ++ "  evm " ++ show (fromIntegral (round (evm * 1000)) / 1000 :: Double)
+                    ++ "  carrier " ++ show (fromIntegral (round hz) :: Double) ++ " Hz")
+  , testCase "survey" $
+      forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
+        let tel s = telephoneChannel s
+            axes =
+              [ ("SNR " ++ show s, tel s) | s <- [20, 16, 14, 12, 10, 8 :: Double] ] ++
+              [ ("sine jitter a=" ++ show a ++ " f=" ++ show f, (tel 25) { chJitter = SineJitter a f })
+              | (a, f) <- [(1, 2), (2, 2), (3, 2), (5, 2), (3, 5), (3, 10), (8, 1)] ] ++
+              [ ("walk jitter step=" ++ show st ++ " max=" ++ show mx, (tel 25) { chJitter = WalkJitter st mx })
+              | (st, mx) <- [(0.02, 5), (0.05, 10), (0.1, 20)] ] ++
+              [ ("slips every " ++ show e ++ "s of " ++ show k, (tel 25) { chJitter = Slips e k })
+              | (e, k) <- [(0.5, 2), (0.3, 4), (0.2, 8)] ] ++
+              [ ("clock " ++ show c, (tel 25) { chRateOffset = c }) | c <- [0.005, 0.01, 0.02, -0.01] ] ++
+              [ ("carrier " ++ show hz, (tel 25) { chFreqOffsetHz = hz }) | hz <- [10, 15, 20, -15] ] ++
+              [ ("delay dist " ++ show ms, (tel 25) { chDelayDist = ms }) | ms <- [1, 2, 3] ]
+        putStrLn ("=== " ++ show r)
+        forM_ (v32Fuzz r (map (\(n, c) -> (n, c)) axes)) $ \(nm, e) ->
+          putStrLn ("  " ++ take 30 (nm ++ repeat ' ') ++ (if e == 0 then "ok" else show e ++ " errors"))
+  ]
+
 v32StartTests :: TestTree
 v32StartTests = testGroup "V.32 start-up per Figure 4"
   [ testCase "the data pump carries bits between two of itself" $ do
@@ -2332,7 +2450,7 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, v32SignalTests, v32StartTests, v32FuzzTests, echoTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"

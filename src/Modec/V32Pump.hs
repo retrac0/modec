@@ -39,6 +39,7 @@ module Modec.V32Pump
   , v32Demodulate
   , v32DemodulateWith
   , v32DemodulateTrained
+  , v32DemodulateTrainedWith
   ) where
 
 import Modec.DSP (Signal, chunksOf)
@@ -75,7 +76,18 @@ v32Params fs = QamParams
 -- loops, which cannot wait for a traceback, while the Viterbi decoder
 -- runs behind it on the same symbols.
 v32RxCfg :: V32Rate -> QamRxCfg
-v32RxCfg r = defaultRxCfg (slicePoint r) (constellation r)
+v32RxCfg r
+  | rateTrellis r = base { qrThKp = 0.03 }
+  | otherwise = base
+  where
+    base = defaultRxCfg (slicePoint r) (constellation r)
+    -- Two carrier loops, one per stage.  The four-point receiver that
+    -- runs the start-up acquires with the fast gain, which reaches +/-18
+    -- Hz and follows timing wander; the trellis rates then inherit that
+    -- receiver already locked, and track with a gain small enough that
+    -- the Viterbi decoder is not shown the loop's own jitter.  Neither
+    -- gain does both jobs: the fast one costs the trellis symbols at
+    -- 30 dB, the slow one cannot acquire a 1 % clock offset at all.
 
 -- | Scrambler, differential encoder and (on the trellis alternative)
 -- convolutional encoder, with any bits left over from the last block.
@@ -265,11 +277,16 @@ v32DemodulateWith fs dir r blk sig = snd (decodeSymbols dir r syms rxCoderInit)
 -- know where it is in the start-up, and cannot simply be pointed at the
 -- line.
 v32DemodulateTrained :: Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
-v32DemodulateTrained fs dir r preSyms sig = snd (decodeSymbols dir r syms rxCoderInit)
+v32DemodulateTrained = v32DemodulateTrainedWith id
+
+-- | The same, with the receiver's tuning adjusted -- for finding out
+-- what the tuning should be.
+v32DemodulateTrainedWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
+v32DemodulateTrainedWith tune fs dir r preSyms sig = snd (decodeSymbols dir r syms rxCoderInit)
   where
     p = v32Params fs
-    trainCfg = v32RxCfg V32R4800
-    dataCfg = v32RxCfg r
+    trainCfg = tune (v32RxCfg V32R4800)
+    dataCfg = tune (v32RxCfg r)
     preN = ceiling (fromIntegral preSyms * samplesPerSymbol p)
     (pre, dat) = VS.splitAt preN sig
     stAfter = snd (runBlocks p trainCfg pre (qamRxInit p trainCfg))

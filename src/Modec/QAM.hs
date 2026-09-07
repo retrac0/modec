@@ -37,6 +37,8 @@ module Modec.QAM
   , qamRxEvm
   , qamRxSps
   , qamRxPower
+  , qamRxTheta
+  , qamRxFreq
   , qamRxReset
   , quarterTurns
     -- * Phase reversal tracking
@@ -82,12 +84,21 @@ data QamRxCfg = QamRxCfg
   }
 
 -- | Gains that work at 2400 baud with a unit-mean-power constellation.
--- The carrier loop is deliberately slower than V.22's.  A trellis
+--
+-- The carrier loop's integral gain is deliberately small.  A trellis
 -- decoder integrates over its whole traceback, so residual phase jitter
 -- costs it far more than it costs an uncoded slicer that judges each
 -- symbol alone: at V.22's gains the coded 9600 alternative was losing
 -- 453 symbols where the uncoded one lost none, which is the coding gain
--- running backwards.  Halving them puts both at zero.
+-- running backwards.  It was the integral term doing that, not the
+-- proportional one, which took a fuzzing sweep to separate: halving both
+-- fixed the trellis and quietly shrank the carrier pull-in range to
+-- about -18 to +15 Hz, so a 1 % clock offset -- which moves the carrier
+-- 18 Hz, since resampling moves every frequency -- acquired in one
+-- direction and wound the loop up the wrong way in the other.  A
+-- proportional gain of 0.08 with the integral left at 0.0015 acquires
+-- both, follows timing wander a good deal better, and leaves the trellis
+-- alone.
 -- The equaliser spans 31 T\/2 taps, about 15 symbols or 6.5 ms, which is
 -- the group delay a telephone connection actually smears a 2400 baud
 -- signal over; V.22's 15 taps cover the same milliseconds at a quarter
@@ -95,7 +106,7 @@ data QamRxCfg = QamRxCfg
 defaultRxCfg :: ((Double, Double) -> Int) -> (Int -> (Double, Double)) -> QamRxCfg
 defaultRxCfg slice point = QamRxCfg
   { qrKp = 0.12, qrKi = 0.0015, qrClamp = 2
-  , qrThKp = 0.03, qrThKi = 0.0015
+  , qrThKp = 0.08, qrThKi = 0.0015
   , qrEqMu = 0.002, qrEqTaps = 31
   , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrPower = 1
   , qrSlice = slice, qrPoint = point }
@@ -263,6 +274,12 @@ qamRxSps = rxSps
 
 qamRxPower :: QamRxState -> Double
 qamRxPower = rxPower_
+
+qamRxTheta :: QamRxState -> Double
+qamRxTheta = rxTheta
+
+qamRxFreq :: QamRxState -> Double
+qamRxFreq = rxFreq
 
 -- | The receiver as a stream stage, so it composes with the rest of the
 -- chain and does not care how the audio is cut up.  The configuration is
