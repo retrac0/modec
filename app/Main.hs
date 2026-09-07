@@ -1,6 +1,5 @@
 module Main (main) where
 
-import Control.Applicative (optional, (<|>))
 import Control.Monad (forM_, when)
 import qualified Data.ByteString as B
 import qualified Data.Vector.Storable as VS
@@ -22,7 +21,8 @@ import Modec.V32Start (v32Timeline)
 import qualified Modec.V32 as V32
 import Modec.Dtmf
 import Modec.Progress
-import Modec.Pipewire (describeNodes, pwAudioNodes)
+import Modec.Pipewire (describeNodes)
+import PipewireIO (pwAudioNodes)
 import Modec.DSP
 import qualified Modec.Handshake as H
 import Modem

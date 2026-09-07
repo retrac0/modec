@@ -66,6 +66,14 @@ wrong, not a bit error rate.
 | DTMF | digits to 3 dB SNR | Q.24's own accept and reject limits |
 | Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
 
+Twelve recorded calls are also in the suite, replayed through the whole
+modem and checked against what the far end really sent: see
+[test/fixtures/live/](test/fixtures/live/). Five of them are the same
+access server answering at 300, 1200, 1200/75, 2400 and 9600 bit/s with
+the same fixed banner, which is the closest thing to an oracle a dial-up
+line offers. `cabal test` never places a call and never opens a device,
+and the library it links carries no dependency that could.
+
 ## Protocols and signal path
 
 - **FSK** (`Modec.FSK`): continuous-phase transmitter with band
@@ -168,10 +176,12 @@ cabal run modec -- probe recording.wav                            # tone energie
 cabal run modec -- detect recording.wav                           # which standard, tone runs
 cabal run modec -- progress recording.wav                        # dial tone, ringing, busy, congestion, SIT
 cabal run modec -- dtmf recording.wav                            # DTMF digits, with timings
+cabal run modec -- replay --mode v22bis,v22 recording.wav        # the whole modem over a recorded call
 # 5-bit text telephone (TTY/TDD): text in, text out, not bytes
 printf 'HELLO GA SK' | cabal run modec -- encode --tty45 -o tty.wav
 cabal run modec -- decode --tty45 tty.wav                         # --tty50 for the 50 baud line
 cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep (also v21, v22low/high, v22bislow/high)
+cabal run modec-bench -- v32-survey                               # V.32 against every impairment axis, per rate
 
 # live modem: answer calls arriving on the default PipeWire source, serve telnet on 2323
 cabal run modec -- modem --answer --audio-pipewire --listen 2323

@@ -44,6 +44,7 @@ import Modec.V32 (V32Rate (..), rateBitRate)
 import qualified Modec.V32 as V32
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
 import Modec.Pipewire
+import PipewireIO
 import Modec.V8 (describeMenu)
 import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
