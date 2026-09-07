@@ -313,7 +313,7 @@ observe st rx = st
     turns' = take 64 (reverse turns ++ vsTurns st)
     dibits = concat [ [a, b] | k <- turns, let (a, b) = dibitOfTurn k ]
     (descr', got) = descrambleRun (vsFar st) (vsDescr st) dibits
-    bits' = take 96 (reverse got ++ vsBits st)
+    bits' = take 512 (reverse got ++ vsBits st)
     pw = if VS.null rx then 0 else VS.sum (VS.map (\v -> v * v) rx) / fromIntegral (VS.length rx)
     quiet' = if pw < 1e-5 then vsQuiet st + VS.length rx else 0
 
@@ -331,15 +331,37 @@ isConditioning ts =
   in length recent == 16 && all (`elem` [1, 3]) recent
      && and (zipWith (/=) recent (drop 1 recent))
 
+-- | How far back the sequence detectors look.
+--
+-- This has to exceed one block of bits, or a transition from one signal
+-- to the next falls between two blocks and is never looked at at all.
+-- A 20 ms block carries 96 bits at 4800 bit/s and 192 at 9600, so the
+-- 64 bits this started with skipped a third of every block at 4800 and
+-- two thirds at 9600.  A rate signal repeats, so nothing showed there;
+-- E is sent once, and one live call skipped it.  The modem sat in B1
+-- for seventeen seconds and then took a noise coincidence for E,
+-- reaching data mode long after the far end had sent its banner.
+seqDepth :: Int
+seqDepth = 256
+
+-- | Every 32-bit window of the recent history, oldest bit first: a
+-- 16-bit sequence and whatever follows it.  The bits arrive newest
+-- first and are aligned to nothing, so every offset has to be tried.
+-- Newest first, and paired with how many bits have arrived since the
+-- window ended: what follows E is timed from the end of E, which may
+-- have gone by a block or two ago.
+seqWindows :: [Bool] -> [(Int, [Bool])]
+seqWindows bits =
+  [ (off, reverse w)
+  | off <- [0 .. seqDepth - 32]
+  , let w = take 32 (drop off bits)
+  , length w == 32 ]
+
 -- | A rate signal: two consecutive identical 16-bit sequences with the
 -- synchronising bits right, which is the minimum §5.3.1 will accept.
--- The bits arrive newest first and are aligned to nothing, so every
--- offset has to be tried.
 detectRate :: [Bool] -> Maybe RateSeq
 detectRate bits =
-  listToMaybe [ a | off <- [0 .. 15]
-                  , let w = take 32 (drop off (reverse (take 64 bits)))
-                  , length w == 32
+  listToMaybe [ a | (_, w) <- seqWindows bits
                   , Just a <- [decodeRateSeq (take 16 w)]
                   , Just b <- [decodeRateSeq (drop 16 w)]
                   , a == b ]
@@ -356,13 +378,18 @@ detectRate bits =
 -- inviting one: §5.4 does put scrambled ones there, but by then they are
 -- at the agreed data rate and coding, which the start-up receiver -- still
 -- slicing four points and undoing Table 1 -- cannot read at all.
-detectE :: [Bool] -> Maybe RateSeq
-detectE bits =
-  listToMaybe [ e | off <- [0 .. 15]
-                  , let w = take 32 (drop off (reverse (take 64 bits)))
-                  , length w == 32
-                  , Just _ <- [decodeRateSeq (take 16 w)]
-                  , Just e <- [decodeESeq (drop 16 w)] ]
+-- Which rate sequence precedes it is known -- it is the one the far end
+-- has been sending -- so requiring that exact sequence rather than any
+-- well-formed one costs nothing and takes another seven bits out of the
+-- chance of a coincidence.
+-- Returns how many bits have arrived since E ended, along with it.
+detectE :: Maybe RateSeq -> [Bool] -> Maybe (Int, RateSeq)
+detectE peer bits =
+  listToMaybe [ (off, e)
+              | (off, w) <- seqWindows bits
+              , Just r <- [decodeRateSeq (take 16 w)]
+              , maybe True (r ==) peer
+              , Just e <- [decodeESeq (drop 16 w)] ]
 
 -- | Points for one of the repeating sources.
 srcPoints :: V32Start -> TxSrc -> Int -> (V32Start, [Point])
@@ -555,15 +582,34 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       OCond
         | null (vsQueue s) -> enter OR2 s { vsAdapt = False }
         | otherwise -> s
+      -- The rate signals are also the last of the far end's training,
+      -- so how long we send one cannot be left to how fast we happen to
+      -- recognise the answer to it.  Detecting R3 in a single block --
+      -- which the detector is well able to do, two copies being 16
+      -- symbols -- and moving straight on to E cuts the answering
+      -- modem's equaliser short and puts a burst of errors just after
+      -- the handover, at the one moment there is nothing to hide it.
+      OR2 | vsSince s < sym 128 -> s
       OR2 -> case detectRate (vsBits s) of
         Just r3 | Just rate <- bestCommonRate (vsOffer s) r3 ->
           enter OB1 s { vsRate = Just rate
+                      -- R3 is what the answering modem's E follows
+                      , vsPeer = Just r3
                       , vsSrc = TxCoded (eSeqBits (chosen rate))
                       , vsAfterE = Just rate }
         Just _ -> enter (V32Fail "no common rate") s
         Nothing | tooLong 80000 s -> enter (V32Fail "no rate signal R3") s
                 | otherwise -> s
-      OB1 -> case detectE (vsBits s) of
+      -- Straight to data on hearing E, rather than counting out B1's
+      -- 128 symbol intervals first.  §5.4.2 would have us wait, and the
+      -- wait is written and works; what does not yet work is decoding
+      -- the far end's B1 while we do.  Coming up in the middle of a run
+      -- of scrambled ones ought to yield an idle line and no bytes, and
+      -- instead yields about two blocks of noise -- a start-up
+      -- transient in the data receiver that going up on E hides,
+      -- because the far end's real data then arrives just as we open.
+      -- Worth fixing, and a separate thing from Figure 4.
+      OB1 -> case detectE (vsPeer s) (vsBits s) of
         Just _ | Just rate <- vsRate s -> enter (V32Up rate) s
         _ | tooLong 80000 s -> enter (V32Fail "no E from the answering modem") s
           | otherwise -> s
@@ -637,8 +683,9 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       ACond2
         | null (vsQueue s) -> enter AR3 s { vsAdapt = False }
         | otherwise -> s
-      AR3 -> case detectE (vsBits s) of
-        Just _ | Just rate <- vsRate s ->
+      AR3 | vsSince s < sym 128 -> s
+      AR3 -> case detectE (vsPeer s) (vsBits s) of
+        Just (_, _) | Just rate <- vsRate s ->
           enter AE s { vsSrc = TxCoded (eSeqBits (chosen rate))
                      , vsAfterE = Just rate, vsSince = 0 }
         _ | tooLong 80000 s -> enter (V32Fail "no E from the calling modem") s
@@ -693,7 +740,7 @@ v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
                  | (f, lv) <- levels, lv > 0.45, not (toneWas f st) ]
           cond = [ (t, "conditioning signal (S)") | isConditioning (vsTurns st1), not (vsSeenS st) ]
           rate = [ (t, "rate signal " ++ showRates r) | Just r <- [detectRate (vsBits st1)], not (vsSeenTrn st) ]
-          eSig = [ (t, "signal E " ++ showRates r) | Just r <- [detectE (vsBits st1)] ]
+          eSig = [ (t, "signal E " ++ showRates r) | Just (_, r) <- [detectE Nothing (vsBits st1)] ]
           st2 = st1 { vsSeenS = vsSeenS st || not (null cond)
                     , vsSeenTrn = vsSeenTrn st || not (null rate) }
       in go st2 (n + blk) cs (reverse (revs ++ tone ++ cond ++ rate ++ eSig) ++ acc)

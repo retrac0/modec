@@ -17,6 +17,7 @@ module Modec.Modem
   , modemEchoErle
   , modemPhase
   , modemV32Phase
+  , modemV32Bits
   , modemTxCmd
   , modemV22Rx
   , modemMnp
@@ -389,6 +390,14 @@ modemV32Phase st = case msMode st of
   _ -> Nothing
 
 -- | The V.32 receiver's decision error, for tracing.
+-- | What the start-up receiver has decoded lately, most recent bit
+-- first, for tracing what the far end is actually sending during
+-- Figure 4.  'Nothing' outside the V.32 start-up.
+modemV32Bits :: ModemState -> Maybe [Bool]
+modemV32Bits st = case msMode st of
+  Starting32 s32 -> Just (v32Bits s32)
+  _ -> Nothing
+
 modemV32Evm :: ModemState -> Maybe Double
 modemV32Evm st = case msMode st of
   DataV32 _ _ pump _ armed -> Just (if armed then negate (v32DataEvm pump) else v32DataEvm pump)
