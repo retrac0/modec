@@ -55,6 +55,7 @@ data EchoConfig = EchoConfig
   , ecSearch :: !Int     -- ^ how far back to look for the echo, samples
   , ecPre   :: !Int      -- ^ how far in front of the peak the filter starts
   , ecPeak  :: !Double   -- ^ peak to mean a correlation must beat to be believed
+  , ecOnRatio :: !Double -- ^ predicted echo over received power worth subtracting
   } deriving (Eq, Show)
 
 -- | 256 taps is 32 ms at 8 kHz -- far wider than the few milliseconds a
@@ -69,7 +70,7 @@ data EchoConfig = EchoConfig
 defaultEchoConfig :: EchoConfig
 defaultEchoConfig = EchoConfig
   { ecTaps = 256, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7
-  , ecSearch = 4000, ecPre = 64, ecPeak = 4 }
+  , ecSearch = 4000, ecPre = 64, ecPeak = 4, ecOnRatio = 0.01 }
 
 data EchoState = EchoState
   { esRef    :: !Signal   -- ^ what we have transmitted, oldest first
@@ -83,6 +84,7 @@ data EchoState = EchoState
   , esTaps   :: !Signal
   , esEchoP  :: !Double   -- ^ tracked power before cancellation
   , esResP   :: !Double   -- ^ and after
+  , esEchoY  :: !Double   -- ^ and how much of it the filter predicts
   , esOn     :: !Bool     -- ^ whether subtracting is worth doing
   , esRxHist :: !Signal   -- ^ recent received audio, for the delay search
   , esFound  :: !(Maybe Int)  -- ^ the delay the search settled on
@@ -93,7 +95,7 @@ echoInit cfg = EchoState
   { esRef = VS.empty, esRefEnd = 0, esRxAt = 0
   , esDelay = ecDelay cfg
   , esTaps = VS.replicate (ecTaps cfg) 0
-  , esEchoP = 0, esResP = 0, esOn = False
+  , esEchoP = 0, esResP = 0, esEchoY = 0, esOn = False
   , esRxHist = VS.empty, esFound = Nothing }
 
 -- | Remember a block we have just transmitted.  Called at the end of a
@@ -170,8 +172,8 @@ echoBlock cfg adapt rx st0 = (st', out)
       let k = (esRxAt st0 + i - d) - (esRefEnd st0 - refLen)
       in if k < 0 || k >= refLen then 0 else VS.unsafeIndex ref k
 
-    go !i !w !ep !rp !on acc
-      | i >= n = (w, ep, rp, on, reverse acc)
+    go !i !w !ep !rp !yp !on acc
+      | i >= n = (w, ep, rp, yp, on, reverse acc)
       | otherwise =
           let xs = VS.generate taps (\k -> refAt i (esDelay st0 + k))
               y = VS.sum (VS.zipWith (*) w xs)
@@ -185,6 +187,7 @@ echoBlock cfg adapt rx st0 = (st', out)
                      else w
               ep' = 0.99 * ep + 0.01 * (d * d)
               rp' = 0.99 * rp + 0.01 * (e * e)
+              yp' = 0.99 * yp + 0.01 * (y * y)
               -- Whether to subtract is decided only while the far end is
               -- silent, and held the rest of the time.
               --
@@ -198,16 +201,33 @@ echoBlock cfg adapt rx st0 = (st', out)
               -- Figure 4's half-duplex windows exist so that an echo
               -- canceller can train; they are equally the only place it
               -- can find out whether it has.
-              on' | not adapt = on
-                  | ep' <= 1e-18 = on
-                  | rp' < 0.5 * ep' = True
-                  | rp' > 0.9 * ep' = False
+              --
+              -- and it is asked again every block rather than once.
+              -- What was here decided only while adapting, which is to
+              -- say once, in a training window lasting half a second --
+              -- and then held that answer for the rest of a call that
+              -- may run for twenty minutes over a path whose delay
+              -- moves every time a jitter buffer resizes.  A filter
+              -- that was right when it was asked and is wrong now goes
+              -- on subtracting either way.
+              --
+              -- The second test is the one that works while both ends
+              -- are talking: y is what the filter thinks the echo is,
+              -- so comparing it against what actually arrived measures
+              -- the echo's share of the line directly.  A filter
+              -- reaching empty line predicts nothing -- leakage pulls
+              -- an unexcited filter to zero -- and says so.
+              on' | ep' <= 1e-18 = on
+                  | adapt, rp' < 0.5 * ep' = True
+                  | adapt, rp' > 0.9 * ep' = False
+                  | yp' > ecOnRatio cfg * ep' = True
+                  | yp' < 0.25 * ecOnRatio cfg * ep' = False
                   | otherwise = on
-          in go (i + 1) w' ep' rp' on' ((if on' then e else d) : acc)
+          in go (i + 1) w' ep' rp' yp' on' ((if on' then e else d) : acc)
 
-    (w1, ep1, rp1, on1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esOn st0) []
+    (w1, ep1, rp1, yp1, on1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esEchoY st0) (esOn st0) []
     out = VS.fromList outs
-    st' = st0 { esTaps = w1, esEchoP = ep1, esResP = rp1, esOn = on1
+    st' = st0 { esTaps = w1, esEchoP = ep1, esResP = rp1, esEchoY = yp1, esOn = on1
               , esRxAt = esRxAt st0 + n
               , esRxHist = keepTail (ecSearch cfg `div` 2) (esRxHist st0 VS.++ rx) }
 
