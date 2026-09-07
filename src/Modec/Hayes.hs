@@ -8,7 +8,11 @@
 -- signal when non-zero), ATX<n> and AT&C/&D/&K/&W accepted and ignored,
 -- and the "+++" escape with a one second guard time on either side.
 -- Result codes: OK, CONNECT <rate>, RING, NO CARRIER, ERROR, NO ANSWER,
--- BUSY (numeric equivalents with ATV0).
+-- BUSY (numeric equivalents with ATV0).  BUSY is reported for anything
+-- the network plays back to refuse a call -- a busy tone, congestion,
+-- or the special information tone before a recorded announcement --
+-- which is the distinction a Hayes modem draws and all the result
+-- codes have room for; the log says which of the three it was.
 module Modec.Hayes
   ( HayesState
   , hayesInit
@@ -57,6 +61,7 @@ data HayesEvent
   = EvConnect Int       -- ^ connected at this bit rate
   | EvNoCarrier
   | EvNoAnswer
+  | EvBusy              -- ^ the far end returned busy, congestion, or a special information tone
   | EvRing              -- ^ a calling signal was detected while idle
   | EvProtocol String   -- ^ an error-correcting protocol came up, named here
   deriving (Eq, Show)
@@ -165,6 +170,7 @@ hayesEvent st ev = case ev of
   EvConnect rate -> (st { hsMode = Online, hsConnected = True, hsLastData = hsT st, hsPlusCount = 0 }, result st ("CONNECT " ++ show rate) (connectCode rate))
   EvNoCarrier -> (st { hsMode = Command, hsConnected = False }, result st "NO CARRIER" 3)
   EvNoAnswer -> (st { hsMode = Command, hsConnected = False }, result st "NO ANSWER" 8)
+  EvBusy -> (st { hsMode = Command, hsConnected = False }, result st "BUSY" 7)
   EvRing -> (st, result st "RING" 2)
   -- Reported the way the modems that spoke this protocol reported it, on
   -- its own line after CONNECT.  There is no numeric result code for it,

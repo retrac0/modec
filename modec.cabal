@@ -32,6 +32,7 @@ library
                       Modec.V8bis
                       Modec.Hayes
                       Modec.Dtmf
+                      Modec.Progress
                       Modec.Json
                       Modec.Baresip
                       Modec.Pipewire

@@ -9,6 +9,8 @@ import Text.Printf (printf)
 
 import Dial
 import Modec.Detect
+import Modec.Dtmf
+import Modec.Progress
 import Modec.Pipewire (describeNodes, pwAudioNodes)
 import Modec.DSP
 import qualified Modec.Handshake as H
@@ -27,6 +29,8 @@ data Cmd
   | Encode Std Channel Int Double FilePath
   | Probe FilePath
   | Detect FilePath
+  | ProgressOf FilePath
+  | DtmfOf FilePath
   | RunModem ModemOpts
   | DialOut DialOpts
   | ListDevices
@@ -51,6 +55,8 @@ cmdP = hsubparser
   <> command "encode" (info encodeP (progDesc "Modulate stdin bytes to a WAV file"))
   <> command "probe"  (info probeP  (progDesc "Report tone energies in a WAV file"))
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
+  <> command "progress" (info progressP (progDesc "Report the call progress tones in a WAV file: dial tone, ringing, busy, congestion, special information tone"))
+  <> command "dtmf"  (info dtmfP   (progDesc "Report the DTMF digits in a WAV file"))
   <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
   <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
   <> command "devices" (info (pure ListDevices) (progDesc "List the PipeWire audio devices usable with --pw-in / --pw-out"))
@@ -65,6 +71,8 @@ cmdP = hsubparser
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
     probeP = Probe <$> argument str (metavar "FILE.wav")
     detectP = Detect <$> argument str (metavar "FILE.wav")
+    progressP = ProgressOf <$> argument str (metavar "FILE.wav")
+    dtmfP = DtmfOf <$> argument str (metavar "FILE.wav")
     modemP = RunModem <$> (ModemOpts
       <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
@@ -99,7 +107,14 @@ cmdP = hsubparser
       <*> optional (strOption (long "record-tx" <> metavar "FILE.wav" <> help "as --record-rx, for transmitted audio"))
       <*> recordDirP
       <*> pure Nothing
-      <*> pure False)
+      <*> pure False
+      <*> ignoreBusyP)
+    -- A modem hangs up when the network answers a call with a busy
+    -- tone, congestion or the special information tone that precedes a
+    -- recorded announcement, and says BUSY.  This is how to sit and
+    -- listen to one instead.
+    ignoreBusyP = switch (long "ignore-busy"
+      <> help "stay on the line when the far end returns busy, congestion or a special information tone, instead of hanging up and reporting BUSY")
     -- Every call is recorded and logged under this directory, named for
     -- when it was placed and what it dialled; --no-record is the way to
     -- ask for a call that leaves nothing behind.
@@ -133,9 +148,11 @@ cmdP = hsubparser
                        <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this")
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
       <*> recordDirP
-    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir = defaultModemOpts
+      <*> ignoreBusyP
+    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy = defaultModemOpts
       { moModes = modes, moV8 = v8, moV8All = v8all, moNoV8bis = noV8bis
-      , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir }
+      , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir
+      , moIgnoreBusy = ignoreBusy }
     modesP =
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"
@@ -261,6 +278,21 @@ main = do
       putStrLn "Tone runs longer than 100 ms:"
       forM_ [ r | r <- toneRunsWith diagnosticToneBank fs x, trEnd r - trStart r >= 0.1 ] $ \r ->
         printf "  %7.3f - %7.3f s  %s\n" (trStart r) (trEnd r) (maybe "silence / no dominant tone" (\f -> printf "%.0f Hz" f) (trTone r) :: String)
+    ProgressOf path -> do
+      w <- readWav path
+      let evs = callProgress (fromIntegral (wavRate w)) (wavSamples w)
+      if null evs
+        then putStrLn "no call progress tone recognised"
+        else mapM_ (putStrLn . describeProgress) evs
+    DtmfOf path -> do
+      w <- readWav path
+      let ds = dtmfDecode (fromIntegral (wavRate w)) defaultDtmfParams (wavSamples w)
+      if null ds
+        then putStrLn "no DTMF digits"
+        else do
+          forM_ ds $ \d ->
+            printf "%7.3f s  %c  %4.0f ms  amplitude %.3f\n" (ddStart d) (ddChar d) (ddDuration d * 1000) (ddLevel d)
+          putStrLn ("dialled: " ++ map ddChar ds)
     Probe path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)

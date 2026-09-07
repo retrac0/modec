@@ -127,10 +127,45 @@ with an annotated timeline.
   the roles reversed as §9.9.3 requires (the MS receiver becomes the
   answering modem). Peers without V.8bis get the classic start-up after
   3 s. `--no-v8bis` skips it.
+- Call progress tones (`Modec.Progress`, `modec progress`): dial tone,
+  ringing, busy, congestion, the fax calling tone, the answer tone and
+  the special information tone that introduces a recorded announcement.
+  Frames of 60 ms name which tones are sounding; the cadence of those
+  frames names what they mean, which is the only thing that can, since
+  ITU-T E.180 country practice is one 425 Hz tone for dial tone,
+  ringing, busy and congestion alike and only the rhythm separates
+  them. North America's own pairs (350+440, 440+480, 480+620) and the
+  UK's double ring are read as well. A call modec places listens until
+  the modems connect and reports what it heard; busy, congestion and a
+  special information tone hang the call up with BUSY, since all three
+  mean the call was refused. `--ignore-busy` stays on the line instead.
+  Robust to 3 dB SNR and to 30 dB below full scale. Across the 221
+  recorded calls in `recordings/` it reports 36 ringings and 159 answer
+  tones and not one busy: the single false positive it started with was
+  a stretch of speech that produced two bursts near 400 Hz with the
+  spacing of congestion, which is why busy and congestion ask for a
+  third burst where ringing is content with two. The three segments of
+  a special information tone are reported as measured, not named:
+  Telcordia's table gives each combination of frequencies and durations
+  a meaning, the published copies of it disagree with one another, and
+  nothing here has yet heard a real one to check a name against.
+- DTMF detection (`Modec.Dtmf`, `modec dtmf`): the eight-Goertzel block
+  receiver of ITU-T Q.24, with its level, twist, relative-peak and
+  fraction-of-total-power tests. The last of those is what rejects
+  speech, since a vowel really does have energy at 770 and 1336 Hz but
+  spends most of its power elsewhere. How long a tone lasted is
+  measured rather than counted in blocks, and has to be: Q.24 wants
+  40 ms accepted and 23 ms rejected, which are 1.3 blocks apart, so
+  whatever number of blocks is demanded, one of the two requirements
+  fails at some alignments of the tone against the block grid. The
+  Goertzel is linear in coverage, so summing a run's levels and
+  dividing by the largest of them measures the tone to a few
+  milliseconds, and both requirements then hold at every alignment.
+  Digits survive the telephone channel to 3 dB SNR.
 - Hayes AT command mode (`Modec.Hayes`, `--hayes`): ATD (digits dialled as
   DTMF, then originate), ATA, ATH, ATO, ATZ, AT&F, ATE/V/Q, ATI, ATS0
   (auto-answer on a sustained calling signal), "+++" with guard times;
-  result codes OK, CONNECT 300/1200/2400, RING, NO CARRIER, ERROR.
+  result codes OK, CONNECT 300/1200/2400, RING, NO CARRIER, BUSY, ERROR.
   `scripts/smoke-hayes.sh` drives two instances through a full
   dial/answer/data/escape/hang-up cycle over telnet.
 - SIP calls through baresip (`Modec.Baresip`, `--sip HOST:PORT`): modec
@@ -196,6 +231,8 @@ printf 'hello\r\n' | cabal run modec -- encode --answer -o out.wav
 cabal run modec -- devices                                        # PipeWire audio devices
 cabal run modec -- probe recording.wav                            # tone energies
 cabal run modec -- detect recording.wav                           # which standard, tone runs
+cabal run modec -- progress recording.wav                        # dial tone, ringing, busy, congestion, SIT
+cabal run modec -- dtmf recording.wav                            # DTMF digits, with timings
 # 5-bit text telephone (TTY/TDD): text in, text out, not bytes
 printf 'HELLO GA SK' | cabal run modec -- encode --tty45 -o tty.wav
 cabal run modec -- decode --tty45 tty.wav                         # --tty50 for the 50 baud line

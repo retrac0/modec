@@ -36,6 +36,7 @@ import Modec.DSP (Signal, rms)
 import Modec.Handshake
 import Modec.Baresip
 import Modec.Dtmf
+import Modec.Progress
 import Modec.Hayes
 import Modec.Modem
 import Modec.Standards (fskBaud, fskName)
@@ -94,6 +95,7 @@ data ModemOpts = ModemOpts
   , moRecordDir :: Maybe FilePath  -- ^ record each call separately here (see "CallLog")
   , moDial     :: Maybe String     -- ^ dial this as soon as the line is ready
   , moHangupExits :: Bool          -- ^ leave when the call does, rather than back to AT
+  , moIgnoreBusy :: Bool          -- ^ stay on the line through busy, congestion and SIT
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -107,7 +109,7 @@ defaultModemOpts = ModemOpts
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
-  , moDial = Nothing, moHangupExits = False }
+  , moDial = Nothing, moHangupExits = False, moIgnoreBusy = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -246,6 +248,10 @@ runModem o = do
                         in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
                               , mcMaxEvm = moMaxEvm o, mcMnp = mnpCfg
                               , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+          -- A call we placed watches the line for what the network
+          -- plays back at it; a call we answered does not.
+          startCall role = LineCall (modemInit (cfgFor role)) (cfgFor role)
+            (if role == Originate then Just (progressRxInit fs defaultProgressParams) else Nothing)
           traceStep st st' = when trace $ do
             k <- readIORef blockRef
             writeIORef blockRef (k + 1)
@@ -267,6 +273,9 @@ runModem o = do
         then do
           -- plain mode: one call in the configured role, then exit
           stRef <- newIORef (modemInit cfg)
+          progRef <- newIORef (if moRole o == Originate
+                                 then Just (progressRxInit fs defaultProgressParams)
+                                 else Nothing)
           let loop = do
                 raw <- readBlock
                 if B.length raw < 2 * blockN
@@ -274,14 +283,28 @@ runModem o = do
                   else do
                     pending <- recvBytes
                     st <- readIORef stRef
-                    let (st', audio, rxBytes, events) = modemStep cfg st (decodeS16 raw) (B.unpack pending)
+                    let rx = decodeS16 raw
+                        (st', audio, rxBytes, events) = modemStep cfg st rx (B.unpack pending)
                     writeIORef stRef st'
                     traceStep st st'
                     unless trace $ modifyIORef' blockRef (+ 1)
                     writeBlock (encodeS16 audio)
                     unless (null rxBytes) $ sendBytes (B.pack rxBytes)
                     mapM_ report events
-                    unless (any isFinal events) loop
+                    refusal <- do
+                      w0 <- readIORef progRef
+                      case w0 of
+                        Just w | not (modemConnected st') -> do
+                          let (w', pevs) = progressRxBlock defaultProgressParams w rx
+                          writeIORef progRef (Just w')
+                          forM_ pevs (say . describeProgress)
+                          case [ e | e <- pevs, refused (peKind e) ] of
+                            (e : _) -> do
+                              writeIORef outcomeRef (shortName (peKind e))
+                              return (not (moIgnoreBusy o))
+                            [] -> return False
+                        _ -> return False
+                    unless (refusal || any isFinal events) loop
           loop `finally` closeRecordings
         else do
           -- Hayes mode: an AT command interpreter controls calls on the line
@@ -384,7 +407,7 @@ runModem o = do
                           stray <- pruneCompetingInputs ln
                           forM_ stray $ \l ->
                             logMsg ("removed stray audio link into " ++ plDst l ++ " from " ++ plSrc l)
-                        writeIORef lineRef (LineCall (modemInit (cfgFor role)) (cfgFor role))
+                        writeIORef lineRef (startCall role)
                       SipStopModem -> do
                         writeIORef lineRef LineIdle
                         endCall
@@ -411,7 +434,7 @@ runModem o = do
                           writeIORef lineRef (LineDialing (dtmfDialSignal fs (0.5 * moAmp o) (map toUpperC s)))
                         ActAnswer -> do
                           say "answering"
-                          writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
+                          writeIORef lineRef (startCall Answer)
                         ActHangup -> case line of
                           LineIdle -> return ()
                           _ -> do
@@ -435,20 +458,41 @@ runModem o = do
                           hs <- readIORef hayesRef
                           when (hayesAutoAnswer hs) $ do
                             logMsg "auto-answer"
-                            writeIORef lineRef (LineCall (modemInit (cfgFor Answer)) (cfgFor Answer))
+                            writeIORef lineRef (startCall Answer)
                         when (n' > 25) $ writeIORef energyRef 0
                         writeBlock (encodeS16 (VS.replicate blockN 0))
                       LineDialing sig -> do
                         let (now, rest) = VS.splitAt blockN sig
                             block = now VS.++ VS.replicate (blockN - VS.length now) 0
                         writeBlock (encodeS16 block)
-                        writeIORef lineRef (if VS.null rest then LineCall (modemInit (cfgFor Originate)) (cfgFor Originate) else LineDialing rest)
-                      LineCall st c -> do
+                        writeIORef lineRef (if VS.null rest then startCall Originate else LineDialing rest)
+                      LineCall st c watch -> do
                         let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack fwd else [])
                         traceStep st st'
                         writeBlock (encodeS16 audio)
                         when (online && not (null rxBytes)) $ sendBytes (B.pack rxBytes)
-                        writeIORef lineRef (LineCall st' c)
+                        -- Listen for what the network is playing back
+                        -- until the modems are talking; after that the
+                        -- line carries a carrier and nothing else.
+                        watch' <- case watch of
+                          Just w | not (modemConnected st') -> do
+                            let (w', pevs) = progressRxBlock defaultProgressParams w rxBlock
+                            forM_ pevs (say . describeProgress)
+                            case [ e | e <- pevs, refused (peKind e) ] of
+                              (e : _) | not (moIgnoreBusy o) -> do
+                                writeIORef outcomeRef (shortName (peKind e))
+                                modemEvent EvBusy
+                                writeIORef lineRef LineIdle
+                                endCall
+                                when (moHangupExits o) (writeIORef doneRef True)
+                              (e : _) -> writeIORef outcomeRef (shortName (peKind e))
+                              [] -> return ()
+                            return (Just w')
+                          _ -> return watch
+                        line' <- readIORef lineRef
+                        case line' of
+                          LineIdle -> return ()       -- the watcher just hung up
+                          _ -> writeIORef lineRef (LineCall st' c watch')
                         forM_ events $ \ev -> do
                           report ev
                           case ev of
@@ -533,10 +577,34 @@ sipDrain (SipClient _ queue _) = atomicModifyIORef' queue (\q -> ([], q))
 
 -- | The line in Hayes mode: idle, dialling (DTMF audio left to play), or
 -- a call in progress with its modem state and configuration.
+--
+-- A call we placed also carries a call progress watcher, which listens
+-- until the modems connect and says what the network was doing in the
+-- meantime.  A call we answered carries none: the tones are what the
+-- network plays back to a caller, and an answering modem hearing one
+-- would be hearing its own end of the line.
 data Line
   = LineIdle
   | LineDialing Signal
-  | LineCall ModemState ModemConfig
+  | LineCall ModemState ModemConfig (Maybe ProgressRx)
+
+-- | The call progress tones that mean the network has refused the
+-- call.  Ringing and dial tone are news, not refusals, and a call goes
+-- on through them.
+refused :: Progress -> Bool
+refused k = case k of
+  Busy -> True
+  Reorder -> True
+  Sit _ -> True
+  _ -> False
+
+-- | What to write in the call log when one of them ends a call.
+shortName :: Progress -> String
+shortName k = case k of
+  Busy -> "busy"
+  Reorder -> "congestion: no circuit"
+  Sit _ -> "special information tone: the call did not complete"
+  _ -> "call progress"
 
 v22Info :: ModemState -> String
 v22Info st = case modemV22Rx st of

@@ -14,6 +14,7 @@ module Modec.DSP
   , windowDot
   , toneEnergy
   , toneEnergyW
+  , goertzel
   , toneAmplitude
   , toneAmplitudeW
     -- * Levels
@@ -90,6 +91,27 @@ toneEnergyW fs f w x = VS.zipWith (\a b -> a * a + b * b) (windowDot w re) (wind
 mixTone :: Double -> Double -> Signal -> (Signal, Signal)
 mixTone fs f x = (VS.imap (\n v -> v * cos (w * fromIntegral n)) x, VS.imap (\n v -> v * sin (w * fromIntegral n)) x)
   where w = 2 * pi * f / fs
+
+-- | Squared magnitude of one DFT bin at @f@ over a whole block, by
+-- Goertzel's recurrence: one multiply and two adds per sample, and no
+-- per-sample sine or cosine.  'toneEnergy' slides a window along a
+-- signal and costs a complex mixer per sample; this is the cheaper
+-- shape for a detector that only wants one number per block, which is
+-- how the DTMF receiver reads its eight tones.
+--
+-- The scaling is the same as 'toneEnergy' with a rectangular window of
+-- the block length -- a tone of amplitude @a@ exactly at @f@ gives
+-- @(a n \/ 2)^2@ -- so 'toneAmplitude' converts it back.  Off-bin tones
+-- read low: the response follows the rectangular window's sinc, which
+-- first nulls at @fs \/ n@ away.
+goertzel :: Double -> Double -> Signal -> Double
+goertzel fs f x = go 0 0 0
+  where
+    n = VS.length x
+    k = 2 * cos (2 * pi * f / fs)
+    go !i !s1 !s2
+      | i >= n = s1 * s1 + s2 * s2 - k * s1 * s2
+      | otherwise = go (i + 1) (VS.unsafeIndex x i + k * s1 - s2) s1
 
 -- | Convert a rectangular-window 'toneEnergy' value back to an
 -- estimated tone amplitude.
