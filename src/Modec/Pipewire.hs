@@ -1,9 +1,11 @@
--- | PipeWire device discovery for the live modem.
+-- | What @pw-dump@ and @pw-link@ say, parsed.
 --
--- Everything here goes through the @pw-dump@ command rather than
+-- PipeWire is reached through those commands rather than through
 -- libpipewire, matching the way audio itself is moved (child @pw-cat@
--- processes).  The parsing and matching are pure so they can be tested
--- against a captured dump.
+-- processes).  Running them is "PipewireIO", in the executable; this
+-- module is the half that turns their output into values, and it is
+-- pure, so it can be tested against a captured dump -- and so that the
+-- library cannot start a process at all.
 --
 -- Device specifications given on the command line are resolved with
 -- 'matchNode': a decimal string is a node id, otherwise an exact node
@@ -17,32 +19,19 @@ module Modec.Pipewire
   , NodeMatch (..)
   , parseNodes
   , matchNode
-  , pwNodes
-  , pwAudioNodes
-  , hasCaptureDevice
-  , resolveNode
-  , waitForNodes
   , describeNodes
     -- * Links
   , PwLink (..)
-  , pwLinks
-  , pwUnlink
-  , pruneCompetingInputs
+  , parseLinks
     -- * Volumes
-  , nodeGains
   , parseGains
-  , attenuatedNodes
+  , attenuated
   ) where
 
-import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, try)
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit, toLower)
 import Data.List (isInfixOf)
 import Data.Maybe (mapMaybe)
-import System.Exit (ExitCode (..))
-import System.Process (readProcess, readProcessWithExitCode)
 
 import Modec.Json
 
@@ -90,57 +79,6 @@ matchNode spec nodes
     uniqueOf [n] = Unique n
     uniqueOf ns = Ambiguous ns
 
--- | All PipeWire nodes, or an empty list if @pw-dump@ is unavailable.
-pwNodes :: IO [PwNode]
-pwNodes = do
-  r <- try (readProcess "pw-dump" ["Node"] "") :: IO (Either IOException String)
-  return $ case r of
-    Left _ -> []
-    Right out -> parseNodes (BC.pack out)
-
--- | Only the audio sinks and sources.
-pwAudioNodes :: IO [PwNode]
-pwAudioNodes = filter (\n -> pnClass n `elem` [PwSink, PwSource]) <$> pwNodes
-
--- | True when PipeWire offers a capture device.  Monitors of outputs are
--- ports of their sink rather than nodes of their own, so any
--- @Audio/Source@ node is a real capture.  If @pw-dump@ cannot be run at
--- all, assume there is one and let @pw-cat@ report the trouble.
-hasCaptureDevice :: IO Bool
-hasCaptureDevice = do
-  ns <- pwNodes
-  return (null ns || any ((== PwSource) . pnClass) ns)
-
--- | Resolve a device specification, returning either a node or a message
--- naming the candidates.
-resolveNode :: String -> PwClass -> IO (Either String PwNode)
-resolveNode spec want = do
-  ns <- pwAudioNodes
-  let pool = filter ((== want) . pnClass) ns
-  return $ case matchNode spec pool of
-    Unique n -> Right n
-    Ambiguous cands -> Left ("device " ++ show spec ++ " is ambiguous:\n" ++ describeNodes cands)
-    NoMatch -> Left ("no " ++ kind ++ " matches " ++ show spec ++
-                     (if null pool then " (none present)" else ":\n" ++ describeNodes pool))
-  where
-    kind = case want of
-      PwSink -> "output"
-      PwSource -> "input"
-      PwOther s -> s
-
--- | Wait for nodes with the given names to appear, polling @pw-dump@.
--- Returns the names still missing when the timeout expires.
-waitForNodes :: [String] -> Double -> IO [String]
-waitForNodes names timeout = go (max 1 (round (timeout / 0.1) :: Int))
-  where
-    go 0 = missing
-    go k = do
-      left <- missing
-      if null left then return [] else threadDelay 100000 >> go (k - 1)
-    missing = do
-      ns <- pwNodes
-      return [ nm | nm <- names, not (any ((== nm) . pnName) ns) ]
-
 -- | A link between two ports, named by the nodes at each end.
 data PwLink = PwLink
   { plId  :: !Int
@@ -148,15 +86,11 @@ data PwLink = PwLink
   , plDst :: String
   } deriving (Eq, Show)
 
--- | Every link in the graph, from @pw-link -I -l@.  Its output lists each
--- port on an unindented line and each of that port's links indented with
--- an arrow giving the direction.
-pwLinks :: IO [PwLink]
-pwLinks = do
-  r <- try (readProcess "pw-link" ["-I", "-l"] "") :: IO (Either IOException String)
-  return $ case r of
-    Left _ -> []
-    Right out -> go "" (lines out)
+-- | Parse @pw-link -I -l@.  Its output lists each port on an unindented
+-- line and each of that port's links indented with an arrow giving the
+-- direction.
+parseLinks :: String -> [PwLink]
+parseLinks out = go "" (lines out)
   where
     go _ [] = []
     go cur (l : ls) = case words l of
@@ -167,28 +101,6 @@ pwLinks = do
       _ -> go cur ls
     nodeOf s = takeWhile (/= ':') s
     readMaybeInt s = case reads s of { [(i, "")] -> Just (i :: Int); _ -> Nothing }
-
--- | Destroy a link by id.
-pwUnlink :: Int -> IO Bool
-pwUnlink lid = do
-  r <- try (readProcessWithExitCode "pw-link" ["-d", show lid] "")
-         :: IO (Either IOException (ExitCode, String, String))
-  return $ case r of
-    Right (ExitSuccess, _, _) -> True
-    _ -> False
-
--- | PipeWire's session manager often links the default capture device
--- into a softphone's input as well as the node the softphone asked for,
--- so the far end hears the microphone mixed with the modem.  Remove any
--- link that feeds a node our line source feeds, unless it comes from the
--- line source itself.  Returns what was removed.
-pruneCompetingInputs :: String -> IO [PwLink]
-pruneCompetingInputs lineNode = do
-  ls <- pwLinks
-  let fedByUs = [ plDst l | l <- ls, plSrc l == lineNode ]
-      stray = [ l | l <- ls, plDst l `elem` fedByUs, plSrc l /= lineNode ]
-  mapM_ (pwUnlink . plId) stray
-  return stray
 
 -- | A human-readable listing, one node per line.
 describeNodes :: [PwNode] -> String
@@ -231,18 +143,8 @@ parseGains bs = case jsonParse bs of
           muted = or [ True | p <- props, Just (JBool True) <- [jsonLookup "mute" p] ]
       if null vols then Nothing else Just (name, maximum vols, muted)
 
--- | 'parseGains' over a live @pw-dump@.
-nodeGains :: IO [(String, Double, Bool)]
-nodeGains = do
-  r <- try (readProcess "pw-dump" [] "") :: IO (Either IOException String)
-  return $ case r of
-    Left _ -> []
-    Right out -> parseGains (BC.pack out)
-
 -- | Of the named nodes, those a mixer would be quietening: muted, or more
 -- than a quarter of a decibel down.  Nodes that are absent or carry no
 -- volume control are not reported.
-attenuatedNodes :: [String] -> IO [(String, Double, Bool)]
-attenuatedNodes names = do
-  gs <- nodeGains
-  return [ g | g@(n, v, m) <- gs, n `elem` names, m || v < 0.97 ]
+attenuated :: [String] -> [(String, Double, Bool)] -> [(String, Double, Bool)]
+attenuated names gs = [ g | g@(n, v, m) <- gs, n `elem` names, m || v < 0.97 ]

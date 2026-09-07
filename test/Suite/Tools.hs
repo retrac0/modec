@@ -1,8 +1,10 @@
 -- | The parts around the modem: Hayes commands, baresip, PipeWire.
-module Suite.Tools (hayesTests, baresipTests, pipewireTests) where
+module Suite.Tools (hayesTests, baresipTests, pipewireTests, hermeticTests) where
 
+import Control.Monad (forM_)
 import qualified Data.ByteString.Char8 as BC
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
+import Data.Char (isSpace)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -156,3 +158,49 @@ pipewireTests = testGroup "PipeWire device discovery"
       , PwNode 61 "alsa_input.usb-Focusrite" "USB Audio" PwSource
       , PwNode 29 "Dummy-Driver" "" (PwOther "") ]
     nodes = take 3 expected
+
+-- | The suite places no call and opens no device, and this is what keeps
+-- it that way.
+--
+-- Being hermetic by habit is not the same as being hermetic: a habit is
+-- one careless import away from a test that dials a number, and a test
+-- that dials a number is slow, flaky, and occasionally expensive.  The
+-- library and the test suite therefore depend on nothing that can start
+-- a process, open a socket or signal anything.  A test cannot reach a
+-- sound card because it cannot link the code that would.
+--
+-- The cabal file is the one place that guarantee can be undone, so the
+-- alarm goes there.  If a stanza below genuinely needs one of these,
+-- the thing to move is the code that needs it -- into the executable,
+-- as app/PipewireIO.hs was -- rather than this list.
+hermeticTests :: TestTree
+hermeticTests = testGroup "the suite cannot place a call"
+  [ testCase "neither the library nor the tests depend on process, network or unix" $ do
+      cabal <- readFile "modec.cabal"
+      forM_ ["library", "test-suite modec-test"] $ \stanza ->
+        forM_ ["process", "network", "unix"] $ \pkg ->
+          assertBool (stanza ++ " depends on " ++ pkg)
+            (not (pkg `elem` dependencies stanza cabal))
+  ]
+
+-- | The build-depends of one stanza, by name.  Stanzas start in the
+-- first column and their fields are indented, which is enough structure
+-- to read a dependency list without a cabal parser.
+dependencies :: String -> String -> [String]
+dependencies stanza cabal =
+  [ takeWhile (\c -> not (isSpace c) && c /= ',') (dropWhile isSpace d)
+  | d <- concatMap (split ',') (field "build-depends:" (stanzaOf stanza cabal)) ]
+  where
+    stanzaOf name src =
+      case dropWhile (not . (name `isPrefixOf`)) (lines src) of
+        [] -> error ("no stanza " ++ show name ++ " in modec.cabal")
+        (h : rest) -> h : takeWhile indented rest
+    indented l = null l || " " `isPrefixOf` l
+    -- a field runs to the next line at the field's own indentation
+    field key ls = case dropWhile (not . (key `isInfixOf`)) ls of
+      [] -> []
+      (h : rest) ->
+        drop 1 (dropWhile (/= ':') h) : takeWhile (\l -> "                 " `isPrefixOf` l) rest
+    split c s = case break (== c) s of
+      (a, []) -> [a]
+      (a, _ : b) -> a : split c b
