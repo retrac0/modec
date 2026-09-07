@@ -253,9 +253,14 @@ runModem o = do
           -- plays back at it; a call we answered does not.
           startCall role = LineCall (modemInit (cfgFor role)) (cfgFor role)
             (if role == Originate then Just (progressRxInit fs defaultProgressParams) else Nothing)
+          -- Reads the block count; does not move it.  It used to do both,
+          -- and the loops below compensated -- one by skipping its own
+          -- increment when tracing, the other not at all -- so with
+          -- MODEC_TRACE set the Hayes clock counted two blocks per block
+          -- and every guard time in Modec.Hayes ran at double speed.  A
+          -- trace may not be able to change what it is tracing.
           traceStep st st' = when trace $ do
             k <- readIORef blockRef
-            writeIORef blockRef (k + 1)
             when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
               logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
           report ev = case ev of
@@ -288,7 +293,7 @@ runModem o = do
                         (st', audio, rxBytes, events) = modemStep cfg st rx (B.unpack pending)
                     writeIORef stRef st'
                     traceStep st st'
-                    unless trace $ modifyIORef' blockRef (+ 1)
+                    modifyIORef' blockRef (+ 1)
                     writeBlock (encodeS16 audio)
                     unless (null rxBytes) $ sendBytes (B.pack rxBytes)
                     mapM_ report events
@@ -363,7 +368,6 @@ runModem o = do
                     when ok loop
                   else do
                     t <- tNow
-                    modifyIORef' blockRef (+ 0)
                     typed <- recvBytes
                     toDial <- readIORef dialRef
                     injected <- atomicModifyIORef' injectRef (\b -> (B.empty, b))
