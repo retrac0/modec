@@ -46,6 +46,8 @@ module Modec.V32
   , trainStates
   , statePoint
   , stateOfDibit
+  , dibitOfState
+  , bitsToInt
   , constellation
   , slicePoint
   , subsetPoint
@@ -78,7 +80,7 @@ module Modec.V32
   , bestCommonRate
   ) where
 
-import Data.Bits (testBit, (.&.), (.|.))
+import Data.Bits (testBit, (.|.))
 import Control.Monad (replicateM)
 import Data.List (foldl')
 import qualified Data.Vector.Unboxed as VU
@@ -211,6 +213,14 @@ stateOfDibit (False, False) = StA
 stateOfDibit (False, True) = StB
 stateOfDibit (True, True) = StC
 stateOfDibit (True, False) = StD
+
+-- | And back.  The start-up reads states off the line as often as it
+-- puts them on it.
+dibitOfState :: TrainState -> (Bool, Bool)
+dibitOfState StA = (False, False)
+dibitOfState StB = (False, True)
+dibitOfState StC = (True, True)
+dibitOfState StD = (True, False)
 
 scalePoint :: (Double, Double) -> Point
 scalePoint (x, y) = (x * gridScale, y * gridScale)

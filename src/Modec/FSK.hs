@@ -163,18 +163,6 @@ data DiscState = DiscState !Int !Signal !Signal
 
 -- | Streaming FIR over a chunk with history; output aligned to the chunk
 -- (i.e. delayed by the filter's group delay, which is fine here).
-firChunk :: VS.Vector Double -> Signal -> Signal -> Signal
-firChunk hrev hist chunk = VS.generate n out
-  where
-    n = VS.length chunk
-    t = VS.length hrev
-    ext = hist VS.++ chunk
-    out i = go 0 0
-      where
-        go !k !acc
-          | k >= t = acc
-          | otherwise = go (k + 1) (acc + VS.unsafeIndex hrev k * VS.unsafeIndex ext (i + k))
-
 -- | Rectangular-window complex correlation of @ext@ against
 -- @exp(-j w n)@ using global sample indices starting at @n0@.  Returns
 -- (re, im) for the @nOut@ windows of length @l@ ending at ext[l-1 ..].
@@ -228,14 +216,13 @@ fskDiscriminator fs spec params = Stage st0 step
     sq a b = a * a + b * b
 
     step (DiscState n0 hist carry) chunk =
-      let filtered = firChunk hrev hist chunk
+      let (filtered, hist') = firStream hrev hist chunk
           n = VS.length chunk
           ext = carry VS.++ filtered
           em = energy n0 n ext (2 * pi * fskMark spec / fs)
           es = energy n0 n ext (2 * pi * fskSpace spec / fs)
           dec = VS.zipWith (\a b -> (a - b) / (a + b + 1e-300)) em es
           pres = VS.zipWith (\a b -> if a + b > squelchE then 1 else 0) em es
-          hist' = VS.drop n (hist VS.++ chunk)
           carry' = VS.drop n ext
           st' = DiscState (n0 + n) hist' carry'
       in hist' `seq` carry' `seq` (st', Discriminated em es dec pres)

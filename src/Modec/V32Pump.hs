@@ -120,15 +120,12 @@ codeSymbol :: V32Rate -> TxCoder -> [Bool] -> (TxCoder, Point)
 codeSymbol r st (q1 : q2 : rest)
   | not (rateTrellis r) =
       let y@(y1, y2) = diffEncode1 (q1, q2) (tcPrev st)
-      in (st { tcPrev = y }, constellation r (packBits ([y1, y2] ++ rest)))
+      in (st { tcPrev = y }, constellation r (bitsToInt ([y1, y2] ++ rest)))
   | otherwise =
       let y@(y1, y2) = diffEncode2 (q1, q2) (tcPrev st)
           (cv, y0) = convStep (tcConv st) y
-      in (st { tcPrev = y, tcConv = cv }, constellation r (packBits ([y0, y1, y2] ++ rest)))
+      in (st { tcPrev = y, tcConv = cv }, constellation r (bitsToInt ([y0, y1, y2] ++ rest)))
 codeSymbol _ _ _ = error "Modec.V32Pump.codeSymbol: short group"
-
-packBits :: [Bool] -> Int
-packBits = foldl (\acc b -> acc * 2 + (if b then 1 else 0)) 0
 
 -- | One symbol's coded content: the differentially encoded pair, then
 -- whatever uncoded bits the rate carries above it.
@@ -188,16 +185,6 @@ decodeQuads dir r quads st0 = (st1 { rcDescr = descr' }, dataBits)
       let (q1, q2) = diff (y1, y2) (rcPrev st)
       in (st { rcPrev = (y1, y2) }, q1 : q2 : rest)) st0 quads
     (descr', dataBits) = descrambleRun far (rcDescr st0) coded
-
-unpair :: Int -> (Bool, Bool)
-unpair i = (odd (i `div` 2), odd i)
-
-dibitOfState :: TrainState -> (Bool, Bool)
-dibitOfState s = case s of
-  StA -> (False, False)
-  StB -> (False, True)
-  StC -> (True, True)
-  StD -> (True, False)
 
 foldlAcc :: (s -> a -> (s, [b])) -> s -> [a] -> (s, [b])
 foldlAcc f = go []

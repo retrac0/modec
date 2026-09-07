@@ -469,13 +469,6 @@ conditioningRun dir trn = (ps, sc, q)
       (lastSt : _) -> dibitOfState lastSt
       [] -> (False, False)
 
-dibitOfState :: TrainState -> (Bool, Bool)
-dibitOfState s = case s of
-  StA -> (False, False)
-  StB -> (False, True)
-  StC -> (True, True)
-  StD -> (True, False)
-
 dirOf :: V32Start -> Direction
 dirOf st = case vsRole st of { Calling' -> Calling; Answering' -> Answering }
 
