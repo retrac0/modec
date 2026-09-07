@@ -78,6 +78,7 @@ data QamRxCfg = QamRxCfg
   , qrEvmFreeze :: !Double  -- ^ stop adapting above this decision error power
   , qrEvmGiveUp :: !Int     -- ^ symbols of bad decisions before starting over
   , qrAdapt     :: !Bool    -- ^ let the equaliser and the watchdog move at all
+  , qrTrack     :: !Bool    -- ^ let the carrier loop follow the decisions
   , qrPower     :: !Double  -- ^ mean square of the constellation (the AGC target)
   , qrSlice     :: (Double, Double) -> Int          -- ^ nearest point, as an index
   , qrPoint     :: Int -> (Double, Double)          -- ^ that index back to a point
@@ -108,7 +109,7 @@ defaultRxCfg slice point = QamRxCfg
   { qrKp = 0.12, qrKi = 0.0015, qrClamp = 2
   , qrThKp = 0.08, qrThKi = 0.0015
   , qrEqMu = 0.002, qrEqTaps = 31
-  , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrPower = 1
+  , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrTrack = True, qrPower = 1
   , qrSlice = slice, qrPoint = point }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
@@ -344,8 +345,24 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               err2 = errR * errR + errI * errI
               evm = 0.98 * rxEvm_ st + 0.02 * err2
               locked = pw > 1e-5
-              freq' = if locked then rxFreq st + qrThKi cfg * phErr else rxFreq st
-              theta' = if locked then wrapPi (th + freq' + qrThKp cfg * phErr) else th
+              -- 'qrTrack' holds the carrier loop where 'qrAdapt' holds
+              -- the equaliser.  They were one flag, which meant they
+              -- were one flag in name only: qrAdapt reached the taps and
+              -- the watchdog and never the phase, so a receiver told to
+              -- stop adapting went on steering its carrier by the
+              -- difference between what arrived and the nearest of four
+              -- points -- while the far end had already moved to
+              -- thirty-two or a hundred and twenty-eight of them, and
+              -- every one of those differences was meaningless.
+              --
+              -- theta still advances by freq' while held.  Stopping it
+              -- outright is the tempting mistake: over B1's 128 symbols
+              -- a residual 7 Hz -- which 2.1/V.32 obliges us to work
+              -- through -- turns the constellation by 134 degrees.
+              freq' = if locked && qrTrack cfg then rxFreq st + qrThKi cfg * phErr else rxFreq st
+              theta' | not locked = th
+                     | qrTrack cfg = wrapPi (th + freq' + qrThKp cfg * phErr)
+                     | otherwise = wrapPi (th + freq')
 
               -- The start-up signals are one point, or two alternating:
               -- their autocorrelation is singular and an LMS equaliser

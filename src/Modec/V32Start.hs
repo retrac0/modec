@@ -307,7 +307,26 @@ observe st rx = st
     -- signal E still to wait for.  Freezing there leaves it holding an
     -- equaliser trained on the first conditioning signal only, and the
     -- link works in one direction and not the other.
-    cfgNow = (v32RxCfg V32R4800) { qrAdapt = not (afterFarE (vsPhase st)) }
+    -- Once the far end's E has gone by it is sending B1 -- 128 symbol
+    -- intervals of scrambled ones at the agreed rate and coding -- and
+    -- the rate is agreed, so point the slicer at the constellation it
+    -- is actually using and let the loops converge on it.  That is what
+    -- 5.4.2 puts B1 there for, and it is the only stretch of the
+    -- start-up where the receiver can see the constellation it is about
+    -- to have to read.
+    --
+    -- What was here before kept the four-point slicer and turned the
+    -- adapting off, which reached the equaliser and not the carrier
+    -- loop: the loop went on steering by the difference between a
+    -- sixty-four point signal and the nearest of four states.  Freezing
+    -- the loop as well is worse again -- 'phErr' against four points is
+    -- a crude phase estimate but not a meaningless one, and coasting on
+    -- a frequency estimate that may already be off loses more than it
+    -- saves.  Measured both ways: 12000 stops carrying one direction.
+    cfgNow = case (afterFarE (vsPhase st), vsRate st) of
+      (True, Just r) -> v32RxCfg r
+      (True, Nothing) -> (v32RxCfg V32R4800) { qrAdapt = False, qrTrack = False }
+      (False, _) -> v32RxCfg V32R4800
     afterFarE ph = case ph of { AE -> True; V32Up _ -> True; _ -> False }
     (rxSt, syms) = qamRxBlock p cfgNow rx (vsRx st)
     -- Everything the start-up has to recognise is a quadrant change:
