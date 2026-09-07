@@ -15,6 +15,7 @@ module Modec.Modem
   , modemConnected
   , modemV32Evm
   , modemEchoErle
+  , modemEchoDelay
   , modemPhase
   , modemV32Phase
   , modemV32Bits
@@ -389,6 +390,10 @@ modemPhase st = case msMode st of
 -- | The echo canceller's return loss enhancement, for tracing: how much
 -- of what arrived it is taking out.  'Nothing' when no canceller is
 -- running, which is every mode but V.32.
+-- | Where the canceller found the echo, in samples, for tracing.
+modemEchoDelay :: ModemState -> Maybe Int
+modemEchoDelay st = msEcho st >>= echoDelay
+
 modemEchoErle :: ModemState -> Maybe Double
 modemEchoErle = fmap echoErle . msEcho
 
@@ -743,17 +748,33 @@ modemStep cfg st0 rxBlock newBytes =
     -- start-up saying which of them we are in.
     cancelEcho adapt st' n' blk = case msEcho st' of
       Nothing -> (Nothing, blk)
-      Just e -> let (e', clean) = echoBlock (mcEcho cfg) adapt blk e
+      Just e -> let (e', clean) = echoBlock (mcEcho cfg) adapt blk (aimed e)
                 in (Just e', if n' == 0 then blk else clean)
+      where
+        -- Look for the echo while the far end is quiet, which is the
+        -- one time what arrives /is/ the echo.  Once, and only until
+        -- something is found: aiming drops the taps, so doing it again
+        -- half way through a training window throws away the training.
+        aimed e
+          | not adapt = e
+          | Just _ <- echoDelay e = e
+          | Just (l, _) <- echoSearch (mcEcho cfg) e = echoAim (mcEcho cfg) l e
+          | otherwise = e
 
     pushEcho audio = fmap (echoPush (mcEcho cfg) audio)
 
-    -- 'echoSetFar' is deliberately not called from here.  The obvious
-    -- reading -- that the round trip the start-up measures (NT and MT)
-    -- is where the echo lives -- does not survive being tried: NT and MT
-    -- time the far modem's turnaround, which is its processing delay as
-    -- much as the line's, and retargeting on it drops the taps in the
-    -- middle of the one window that was training them.  Measured, it
-    -- took the calling modem from 17 dB of return loss to none.  The
-    -- filter spans 96 taps either side of a fixed bulk delay instead,
-    -- which is 12 ms and covers what a hybrid smears.
+    -- 'echoSetFar' is deliberately not called from here, and the round
+    -- trip the start-up measures is not what aims the filter.  The
+    -- obvious reading -- that NT and MT say where the echo lives --
+    -- does not survive being tried: they time the far modem's
+    -- turnaround, which is its processing delay as much as the line's,
+    -- and retargeting on them drops the taps in the middle of the one
+    -- window that was training them.  Measured, it took the calling
+    -- modem from 17 dB of return loss to none.
+    --
+    -- Nor does a bulk delay chosen in advance.  That is what was here,
+    -- and it spans 20 to 52 ms; dialling the voip.ms echo test, which
+    -- returns everything it is sent, put our own signal back at 116 ms.
+    -- The filter was aimed at empty line for the whole of every VoIP
+    -- call this modem has ever made.  'echoSearch' measures where the
+    -- reflection actually is instead.

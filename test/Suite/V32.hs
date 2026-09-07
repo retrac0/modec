@@ -1,6 +1,6 @@
 -- | V.32 and V.32bis: the coding layer, the data pump, the start-up of
 -- Figure 4, and the echo canceller that makes it possible.
-module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32StartTests) where
+module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32StartTests) where
 
 import Control.Monad (forM_, replicateM)
 import Data.List (nub)
@@ -455,7 +455,10 @@ echoPath taps x = VS.generate (VS.length x) $ \i ->
 -- reference is always a block behind, and the test has to honour that or
 -- it is measuring a canceller that could not exist.
 runEcho :: EchoConfig -> Int -> Signal -> Signal -> (Signal, EchoState)
-runEcho cfg blk tx rx = go 0 (echoInit cfg) []
+runEcho cfg = runEchoFrom (echoInit cfg) cfg
+
+runEchoFrom :: EchoState -> EchoConfig -> Int -> Signal -> Signal -> (Signal, EchoState)
+runEchoFrom st0 cfg blk tx rx = go 0 st0 []
   where
     n = VS.length rx
     go i st acc
@@ -468,7 +471,50 @@ runEcho cfg blk tx rx = go 0 (echoInit cfg) []
 
 echoTests :: TestTree
 echoTests = testGroup "echo cancellation"
-  [ testCase "a dispersive hybrid return is cancelled by 30 dB" $ do
+  [  testCase "the echo is found where a VoIP leg actually puts it" $ do
+      -- 116 ms is not a guess: it is where dialling the voip.ms echo
+      -- test, which returns everything it is sent, put our own signal
+      -- back.  The bulk delay the canceller started with spans 20 to
+      -- 52 ms, so this is the case it could never have handled, and the
+      -- one every real call presents.
+      -- Probed with the signal the canceller will really be searching
+      -- over: TRN, scrambled, from the conditioning period Figure 4
+      -- provides for exactly this.  Segments 1 and 2 of that signal
+      -- alternate two states and so have an envelope that repeats every
+      -- two symbols, which correlates with itself at every multiple of
+      -- 0.83 ms and would find a delay anywhere.  Only TRN decorrelates,
+      -- and a test driven by anything tidier would pass while the real
+      -- thing failed.
+      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+          lag = 928 :: Int          -- 116 ms, as measured on the line
+          rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
+          (_, st) = runEcho defaultEchoConfig 160 tx rx
+      case echoSearch defaultEchoConfig st of
+        Nothing -> assertFailure "the echo was not found at all"
+        Just (l, ratio) ->
+          assertBool ("found " ++ show l ++ " samples (" ++ show (fromIntegral l / 8.0 :: Double)
+                      ++ " ms), peak/mean " ++ show ratio ++ ", wanted about " ++ show lag)
+            (abs (l - lag) <= 24)
+  , testCase "and taken out once the filter is aimed where it was found" $ do
+      -- The whole point of the search: the same path the bulk delay
+      -- could not reach, cancelled.
+      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+          lag = 928 :: Int
+          rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
+          (_, found) = runEcho defaultEchoConfig 160 tx rx
+      case echoSearch defaultEchoConfig found of
+        Nothing -> assertFailure "the echo was not found"
+        Just (l, _) -> do
+          let aimed = echoAim defaultEchoConfig l (echoInit defaultEchoConfig)
+              (_, st) = runEchoFrom aimed defaultEchoConfig 160 tx rx
+          assertBool ("return loss " ++ show (echoErle st) ++ " dB, aimed at " ++ show l)
+            (echoErle st > 20)
+  , testCase "a leg with no echo on it offers no delay to find" $ do
+      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+          rx = VS.replicate (VS.length tx) 0
+          (_, st) = runEcho defaultEchoConfig 160 tx rx
+      assertEqual "nothing to find" Nothing (fmap fst (echoSearch defaultEchoConfig st))
+  ,  testCase "a dispersive hybrid return is cancelled by 30 dB" $ do
       let tx = gaussianNoise 5 24000 0.3
           rx = echoPath [(200, 0.20), (203.5, 0.10), (209.2, 0.04)] tx
           cfg = defaultEchoConfig

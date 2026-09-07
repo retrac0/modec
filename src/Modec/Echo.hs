@@ -36,6 +36,9 @@ module Modec.Echo
   , echoPush
   , echoBlock
   , echoSetFar
+  , echoSearch
+  , echoAim
+  , echoDelay
   , echoErle
   , echoRefDelay
   ) where
@@ -49,14 +52,24 @@ data EchoConfig = EchoConfig
   , ecDelay :: !Int      -- ^ bulk delay to the start of the filter, samples
   , ecMu    :: !Double   -- ^ normalised LMS step, 0 to 2
   , ecLeak  :: !Double   -- ^ tap leakage per sample
+  , ecSearch :: !Int     -- ^ how far back to look for the echo, samples
+  , ecPre   :: !Int      -- ^ how far in front of the peak the filter starts
+  , ecPeak  :: !Double   -- ^ peak to mean a correlation must beat to be believed
   } deriving (Eq, Show)
 
 -- | 256 taps is 32 ms at 8 kHz -- far wider than the few milliseconds a
 -- hybrid smears its return over, because the bulk delay is not known
 -- nearly as well as it looks.  See 'echoSetFar'.
+-- The search reaches 500 ms because a real one does.  Dialling the
+-- voip.ms echo test, which returns everything it is sent, put our own
+-- signal back at 116 ms: a filter spanning 20 to 52 ms -- which is what
+-- ecDelay and ecTaps came to on their own -- never had a chance at it.
+-- 4000 samples of reference history is 32 kB, which is not worth being
+-- clever about.
 defaultEchoConfig :: EchoConfig
 defaultEchoConfig = EchoConfig
-  { ecTaps = 256, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7 }
+  { ecTaps = 256, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7
+  , ecSearch = 4000, ecPre = 64, ecPeak = 4 }
 
 data EchoState = EchoState
   { esRef    :: !Signal   -- ^ what we have transmitted, oldest first
@@ -71,6 +84,8 @@ data EchoState = EchoState
   , esEchoP  :: !Double   -- ^ tracked power before cancellation
   , esResP   :: !Double   -- ^ and after
   , esOn     :: !Bool     -- ^ whether subtracting is worth doing
+  , esRxHist :: !Signal   -- ^ recent received audio, for the delay search
+  , esFound  :: !(Maybe Int)  -- ^ the delay the search settled on
   }
 
 echoInit :: EchoConfig -> EchoState
@@ -78,7 +93,8 @@ echoInit cfg = EchoState
   { esRef = VS.empty, esRefEnd = 0, esRxAt = 0
   , esDelay = ecDelay cfg
   , esTaps = VS.replicate (ecTaps cfg) 0
-  , esEchoP = 0, esResP = 0, esOn = False }
+  , esEchoP = 0, esResP = 0, esOn = False
+  , esRxHist = VS.empty, esFound = Nothing }
 
 -- | Remember a block we have just transmitted.  Called at the end of a
 -- modem step, with the audio that step produced.
@@ -88,8 +104,9 @@ echoPush cfg blk st = st
   , esRefEnd = esRefEnd st + VS.length blk }
   where
     kept = esRef st VS.++ blk
-    -- keep the bulk delay, the filter, and a block of slack
-    want = esDelay st + ecTaps cfg + 1024
+    -- the bulk delay, the filter, whatever the search may reach for,
+    -- and a block of slack
+    want = max (esDelay st + ecTaps cfg) (ecSearch cfg) + 1024
     drop_ = max 0 (VS.length kept - want)
 
 -- | The delay, in samples, between the newest reference sample we hold
@@ -191,10 +208,96 @@ echoBlock cfg adapt rx st0 = (st', out)
     (w1, ep1, rp1, on1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esOn st0) []
     out = VS.fromList outs
     st' = st0 { esTaps = w1, esEchoP = ep1, esResP = rp1, esOn = on1
-              , esRxAt = esRxAt st0 + n }
+              , esRxAt = esRxAt st0 + n
+              , esRxHist = keepTail (ecSearch cfg `div` 2) (esRxHist st0 VS.++ rx) }
+
+-- | Where the echo is, by looking for it.
+--
+-- Aiming the filter at a delay chosen in advance is what the bulk delay
+-- did, and it works exactly as long as the guess does.  A four-wire VoIP
+-- leg put the reflection back at 116 ms, which is not near any number
+-- worth guessing; the round trip a modem measures for itself is no help
+-- either, because NT and MT time the far modem's /turnaround/, which is
+-- its processing delay as much as the line's.  So measure the thing
+-- itself: our own transmit is known exactly, and where it reappears in
+-- what arrives is where the echo is.
+--
+-- On the waveform, and not on its envelope.  The envelope is the
+-- cheaper thing to correlate and it is useless here: the signal the
+-- half-duplex windows offer is TRN, whose four states all have the same
+-- magnitude, so its envelope is nearly flat and carries almost no
+-- structure to match.  The waveform carries all of it.  A coherent
+-- correlation of two signals centred on 1800 Hz does have a sidelobe
+-- every carrier period, but those sit within half a millisecond of the
+-- true peak and the filter reaches 'ecPre' in front of wherever it is
+-- aimed, so being a carrier period out costs nothing.
+--
+-- Returns the lag in samples and the peak-to-mean ratio that justified
+-- it.  'Nothing' when nothing stands out, which is the answer on a leg
+-- with no echo on it and has to stay the answer: a canceller that
+-- believes a noise peak subtracts a signal that was never there.
+echoSearch :: EchoConfig -> EchoState -> Maybe (Int, Double)
+echoSearch cfg st
+  | VS.length rxW < 256 = Nothing
+  | null scores = Nothing
+  | best > ecPeak cfg * avg, avg > 0
+  , best > 2 * rival = Just (bestLag, best / avg)
+  | otherwise = Nothing
+  where
+    ref = esRef st
+    refLen = VS.length ref
+    -- the most recent stretch of what arrived
+    rxW = keepTail 1000 (esRxHist st)
+    w = VS.length rxW
+    rxMean = VS.sum rxW / fromIntegral w
+    rxC = VS.map (subtract rxMean) rxW
+    rxNorm = sqrt (VS.sum (VS.map (\v -> v * v) rxC))
+    rxFrom = esRxAt st - w
+    startOf l = (rxFrom - l) - (esRefEnd st - refLen)
+    -- an echo cannot come back sooner than our own transmit is old
+    lo = max 0 (esRxAt st - esRefEnd st)
+    lags = [ l | l <- [lo .. ecSearch cfg]
+               , let o = startOf l, o >= 0, o + w <= refLen ]
+    scores = [ (score l, l) | l <- lags ]
+    score l =
+      let o = startOf l
+          e = VS.slice o w ref
+          m = VS.sum e / fromIntegral w
+          c = VS.map (subtract m) e
+          nrm = sqrt (VS.sum (VS.map (\v -> v * v) c))
+      in if nrm <= 0 || rxNorm <= 0 then 0
+         else abs (VS.sum (VS.zipWith (*) rxC c)) / (nrm * rxNorm)
+    best = maximum (map fst scores)
+    bestLag = snd (head [ p | p <- scores, fst p == best ])
+    avg = sum (map fst scores) / fromIntegral (length scores)
+    -- The best peak anywhere but next to the winner.  A reflection is
+    -- one place on the line and correlates nowhere else; a signal that
+    -- repeats correlates with itself at every multiple of its period,
+    -- and the first two segments of the conditioning signal alternate
+    -- two states and so repeat every two symbols.  Searching over those
+    -- finds a confident answer at a delay set by arithmetic rather than
+    -- by the line, aims the filter there, and drops the taps that were
+    -- converging.  Comparing against the mean does not catch it -- a
+    -- comb of peaks lifts the mean too -- and this does.
+    rival = maximum (0 : [ c | (c, l) <- scores, abs (l - bestLag) > 160 ])
+
+-- | Point the filter at a delay the search found, reaching 'ecPre' in
+-- front of it so the leading edge of the reflection is inside the span.
+echoAim :: EchoConfig -> Int -> EchoState -> EchoState
+echoAim cfg l st = st
+  { esDelay = max (ecDelay cfg) (l - ecPre cfg)
+  , esTaps = VS.map (const 0) (esTaps st)
+  , esFound = Just l }
+
+-- | The delay the search settled on, for tracing.
+echoDelay :: EchoState -> Maybe Int
+echoDelay = esFound
 
 -- | Echo return loss enhancement, in dB: how much of what arrived has
 -- been taken out.  Traced so a test can assert it does not regress.
+keepTail :: Int -> Signal -> Signal
+keepTail k x = VS.drop (max 0 (VS.length x - k)) x
+
 echoErle :: EchoState -> Double
 echoErle st
   | esResP st <= 0 || esEchoP st <= 0 = 0
