@@ -4,7 +4,7 @@ import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Control.Monad (forM_)
-import Data.List (isInfixOf, isSuffixOf, sort)
+import Data.List (isInfixOf, isSuffixOf, nub, sort)
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 import System.Directory (listDirectory)
@@ -23,6 +23,8 @@ import Modec.Modem
 import Modec.Telnet
 import Modec.Async
 import Modec.V22
+import Modec.V32
+import qualified Modec.V32 as V32
 import Modec.Hdlc
 import Modec.MnpFrame
 import Modec.Mnp
@@ -1426,10 +1428,287 @@ dspTests = testGroup "shared DSP primitives"
     groupRuns [] = []
     groupRuns (x:xs) = let (a, b) = span (== x) xs in (x : a) : groupRuns b
 
+-- Table 1/V.32, transcribed from the Recommendation rather than derived:
+-- inputs Q1 Q2, previous Y1 Y2, resulting Y1 Y2.
+table1 :: [((Bool, Bool), (Bool, Bool), (Bool, Bool))]
+table1 = [ (q, p, o) | (qi, ps) <- zip [0 :: Int ..] rows, (pi_, oi) <- zip [0 :: Int ..] ps
+         , let q = bitPair qi, let p = bitPair pi_, let o = bitPair oi ]
+  where
+    -- rows are Q1Q2 = 00, 01, 10, 11; within a row, previous = 00, 01, 10, 11
+    rows = [ [1, 3, 0, 2]      -- +90 degrees
+           , [0, 1, 2, 3]      --   0
+           , [3, 2, 1, 0]      -- +180
+           , [2, 0, 3, 1] ]    -- +270
+
+-- Table 2/V.32, likewise: the trellis alternative's differential
+-- encoding, which is a different table and must stay one.
+table2 :: [((Bool, Bool), (Bool, Bool), (Bool, Bool))]
+table2 = [ (q, p, o) | (qi, ps) <- zip [0 :: Int ..] rows, (pi_, oi) <- zip [0 :: Int ..] ps
+         , let q = bitPair qi, let p = bitPair pi_, let o = bitPair oi ]
+  where
+    rows = [ [0, 1, 2, 3]
+           , [1, 0, 3, 2]
+           , [2, 3, 1, 0]
+           , [3, 2, 0, 1] ]
+
+bitPair :: Int -> (Bool, Bool)
+bitPair i = (testBit i (1 :: Int), testBit i (0 :: Int))
+
+pairBits :: (Bool, Bool) -> Int
+pairBits (a, b) = (if a then 2 else 0) + (if b then 1 else 0)
+
+-- One symbol's worth of data at 9600: Q1 Q2 Q3 Q4.
+type Quad = (Bool, Bool, Bool, Bool)
+
+quadsFrom :: Int -> [Quad]
+quadsFrom n = [ (b 0, b 1, b 2, b 3) | i <- [0 .. n - 1]
+              , let b k = odd ((i * 7919 + 13) `div` (3 ^ (k :: Int)) + i `div` 7) ]
+
+-- The 9600 bit/s non-redundant chain, end to end.
+enc16 :: [Quad] -> [Point]
+enc16 = go (False, False)
+  where
+    go _ [] = []
+    go prev ((q1, q2, q3, q4) : rest) =
+      let y@(y1, y2) = diffEncode1 (q1, q2) prev
+      in constellation V32R9600 (pairBits (y1, y2) * 4 + pairBits (q3, q4)) : go y rest
+
+dec16 :: [Point] -> [Quad]
+dec16 pts = go (False, False) pts
+  where
+    go _ [] = []
+    go prev (p : rest) =
+      let i = slicePoint V32R9600 p
+          y = bitPair (i `div` 4)
+          (q3, q4) = bitPair (i `mod` 4)
+          (q1, q2) = diffDecode1 y prev
+      in (q1, q2, q3, q4) : go y rest
+
+-- The 9600 bit/s trellis chain, end to end.
+enc32 :: [Quad] -> [Point]
+enc32 = go (False, False) convInit
+  where
+    go _ _ [] = []
+    go prev cs ((q1, q2, q3, q4) : rest) =
+      let y@(y1, y2) = diffEncode2 (q1, q2) prev
+          (cs', y0) = convStep cs y
+          i = pairBits (y0, y1) * 8 + pairBits (y2, q3) * 2 + (if q4 then 1 else 0)
+      in constellation V32R9600T i : go y cs' rest
+
+dec32 :: Int -> [Point] -> [Quad]
+dec32 depth pts = go (False, False) (viterbiDecode depth pts)
+  where
+    go _ [] = []
+    go prev ((y1, y2, q3, q4) : rest) =
+      let (q1, q2) = diffDecode2 (y1, y2) prev
+      in (q1, q2, q3, q4) : go (y1, y2) rest
+
+rot90 :: Point -> Point
+rot90 (x, y) = (negate y, x)
+
+v32Tests :: TestTree
+v32Tests = testGroup "V.32 coding layer"
+  [ testCase "both scramblers reproduce the TRN openings of 5.2.3" $ do
+      -- The Recommendation prints the first 30 scrambled bits and the
+      -- states they become, for each direction.  One assertion pins both
+      -- polynomials, the all-zero register, the dibit ordering and the
+      -- A/C convention of the first 256 symbols.
+      let showBits = concatMap (\b -> if b then "1" else "0")
+          showStates = map (\st -> case st of StA -> 'A'; StB -> 'B'; StC -> 'C'; StD -> 'D')
+      assertEqual "GPC bits" "111111111111111111000001111111" (showBits (trnBits Calling 30))
+      assertEqual "GPA bits" "111110000011111000001110011111" (showBits (trnBits Answering 30))
+      assertEqual "call mode states" "CCCCCCCCCAAACCC" (showStates (trnStates Calling 15))
+      assertEqual "answer mode states" "CCCAACCCAACCACC" (showStates (trnStates Answering 15))
+
+  , testCase "a scrambler and its descrambler are inverse" $
+      forM_ [Calling, Answering] $ \d -> do
+        let bits = prbs (11, 9) 500
+            line = snd (foldl (\(sc, acc) b -> let (sc', o) = V32.scrambleBit d sc b in (sc', acc ++ [o])) (scramblerInit, []) bits)
+            back = snd (foldl (\(sc, acc) b -> let (sc', o) = V32.descrambleBit d sc b in (sc', acc ++ [o])) (scramblerInit, []) line)
+        assertEqual (show d) bits back
+
+  , testCase "Table 1 is transcribed correctly and inverts" $
+      forM_ table1 $ \(q, p, o) -> do
+        assertEqual ("encode " ++ show (q, p)) o (diffEncode1 q p)
+        assertEqual ("decode " ++ show (q, p)) q (diffDecode1 o p)
+
+  , testCase "Table 2 is transcribed correctly and inverts" $
+      forM_ table2 $ \(q, p, o) -> do
+        assertEqual ("encode " ++ show (q, p)) o (diffEncode2 q p)
+        assertEqual ("decode " ++ show (q, p)) q (diffDecode2 o p)
+
+  , testCase "Table 1 and Table 2 are different tables" $ do
+      -- Copying one into the other's path gives a link that trains and
+      -- then errors systematically, so assert outright that they differ.
+      let differing = [ () | ((q, p, o1), (_, _, o2)) <- zip table1 table2, o1 /= o2 ]
+      assertBool "the two differential encodings must not coincide" (length differing >= 8)
+
+  , testCase "the training states are Figure 1's circled points" $ do
+      -- A, B, C, D each have power 10 in grid units, the mean power of
+      -- both data constellations, so training goes to line at the data
+      -- level.  They are 90 degrees apart in the order C D A B.
+      forM_ trainStates $ \st -> do
+        let (x, y) = statePoint st
+        assertBool (show st ++ " power") (abs (x * x + y * y - 1) < 1e-12)
+      let ang st = let (x, y) = statePoint st in atan2 y x
+          step a b = let d = (ang b - ang a) * 180 / pi in if d < -1 then d + 360 else d
+      forM_ [(StC, StD), (StD, StA), (StA, StB)] $ \(a, b) ->
+        assertBool (show (a, b) ++ " is a quarter turn") (abs (step a b - 90) < 1e-9)
+      let (ax, ay) = statePoint StA
+          (cx, cy) = statePoint StC
+      assertBool "A and C are antipodal" (abs (ax + cx) < 1e-12 && abs (ay + cy) < 1e-12)
+
+  , testCase "both constellations have unit mean power and slice back" $
+      forM_ [(V32R4800, 4), (V32R9600, 16), (V32R9600T, 32)] $ \(r, n) -> do
+        let pts = [ constellation r i | i <- [0 .. n - 1] ]
+            mp = sum [ x * x + y * y | (x, y) <- pts ] / fromIntegral n
+        assertEqual (show r ++ ": all points distinct") n (length (nubPoints pts))
+        assertBool (show r ++ " mean power " ++ show mp) (abs (mp - 1) < 1e-12)
+        forM_ [0 .. n - 1] $ \i ->
+          assertEqual (show r ++ " slices index " ++ show i) i (slicePoint r (constellation r i))
+
+  , testCase "the trellis subsets are further apart than the whole set" $ do
+      -- The Y0 bit splits the 32 points into two halves whose own
+      -- minimum distance is larger than the set's.  That gap is the
+      -- coding gain; if the subset partition is wrong it silently
+      -- vanishes and the Viterbi decoder buys nothing.
+      let pts = [ (i, constellation V32R9600T i) | i <- [0 .. 31] ]
+          d2 (a, b) (c, d) = (a - c) ^ (2 :: Int) + (b - d) ^ (2 :: Int)
+          whole = minimum [ d2 p q | (i, p) <- pts, (j, q) <- pts, i < j ]
+          half h = minimum [ d2 p q | (i, p) <- pts, (j, q) <- pts, i < j
+                           , i `div` 16 == h, j `div` 16 == h ]
+      assertBool "Y0 = 0 subset" (half (0 :: Int) > whole * 1.9)
+      assertBool "Y0 = 1 subset" (half 1 > whole * 1.9)
+
+  , testCase "the trellis code has the free distance it is supposed to" $ do
+      -- The decisive check on Figure 2.  Two things bound how far apart
+      -- two distinct transmitted sequences can be: the distance between
+      -- the four points sharing a branch (parallel transitions), and the
+      -- distance accumulated by two paths that diverge and remerge.  A
+      -- mis-traced adder or AND gate changes the second and nothing
+      -- else, so this pins the wiring without simulating anything.
+      --
+      -- Working in the Recommendation's integer grid, where the uncoded
+      -- 16-point set has a minimum squared distance of 4, V.32's 8-state
+      -- code should reach 10 -- a 3.98 dB asymptotic gain.
+      let grid i = let (x, y) = constellation V32R9600T i in (x / gridScale, y / gridScale)
+          subsetPts y0 y1 y2 =
+            [ grid ((if y0 then 16 else 0) + (if y1 then 8 else 0)
+                    + (if y2 then 4 else 0) + q) | q <- [0 .. 3] ]
+          sq (a, b) (c, d) = (a - c) ^ (2 :: Int) + (b - d) ^ (2 :: Int)
+          dibs = [(False, False), (False, True), (True, False), (True, True)]
+          stepOf st u = let (ConvState st', y0) = convStep (ConvState st) u in (st', y0)
+          branchPts st u = let (_, y0) = stepOf st u in subsetPts y0 (fst u) (snd u)
+          interD a u b u' = minimum [ sq p q | p <- branchPts a u, q <- branchPts b u' ]
+          parallel = minimum
+            [ sq p q | y0 <- [False, True], y1 <- [False, True], y2 <- [False, True]
+            , let ps = subsetPts y0 y1 y2
+            , (i, p) <- zip [0 :: Int ..] ps, (j, q) <- zip [0 :: Int ..] ps, i < j ]
+          minPerKey xs = [ (k, minimum [ v | (k', v) <- xs, k' == k ]) | k <- nub (map fst xs) ]
+          expand (a, b) = [ ((fst (stepOf a u), fst (stepOf b u')), interD a u b u')
+                          | u <- dibs, u' <- dibs ]
+          seeds = [ ((fst (stepOf st u), fst (stepOf st u')), interD st u st u')
+                  | st <- [0 .. 7 :: Int], u <- dibs, u' <- dibs, u /= u' ]
+          walk best frontier n
+            | n <= (0 :: Int) || null frontier = best
+            | otherwise =
+                let nxt = minPerKey [ ((x, y), c + d) | ((a, b), c) <- frontier
+                                    , ((x, y), d) <- expand (a, b) ]
+                    best' = minimum (best : [ v | ((x, y), v) <- nxt, x == y ])
+                in walk best' [ (k, v) | (k@(x, y), v) <- nxt, x /= y, v < best' ] (n - 1)
+          merged0 = minimum ([ c | ((x, y), c) <- seeds, x == y ] ++ [1e9])
+          dfree = walk merged0 (minPerKey [ (k, c) | (k, c) <- seeds, fst k /= snd k ]) 25
+          eff = min parallel dfree
+      assertEqual "distance between parallel transitions" 16 parallel
+      assertEqual "free distance of the code" 10 dfree
+      assertBool ("asymptotic gain " ++ show (10 * logBase 10 (eff / 4)) ++ " dB")
+        (abs (10 * logBase 10 (eff / 4) - 3.98) < 0.02)
+
+  , testCase "the trellis decoder is right where the plain slicer is wrong" $ do
+      -- And the gain shows up in practice: at a noise level that costs
+      -- the 16-point slicer a dozen symbols, the Viterbi decoder loses
+      -- none.  Both constellations have unit mean power, so the same
+      -- sigma is the same channel.
+      let qs = quadsFrom 3000
+          sigma = 0.10
+          noisy sd ps = zipWith3 (\(x, y) a b -> (x + a, y + b)) ps
+            (VS.toList (gaussianNoise sd (length ps) sigma))
+            (VS.toList (gaussianNoise (sd + 7) (length ps) sigma))
+          wrong a b = length [ () | (x, y) <- zip a b, x /= y ]
+          plain = wrong (drop 30 qs) (drop 30 (dec16 (noisy 1 (enc16 qs))))
+          coded = wrong (drop 30 qs) (drop 30 (dec32 16 (noisy 1 (enc32 qs))))
+      assertBool ("the plain slicer should be making errors here, made " ++ show plain)
+        (plain >= 8)
+      assertEqual "the trellis decoder should make none" 0 coded
+
+  , testCase "rate sequences survive Table 6 and Table 7 and reject noise" $ do
+      let seqs = [ RateSeq a b c t | a <- [False, True], b <- [False, True]
+                 , c <- [False, True], t <- [False, True] ]
+      forM_ seqs $ \r -> do
+        assertEqual "R round trip" (Just r) (decodeRateSeq (rateSeqBits r))
+        assertEqual "E round trip" (Just r) (decodeESeq (eSeqBits r))
+        -- E and a rate sequence differ only in B0-B3, and each decoder
+        -- must refuse the other's leader.
+        assertEqual "R is not an E" Nothing (decodeESeq (rateSeqBits r))
+        assertEqual "E is not an R" Nothing (decodeRateSeq (eSeqBits r))
+      let good = rateSeqBits (RateSeq False True True True)
+      forM_ [0, 1, 2, 3, 7, 9, 10, 11, 12, 13, 14, 15] $ \i ->
+        assertEqual ("a flipped sync bit " ++ show i ++ " is refused")
+          Nothing (decodeRateSeq (flipAt i good))
+      assertBool "all rates off is a cleardown" (rateSeqCleardown noRates)
+
+  , testCase "the rate both ends can run is the best they share" $ do
+      let full = RateSeq True True True True
+          noTcm = RateSeq True True True False
+          slow = RateSeq True True False False
+      assertEqual "both trellis" (Just V32R9600T) (bestCommonRate full full)
+      assertEqual "one without trellis" (Just V32R9600) (bestCommonRate full noTcm)
+      assertEqual "one without 9600" (Just V32R4800) (bestCommonRate full slow)
+      assertEqual "nothing in common" Nothing (bestCommonRate slow (RateSeq True False False False))
+
+  , testCase "9600 non-redundant carries data through a clean channel" $ do
+      let qs = quadsFrom 400
+      sameQuads "non-redundant" (drop 1 qs) (drop 1 (dec16 (enc16 qs)))
+
+  , testCase "9600 trellis carries data through a clean channel" $ do
+      let qs = quadsFrom 400
+      sameQuads "trellis" (drop 1 qs) (drop 1 (dec32 16 (enc32 qs)))
+
+  , testCase "both 9600 alternatives ignore a quarter turn of the line" $ do
+      -- The receiver's carrier loop locks with a four-fold phase
+      -- ambiguity it cannot resolve on its own.  Table 1 removes it for
+      -- the non-redundant alternative; for the trellis one it is the
+      -- non-linear convolutional encoder that has to, which makes this
+      -- the test that the wiring of Figure 2 was traced correctly.
+      let qs = quadsFrom 400
+          turns k = iterate (map rot90) (enc16 qs) !! k
+          turnsT k = iterate (map rot90) (enc32 qs) !! k
+      forM_ [0, 1, 2, 3] $ \k -> do
+        sameQuads ("non-redundant, " ++ show k ++ " quarter turns")
+          (drop 1 qs) (drop 1 (dec16 (turns k)))
+        sameQuads ("trellis, " ++ show k ++ " quarter turns")
+          (drop 20 qs) (drop 20 (dec32 16 (turnsT k)))
+  ]
+  where
+    nubPoints [] = []
+    nubPoints (x : xs) = x : nubPoints (filter (/= x) xs)
+    flipAt i bs = [ if j == i then not b else b | (j, b) <- zip [0 :: Int ..] bs ]
+    -- These lists are hundreds of symbols long; report where they first
+    -- differ rather than printing both.
+    sameQuads what want got = do
+      assertEqual (what ++ ": length") (length want) (length got)
+      case [ (i, a, b) | (i, a, b) <- zip3 [0 :: Int ..] want got, a /= b ] of
+        [] -> return ()
+        ((i, a, b) : _) ->
+          assertFailure (what ++ ": symbol " ++ show i ++ " is " ++ show b
+                         ++ ", expected " ++ show a ++ " ("
+                         ++ show (length [ () | (x, y) <- zip want got, x /= y ])
+                         ++ " of " ++ show (length want) ++ " wrong)")
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
