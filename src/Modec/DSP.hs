@@ -7,6 +7,7 @@
 -- and tone helpers here.
 module Modec.DSP
   ( Signal
+  , chunksOf
     -- * Windows and correlators
   , movingSum
   , rectWindow
@@ -36,6 +37,9 @@ module Modec.DSP
     -- * Pulse shaping
   , rrcPulse
   , rrcKernel
+    -- * Phase
+  , wrapPi
+  , wrapTwoPi
     -- * Interpolation and time warping
   , sampleAt
   , cubicAt
@@ -49,6 +53,16 @@ import qualified Data.Vector.Storable as VS
 
 -- | Real-valued sample stream, nominally in [-1, 1].
 type Signal = VS.Vector Double
+
+-- | Cut a signal into blocks of @n@ samples, the last one short.  A
+-- streaming receiver is defined by its behaviour not depending on where
+-- these fall, so the offline helpers that drive one over a whole
+-- recording all have to cut it up somewhere; they cut it up here.
+chunksOf :: Int -> Signal -> [Signal]
+chunksOf n x
+  | n <= 0 = [x]
+  | VS.null x = []
+  | otherwise = VS.take n x : chunksOf n (VS.drop n x)
 
 -- | Sliding-window sum of the last @len@ samples (window ends at the
 -- current index, truncated at the start of the vector).  Uses prefix
@@ -281,6 +295,18 @@ rrcKernel fs baud rollOff span_ = VS.map (/ norm) raw
     half = round (span_ * sps) :: Int
     raw = VS.generate (2 * half + 1) (\i -> rrcPulse rollOff (fromIntegral (i - half) / sps))
     norm = sqrt (VS.sum (VS.map (\v -> v * v) raw))
+
+-- | Fold a phase into [-pi, pi).  For a phase /error/, where the whole
+-- point is that a step across the branch cut is a small correction and
+-- not a full turn backwards.
+wrapPi :: Double -> Double
+wrapPi x = x - 2 * pi * fromIntegral (round (x / (2 * pi)) :: Int)
+
+-- | Fold a phase into [0, 2*pi).  For an oscillator carried across
+-- blocks, where the only job is to keep the accumulator from growing
+-- until its absolute precision no longer resolves a sample.
+wrapTwoPi :: Double -> Double
+wrapTwoPi x = x - 2 * pi * fromIntegral (floor (x / (2 * pi)) :: Int)
 
 -- | Band-limited interpolation at fractional index @t@ (Lanczos, a = 6).
 -- Samples outside the vector read as zero.

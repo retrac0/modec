@@ -40,6 +40,8 @@ module Modec.V22
   , v22RxInit
   , v22RxInitWith
   , v22RxBlock
+  , v22Receiver
+  , v22ReceiverFrom
   , v22RxSetRate
   , v22RxSetCoherentGains
   , rxSpsEstimate
@@ -65,12 +67,13 @@ module Modec.V22
   ) where
 
 import qualified Data.Vector.Storable as VS
-import Data.Bits (shiftL, testBit, (.&.))
 import Data.Word (Word8)
 
 import Modec.DSP
 import Modec.FSK (Framing, frameBits)
 import Modec.Hdlc (hdlcFlagBits)
+import Modec.Scrambler
+import Modec.Stream
 
 data V22Channel = LowChannel | HighChannel deriving (Eq, Show)
 
@@ -86,39 +89,24 @@ baud = 600
 rollOff :: Double
 rollOff = 0.75
 
--- | Root-raised-cosine impulse response, time in symbol periods.
-rrc :: Double -> Double
-rrc t
-  | abs t < 1e-9 = 1 - b + 4 * b / pi
-  | abs (abs t - 1 / (4 * b)) < 1e-9 =
-      b / sqrt 2 * ((1 + 2 / pi) * sin (pi / (4 * b)) + (1 - 2 / pi) * cos (pi / (4 * b)))
-  | otherwise =
-      (sin (pi * t * (1 - b)) + 4 * b * t * cos (pi * t * (1 + b))) / (pi * t * (1 - (4 * b * t) ^ (2 :: Int)))
-  where b = rollOff
-
 -- | Pulse span on each side, in symbols.
 pulseSpan :: Double
 pulseSpan = 6
 
 -- | Sampled RRC kernel for the matched filter, unit energy.
 rrcTaps :: Double -> VS.Vector Double
-rrcTaps fs = VS.map (/ norm) raw
-  where
-    sps = fs / baud
-    half = round (pulseSpan * sps) :: Int
-    raw = VS.generate (2 * half + 1) (\i -> rrc (fromIntegral (i - half) / sps))
-    norm = sqrt (VS.sum (VS.map (\v -> v * v) raw))
+rrcTaps fs = rrcKernel fs baud rollOff pulseSpan
 
--- Scrambler / descrambler: 17-bit history of the line (scrambled) bits.
+-- | The V.22 scrambler polynomial (§6.2), 1 + x^-14 + x^-17.  The
+-- register it runs on is a 17-bit history of the line (scrambled) bits.
+v22Lfsr :: Lfsr
+v22Lfsr = lfsr 14 17
+
 scrambleBit :: Int -> Bool -> (Int, Bool)
-scrambleBit reg d =
-  let s = d /= (testBit reg 13 /= testBit reg 16)   -- x^-14 and x^-17
-  in (((reg `shiftL` 1) .&. 0x1FFFF) + (if s then 1 else 0), s)
+scrambleBit = scramble v22Lfsr
 
 descrambleBit :: Int -> Bool -> (Int, Bool)
-descrambleBit reg s =
-  let d = s /= (testBit reg 13 /= testBit reg 16)
-  in (((reg `shiftL` 1) .&. 0x1FFFF) + (if s then 1 else 0), d)
+descrambleBit = descramble v22Lfsr
 
 -- | Dibit (first bit, second bit) to phase change in quadrants
 -- (Table 1/V.22): 00 = +90, 01 = 0, 11 = +270, 10 = +180.
@@ -256,20 +244,19 @@ v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
           accum !k !a !b
             | k > kHi = (a, b)
             | otherwise =
-                let p = rrc ((t - (t0s + fromIntegral k * sps)) / sps)
+                let p = rrcPulse rollOff ((t - (t0s + fromIntegral k * sps)) / sps)
                 in accum (k + 1) (a + p * VS.unsafeIndex symsRe k) (b + p * VS.unsafeIndex symsIm k)
           (re, im) = accum kLo 0 0
           th = txCarrier stFilled + wc * t
           g = if guard && ch == HighChannel then 0.5 * sin (txGuard stFilled + wg * t) else 0
       in amp * (re * cos th - im * sin th + g)
-    wrap p = p - 2 * pi * fromIntegral (floor (p / (2 * pi)) :: Int)
     dropN = max 0 (floor ((fromIntegral n - (pulseSpan + 1) * sps - t0s) / sps)) :: Int
     st' = stFilled
       { txSymClock = txSymClock stFilled - fromIntegral n
       , txSymT0 = t0s + fromIntegral dropN * sps - fromIntegral n
       , txSymbols = drop dropN (txSymbols stFilled)
-      , txCarrier = wrap (txCarrier stFilled + wc * fromIntegral n)
-      , txGuard = wrap (txGuard stFilled + wg * fromIntegral n)
+      , txCarrier = wrapTwoPi (txCarrier stFilled + wc * fromIntegral n)
+      , txGuard = wrapTwoPi (txGuard stFilled + wg * fromIntegral n)
       }
 
 -- | Pending data bits of a transmitter (for experiments and tests).
@@ -420,6 +407,16 @@ decide4 x y = gridPoint q False True
     ang = atan2 y x - atan2 1 3
     q = (floor ((ang + pi / 4) / (pi / 2)) :: Int) `mod` 4
 
+-- | The receiver as a stream stage, so it composes with the rest of the
+-- chain and does not care how the audio is cut up.
+v22Receiver :: Double -> V22Channel -> Stage Signal RxOut
+v22Receiver fs ch = v22ReceiverFrom fs ch (v22RxInit fs)
+
+-- | 'v22Receiver' resuming from a receiver that has already run, or one
+-- set to a rate other than the 1200 bit\/s it starts at.
+v22ReceiverFrom :: Double -> V22Channel -> V22RxState -> Stage Signal RxOut
+v22ReceiverFrom fs ch st0 = Stage st0 (\st chunk -> v22RxBlock fs ch chunk st)
+
 v22RxBlock :: Double -> V22Channel -> Signal -> V22RxState -> (V22RxState, RxOut)
 v22RxBlock fs ch chunk st0 = (st', out)
   where
@@ -441,7 +438,6 @@ v22RxBlock fs ch chunk st0 = (st', out)
     thetaKp = rxThKp st0
     thetaKi = rxThKi st0
     eqMu = rxEqMu st0
-    wrapPi x = x - 2 * pi * fromIntegral (round (x / (2 * pi)) :: Int)
     -- per-symbol loop; accumulates symbols, steps, bits and angle errors
     go st syms dibits bits aerrs
       | floor (rxTau st) + 2 >= len = (st, reverse syms, reverse dibits, reverse bits, aerrs)
@@ -513,8 +509,7 @@ v22RxBlock fs ch chunk st0 = (st', out)
               bitsIn = case rxRate st of
                 R1200 -> [d1, d2]
                 R2400 -> [c1, c2, b3, b4]
-              (reg', descRev) = foldl (\(r, acc) b -> let (r', d) = descrambleBit r b in (r', d : acc)) (rxDescr st, []) bitsIn
-              descBits = reverse descRev
+              (reg', descBits) = descrambleRun v22Lfsr (rxDescr st) bitsIn
               ones = foldl (\acc b -> if b then acc + 1 else 0) (rxOnesRun st) descBits
               ones2400 = case rxRate st of
                 R2400 -> ones
@@ -531,7 +526,7 @@ v22RxBlock fs ch chunk st0 = (st', out)
               -- a V.22 signal has just started (unscrambled ones recognised), or the
               -- coherent path has been lost for 50 symbols: start the coherent path over
               st2 = if u11 == 93 || badEvm >= 50 then resetCoherent st1 else st1
-          in go st2 ((ur, ui) : syms) (stepQ : dibits) (descRev ++ bits) (aerr : aerrs)
+          in go st2 ((ur, ui) : syms) (stepQ : dibits) (reverse descBits ++ bits) (aerr : aerrs)
     (stSym, symsOut, dibitsOut, bitsOut, aerrs) = go st0 [] [] [] []
     angleErr = if null aerrs then 0 else sum aerrs / fromIntegral (length aerrs)
     carry = VS.length (rxPrevRe st0)
@@ -562,18 +557,14 @@ v22ModulateAt fs ch rate amp bits = VS.concat (go v22TxInit bits)
 
 -- | Offline: descrambled bits from a signal at 1200 bit/s.
 v22Demodulate :: Double -> V22Channel -> Signal -> [Bool]
-v22Demodulate fs ch = v22DemodulateWith (v22RxInit fs) ch
+v22Demodulate fs ch = v22DemodulateWith fs (v22RxInit fs) ch
 
 v22DemodulateAt :: Double -> V22Channel -> Rate -> Signal -> [Bool]
-v22DemodulateAt fs ch rate = v22DemodulateWith (v22RxSetRate rate (v22RxInit fs)) ch
+v22DemodulateAt fs ch rate = v22DemodulateWith fs (v22RxSetRate rate (v22RxInit fs)) ch
 
-v22DemodulateWith :: V22RxState -> V22Channel -> Signal -> [Bool]
-v22DemodulateWith st0 ch x = concatMap roBits (v22RxRun 8000 st0 ch x)
+v22DemodulateWith :: Double -> V22RxState -> V22Channel -> Signal -> [Bool]
+v22DemodulateWith fs st0 ch x = concatMap roBits (v22RxRun fs st0 ch x)
 
 -- | Offline: all receiver outputs per 160-sample block.
 v22RxRun :: Double -> V22RxState -> V22Channel -> Signal -> [RxOut]
-v22RxRun fs st0 ch x = go st0 (chunks x)
-  where
-    chunks v | VS.null v = [] | otherwise = VS.take 160 v : chunks (VS.drop 160 v)
-    go _ [] = []
-    go st (c : cs) = let (st', o) = v22RxBlock fs ch c st in o : go st' cs
+v22RxRun fs st0 ch x = runStage (v22ReceiverFrom fs ch st0) (chunksOf 160 x)

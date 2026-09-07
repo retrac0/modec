@@ -35,6 +35,8 @@ module Modec.V32
   , scramblerInit
   , scrambleBit
   , descrambleBit
+  , scrambleRun
+  , descrambleRun
     -- * Signal states and constellations (Figures 1 and 3, Table 3)
   , Point
   , TrainState (..)
@@ -68,8 +70,11 @@ module Modec.V32
   , bestCommonRate
   ) where
 
-import Data.Bits (shiftL, testBit, (.&.), (.|.))
+import Data.Bits (testBit, (.&.), (.|.))
 import Data.List (foldl')
+
+import Modec.Scrambler (Lfsr, lfsr, scramble, descramble)
+import qualified Modec.Scrambler as Scr
 
 -- | The rates this implementation offers.  2400 bit\/s is "for further
 -- study" in §2.4.3 and does not exist in any real modem, so it is not
@@ -103,32 +108,34 @@ newtype Scrambler = Scrambler Int deriving (Eq, Show)
 scramblerInit :: Scrambler
 scramblerInit = Scrambler 0
 
--- | The two taps of the generating polynomial, as bit positions in the
--- register.  GPC = 1 + x^-18 + x^-23, GPA = 1 + x^-5 + x^-23 (§4).
-taps :: Direction -> (Int, Int)
-taps Calling = (17, 22)
-taps Answering = (4, 22)
-
-scrMask :: Int
-scrMask = (1 `shiftL` 23) - 1
+-- | The generating polynomial of each direction (§4): GPC =
+-- 1 + x^-18 + x^-23 for the calling modem, GPA = 1 + x^-5 + x^-23 for
+-- the answering one.
+scrPoly :: Direction -> Lfsr
+scrPoly Calling = lfsr 18 23
+scrPoly Answering = lfsr 5 23
 
 -- | Scramble one bit: the line bit is the data bit plus the two tapped
 -- line bits, and the register then remembers it.
 scrambleBit :: Direction -> Scrambler -> Bool -> (Scrambler, Bool)
-scrambleBit dir (Scrambler reg) d = (Scrambler reg', out)
-  where
-    (t1, t2) = taps dir
-    out = d /= (testBit reg t1 /= testBit reg t2)
-    reg' = ((reg `shiftL` 1) .|. (if out then 1 else 0)) .&. scrMask
+scrambleBit dir (Scrambler reg) d = wrapScr (scramble (scrPoly dir) reg d)
 
 -- | Descramble one bit.  The register takes the same line bits as the
 -- far scrambler did, which is what makes it self-synchronising.
 descrambleBit :: Direction -> Scrambler -> Bool -> (Scrambler, Bool)
-descrambleBit dir (Scrambler reg) line = (Scrambler reg', d)
-  where
-    (t1, t2) = taps dir
-    d = line /= (testBit reg t1 /= testBit reg t2)
-    reg' = ((reg `shiftL` 1) .|. (if line then 1 else 0)) .&. scrMask
+descrambleBit dir (Scrambler reg) line = wrapScr (descramble (scrPoly dir) reg line)
+
+-- | Scramble a run of bits, in order.
+scrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
+scrambleRun dir (Scrambler reg) bs = wrapScr (Scr.scrambleRun (scrPoly dir) reg bs)
+
+-- | Descramble a run of bits, in order.  The far end scrambles with the
+-- polynomial of /its/ direction, so a receiver passes the other one.
+descrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
+descrambleRun dir (Scrambler reg) bs = wrapScr (Scr.descrambleRun (scrPoly dir) reg bs)
+
+wrapScr :: (Int, a) -> (Scrambler, a)
+wrapScr (reg, x) = (Scrambler reg, x)
 
 -- | A constellation point, in the Recommendation's integer grid units
 -- scaled by 'gridScale'.

@@ -137,7 +137,7 @@ txBlock fs amp fr guard cmd n st = case cmd of
     in (st2 { txV22 = v', txFir = Nothing }, sig)
   where
     twoPi = 2 * pi
-    wrap p = p - twoPi * fromIntegral (floor (p / twoPi) :: Int)
+    wrap = wrapTwoPi
     -- queue raw bits before generating (used once per TxBits command)
     withQueuedBits f bits = let _ = f in fskWith spec' False bits
       where spec' = case cmd of { TxBits s _ -> s; _ -> error "withQueuedBits" }
@@ -364,7 +364,11 @@ modemStep cfg st0 rxBlock newBytes =
               let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
                   z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
               in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
-          (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr report (if i == 0 then HsIn hdlcFrames v8Evs ansamHit else noHsIn) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
+          -- the block's events go to the first frame of the block only;
+          -- the pump report is a running state and goes to every frame
+          hsInFor i = if i == 0 then HsIn hdlcFrames v8Evs ansamHit report
+                                else noHsIn { hiPump = report }
+          (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr (hsInFor i) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
           (cmd, status, rxRate, role', hdlcWant) =
             if null outs then (msTxCmd st, HsBusy, msRxRate st, msRole st, fmap (\(s, _, _, _) -> s) (msHdlc st))
             else let o = last outs in (hoTx o, hoStatus o, hoRxRate o, hoRole o, hoHdlc o)

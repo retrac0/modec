@@ -31,6 +31,8 @@ module Modec.QAM
   , QamRxState
   , qamRxInit
   , qamRxBlock
+  , qamReceiver
+  , qamReceiverFrom
   , QamSym (..)
   , qamRxEvm
   , qamRxSps
@@ -41,6 +43,7 @@ module Modec.QAM
 import qualified Data.Vector.Storable as VS
 
 import Modec.DSP
+import Modec.Stream (Stage (..))
 
 -- | The line parameters of a pump.
 data QamParams = QamParams
@@ -152,13 +155,12 @@ qamTxBlock p amp n syms0 st0 = (st', sig, rest)
           th = txCarrier stF + wc * t
       in amp * (re * cos th - im * sin th)
 
-    wrap x = x - 2 * pi * fromIntegral (floor (x / (2 * pi)) :: Int)
     dropN = max 0 (floor ((fromIntegral n - (span_ + 1) * sps - t0s) / sps)) :: Int
     st' = stF
       { txSymClock = txSymClock stF - fromIntegral n
       , txSymT0 = t0s + fromIntegral dropN * sps - fromIntegral n
       , txSymbols = drop dropN (txSymbols stF)
-      , txCarrier = wrap (txCarrier stF + wc * fromIntegral n) }
+      , txCarrier = wrapTwoPi (txCarrier stF + wc * fromIntegral n) }
 
 -- | One decided symbol.
 data QamSym = QamSym
@@ -229,6 +231,17 @@ qamRxSps = rxSps
 
 qamRxPower :: QamRxState -> Double
 qamRxPower = rxPower_
+
+-- | The receiver as a stream stage, so it composes with the rest of the
+-- chain and does not care how the audio is cut up.  The configuration is
+-- fixed for the life of the stage; a start-up that has to change slicer
+-- part way through drives 'qamRxBlock' directly instead.
+qamReceiver :: QamParams -> QamRxCfg -> Stage Signal [QamSym]
+qamReceiver p cfg = qamReceiverFrom p cfg (qamRxInit p cfg)
+
+-- | 'qamReceiver' resuming from a receiver that has already run.
+qamReceiverFrom :: QamParams -> QamRxCfg -> QamRxState -> Stage Signal [QamSym]
+qamReceiverFrom p cfg st0 = Stage st0 (\st chunk -> qamRxBlock p cfg chunk st)
 
 -- | Demodulate one block, returning the symbols it completed.
 qamRxBlock :: QamParams -> QamRxCfg -> Signal -> QamRxState -> (QamRxState, [QamSym])
@@ -315,9 +328,6 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
       , rxHistRe = histRe', rxHistIm = histIm'
       , rxPrevRe = VS.drop keepFrom extRe, rxPrevIm = VS.drop keepFrom extIm
       , rxTau = rxTau stSym - fromIntegral keepFrom }
-
-wrapPi :: Double -> Double
-wrapPi x = x - 2 * pi * fromIntegral (round (x / (2 * pi)) :: Int)
 
 distinct :: [Int] -> [Int]
 distinct [] = []

@@ -16,6 +16,8 @@ import Test.Tasty.QuickCheck (testProperty, withMaxSuccess)
 
 import Modec.Channel
 import Modec.Detect
+import Modec.Scrambler (lfsr)
+import qualified Modec.Scrambler as Scr
 import Modec.Handshake
 import Modec.DSP
 import Modec.Metrics
@@ -25,6 +27,7 @@ import Modec.Async
 import Modec.V22
 import Modec.V32
 import Modec.V32Pump
+import Modec.QAM
 import qualified Modec.V32 as V32
 import Modec.Hdlc
 import Modec.MnpFrame
@@ -223,7 +226,7 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
       case sdBank s of
        Stage bst bstep ->
         let (bst', frames) = bstep bst audio
-            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr Nothing noHsIn in (h', acc ++ [(hoTx o, hoStatus o)])) (sdHs s, []) frames
+            (hs', outs) = foldl (\(h, acc) fr -> let (h', o) = handshakeStep cfg h fr noHsIn in (h', acc ++ [(hoTx o, hoStatus o)])) (sdHs s, []) frames
             s' = s { sdBank = Stage bst' bstep, sdHs = hs' }
         in case outs of
              [] -> s'
@@ -1368,11 +1371,33 @@ pipewireTests = testGroup "PipeWire device discovery"
 -- written here would be.
 dspTests :: TestTree
 dspTests = testGroup "shared DSP primitives"
-  [ testCase "the lifted RRC kernel is the one V.22 has been using" $
-      -- Modec.V22 keeps its own 600 Bd / 0.75 roll-off kernel; the
-      -- parameterised one must agree with it tap for tap, or the lift
-      -- changed a tuned mode.
-      assertEqual "taps" (VS.toList (rrcTaps 8000)) (VS.toList (rrcKernel 8000 600 0.75 6))
+  [ testCase "the lifted RRC kernel is the one V.22 has been using" $ do
+      -- Modec.V22 no longer has its own kernel: 'rrcTaps' is 'rrcKernel'
+      -- at 600 Bd, 0.75 roll-off and a 6 symbol span.  Asserting those
+      -- two against each other would now be a tautology, so the
+      -- reference here is the formula V.22 used to carry inline, and
+      -- what it guards is that the arguments still say what they said.
+      let refPulse t
+            | abs t < 1e-9 = 1 - b + 4 * b / pi
+            | abs (abs t - 1 / (4 * b)) < 1e-9 =
+                b / sqrt 2 * ((1 + 2 / pi) * sin (pi / (4 * b)) + (1 - 2 / pi) * cos (pi / (4 * b)))
+            | otherwise =
+                (sin (pi * t * (1 - b)) + 4 * b * t * cos (pi * t * (1 + b))) / (pi * t * (1 - (4 * b * t) ^ (2 :: Int)))
+            where b = 0.75
+          sps = 8000 / 600 :: Double
+          half = round (6 * sps) :: Int
+          raw = [ refPulse (fromIntegral (i - half) / sps) | i <- [0 .. 2 * half] ]
+          norm = sqrt (sum (map (\v -> v * v) raw))
+      assertEqual "taps" (map (/ norm) raw) (VS.toList (rrcTaps 8000))
+
+  , testCase "chunksOf partitions a signal and loses nothing" $
+      forM_ [1, 7, 160, 999, 5000] $ \n -> do
+        let x = VS.generate 3000 (\i -> sin (0.01 * fromIntegral i)) :: Signal
+            cs = chunksOf n x
+        assertEqual ("rejoins at " ++ show n) (VS.toList x) (VS.toList (VS.concat cs))
+        assertBool ("no empty block at " ++ show n) (all (not . VS.null) cs)
+        assertBool ("full but the last at " ++ show n)
+          (all (\c -> VS.length c == n) (if null cs then [] else init cs))
 
   , testCase "the RRC kernel has unit energy and is symmetric" $
       forM_ [(8000, 600, 0.75, 6), (8000, 2400, 0.25, 8), (48000, 2400, 0.5, 6)] $
@@ -1768,10 +1793,94 @@ v32PumpTests = testGroup "V.32 data pump"
     fastPlain = fast ++ [ jitter ]
     fastCoded = fast ++ [ ("SNR 16 dB", tel 16) ]
 
+-- | The shared self-synchronising scrambler.  V.22 and V.32 used to
+-- carry a copy each; these pin the behaviour both copies had.
+scramblerTests :: TestTree
+scramblerTests = testGroup "self-synchronising scrambler"
+  [ testCase "V.22's polynomial still scrambles ones the way it did" $
+      -- 1 + x^-14 + x^-17 from an all-zero register, which is what the
+      -- transmitter sends during scrambled binary 1.  Taken from the
+      -- implementation Modec.V22 carried before the lift.
+      assertEqual "scrambled ones"
+        "111111111111110001111111111100000011111111000111"
+        (concatMap (\b -> if b then "1" else "0")
+                   (snd (Scr.scrambleRun (lfsr 14 17) 0 (replicate 48 True))))
+
+  , testCase "every polynomial here is its own inverse" $
+      forM_ [("V.22", lfsr 14 17), ("V.32 GPC", lfsr 18 23), ("V.32 GPA", lfsr 5 23)] $
+        \(name, l) -> do
+          let bits = prbs (11, 9) 600
+              (_, line) = Scr.scrambleRun l 0 bits
+              (_, back) = Scr.descrambleRun l 0 line
+          assertEqual name bits back
+
+  , testCase "a descrambler started in the wrong state catches up" $
+      -- This is what "self-synchronising" buys and why no framing is
+      -- needed underneath it: the register holds line bits, so after as
+      -- many bits as it is wide both ends hold the same thing whatever
+      -- the receiver started from.  Nothing else here tests it, and a
+      -- scrambler that quietly stopped having the property would still
+      -- pass every round trip that starts both ends at zero.
+      forM_ [(14, 17), (18, 23), (5, 23)] $ \(a, b) -> do
+        let l = lfsr a b
+            width = max a b
+            bits = prbs (11, 9) 400
+            (_, line) = Scr.scrambleRun l 0 bits
+            (_, back) = Scr.descrambleRun l 0x2AAAA line
+        assertEqual ("after " ++ show width ++ " bits, taps " ++ show (a, b))
+          (drop width bits) (drop width back)
+  ]
+
+-- | The two QAM-family receivers as stream stages.  A receiver that is
+-- only correct at one block size is not a streaming receiver, and both
+-- of these are driven from PipeWire buffers whose size is not ours to
+-- pick.
+stageTests :: TestTree
+stageTests = testGroup "pump receivers do not depend on the block size"
+  [ testCase "V.22 at 1200 bit/s" $ do
+      let bits = prbs (11, 9) 2000
+          sig = v22Modulate 8000 HighChannel 0.5 bits
+          at c = concatMap roBits (runStage (v22Receiver 8000 HighChannel) (chunksOf c sig))
+      forM_ [7, 160, 1000, 4096] $ \c ->
+        assertEqual ("chunks of " ++ show c) (at 160) (at c)
+
+  , testCase "V.32 at 9600 bit/s" $ do
+      let bits = prbs (11, 9) 2000
+          sig = v32Modulate 8000 Calling V32R9600 0.5 bits
+          p = v32Params 8000
+          at c = concatStage (qamReceiver p (v32RxCfg V32R9600)) (chunksOf c sig)
+      forM_ [7, 160, 1000, 4096] $ \c ->
+        assertEqual ("chunks of " ++ show c) (map qsIndex (at 160)) (map qsIndex (at c))
+  ]
+
+-- | A tone frame answers questions about itself.
+toneFrameTests :: TestTree
+toneFrameTests = testGroup "tone frames carry their own bank"
+  [ testCase "a measured frequency reads back, an unmeasured one is zero" $ do
+      let fs = 8000
+          sig = VS.generate 8000 (\i -> 0.5 * sin (2 * pi * 1650 * fromIntegral i / fs))
+          frs = toneFrames fs defaultToneBank sig
+          fr = last frs
+      assertBool "1650 Hz is loud" (toneAmp fr 1650 > 0.4)
+      assertBool "1270 Hz is not" (toneAmp fr 1270 < 0.05)
+      -- 2250 Hz is in the diagnostic bank but not the default one, so a
+      -- frame from the default bank must report it as absent rather than
+      -- reading whatever sits at that index of another bank's list
+      assertEqual "unmeasured" 0 (toneAmp fr 2250)
+      assertEqual "dominant" (Just 1650) (dominant 3e-3 1.5 fr)
+
+  , testCase "the diagnostic bank measures what the handshake bank leaves out" $ do
+      let fs = 8000
+          sig = VS.generate 8000 (\i -> 0.5 * sin (2 * pi * 2250 * fromIntegral i / fs))
+          amp cfg = toneAmp (last (toneFrames fs cfg sig)) 2250
+      assertEqual "default bank has no 2250 Hz" 0 (amp defaultToneBank)
+      assertBool "diagnostic bank does" (amp diagnosticToneBank > 0.4)
+  ]
+
 main :: IO ()
 main = do
   fx <- fixtureTests
-  defaultMain (testGroup "modec" [wavTests, fx, dspTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
+  defaultMain (testGroup "modec" [wavTests, fx, dspTests, scramblerTests, stageTests, toneFrameTests, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, handshakeTests, modemTests, telnetTests, v22Tests, v32Tests, v32PumpTests, hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests, hayesTests, baresipTests, pipewireTests, v8Tests, ttyTests, dtmfTests, progressTests])
 
 v8Tests :: TestTree
 v8Tests = testGroup "V.8 menus and ANSam"
@@ -2020,12 +2129,6 @@ dtmfTests = testGroup "DTMF detection (Q.23, Q.24)"
       sequence_ [ assertEqual ("chunks of " ++ show n) (dtmfDecode 8000 defaultDtmfParams sig) (streamed n)
                 | n <- [37, 160, 1000] ]
   ]
-
--- | Split a signal into fixed chunks, as an audio device would deliver it.
-chunksOf :: Int -> Signal -> [Signal]
-chunksOf n v
-  | VS.null v = []
-  | otherwise = let (a, b) = VS.splitAt n v in a : chunksOf n b
 
 progressTests :: TestTree
 progressTests = testGroup "call progress tones"

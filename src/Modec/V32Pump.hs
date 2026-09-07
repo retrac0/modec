@@ -29,8 +29,9 @@ module Modec.V32Pump
   , v32DemodulateTrained
   ) where
 
-import Modec.DSP (Signal)
+import Modec.DSP (Signal, chunksOf)
 import Modec.QAM
+import Modec.Stream (concatStage)
 import Modec.V32
 
 import qualified Data.Vector.Storable as VS
@@ -105,18 +106,6 @@ codeSymbol _ _ _ = error "Modec.V32Pump.codeSymbol: wrong group size"
 
 packBits :: [Bool] -> Int
 packBits = foldl (\acc b -> acc * 2 + (if b then 1 else 0)) 0
-
-scrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
-scrambleRun dir = go []
-  where
-    go acc sc [] = (sc, reverse acc)
-    go acc sc (b : bs) = let (sc', o) = scrambleBit dir sc b in go (o : acc) sc' bs
-
-descrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
-descrambleRun dir = go []
-  where
-    go acc sc [] = (sc, reverse acc)
-    go acc sc (b : bs) = let (sc', o) = descrambleBit dir sc b in go (o : acc) sc' bs
 
 data RxCoder = RxCoder
   { rcDescr :: !Scrambler
@@ -225,14 +214,7 @@ v32DemodulateWith :: Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
 v32DemodulateWith fs dir r blk sig = snd (decodeSymbols dir r syms rxCoderInit)
   where
     p = v32Params fs
-    cfg = v32RxCfg r
-    syms = run (qamRxInit p cfg) sig
-    run st s
-      | VS.null s = []
-      | otherwise =
-          let (chunk, rest) = VS.splitAt blk s
-              (st', out) = qamRxBlock p cfg chunk st
-          in out ++ run st' rest
+    syms = concatStage (qamReceiver p (v32RxCfg r)) (chunksOf blk sig)
 
 -- | Demodulate a signal whose first @preSyms@ symbols are the receiver
 -- conditioning signal, as 'v32ModulateTrained' produces and as the
@@ -257,13 +239,15 @@ v32DemodulateTrained fs dir r preSyms sig = snd (decodeSymbols dir r syms rxCode
     stAfter = snd (runBlocks p trainCfg pre (qamRxInit p trainCfg))
     syms = fst (runBlocks p dataCfg dat stAfter)
 
+-- | Drive the receiver over a whole signal, returning the state it ends
+-- in as well as the symbols.  The trained start-up needs that state to
+-- hand to a second pass under a different slicer, which is the one thing
+-- a 'Stage' cannot give back, so this stays a plain fold.
 runBlocks :: QamParams -> QamRxCfg -> Signal -> QamRxState -> ([QamSym], QamRxState)
-runBlocks p cfg = go
+runBlocks p cfg sig st0 = go st0 (chunksOf 160 sig)
   where
-    go s st
-      | VS.null s = ([], st)
-      | otherwise =
-          let (chunk, rest) = VS.splitAt 160 s
-              (st', out) = qamRxBlock p cfg chunk st
-              (more, stF) = go rest st'
-          in (out ++ more, stF)
+    go st [] = ([], st)
+    go st (c : cs) =
+      let (st', out) = qamRxBlock p cfg c st
+          (more, stF) = go st' cs
+      in (out ++ more, stF)

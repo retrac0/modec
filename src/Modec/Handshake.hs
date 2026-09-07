@@ -217,17 +217,22 @@ data V22Report = V22Report
   , vrOnes2400 :: !Int      -- ^ consecutive descrambled ones decided 16-way
   } deriving (Show)
 
--- | What the receivers found for the handshake this hop.  Everything
--- here arrives on the first tone frame of an audio block.
+-- | What the receivers found for the handshake this hop.
+--
+-- 'hiFrames', 'hiV8' and 'hiAnsam' are per audio block, and so arrive on
+-- the first tone frame of one; 'hiPump' is a running state rather than an
+-- event and belongs on every frame, since the runs it counts are what
+-- the timings are measured against.
 data HsIn = HsIn
-  { hiFrames :: [[Word8]]    -- ^ HDLC frames (V.8bis)
-  , hiV8     :: [V8Event]    -- ^ V.8 signals off the async V.21 receiver
-  , hiAnsam  :: !Bool        -- ^ ANSam was confirmed in this block
+  { hiFrames :: [[Word8]]      -- ^ HDLC frames (V.8bis)
+  , hiV8     :: [V8Event]      -- ^ V.8 signals off the async V.21 receiver
+  , hiAnsam  :: !Bool          -- ^ ANSam was confirmed in this block
+  , hiPump   :: Maybe V22Report -- ^ what the data pump's receiver sees
   }
 
 -- | Nothing was received.
 noHsIn :: HsIn
-noHsIn = HsIn [] [] False
+noHsIn = HsIn [] [] False Nothing
 
 -- | What the handshake wants from the modem this hop.
 data HsOut = HsOut
@@ -333,18 +338,19 @@ s1Symbols = 30
 -- of it.  Scrambled ones never hold one step for long.
 u11Guard = 12
 
--- | Advance the state machine by one tone frame and the latest V.22
--- receiver report (if a V.22 receiver is running).
-handshakeStep :: HsConfig -> HsState -> ToneFrame -> Maybe V22Report -> HsIn -> (HsState, HsOut)
-handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcListen v8Listen v8MenuOut)
+-- | Advance the state machine by one tone frame and whatever the
+-- receivers found, 'hiPump' included.
+handshakeStep :: HsConfig -> HsState -> ToneFrame -> HsIn -> (HsState, HsOut)
+handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') hdlcListen v8Listen v8MenuOut)
   where
+    v22 = hiPump inp
     t = tfTime fr
-    dom = dominant (hcBank cfg) (hcSquelch cfg) (hcDomRatio cfg) fr
+    dom = dominant (hcSquelch cfg) (hcDomRatio cfg) fr
     role = hsRole st
     hop = tbHopSec (hcBank cfg)
     -- V.8bis dual tone pair detection: both tones above squelch and each at
     -- least half of the strongest tone in the bank; then the segment 2 tone
-    amp f = toneAmp (hcBank cfg) fr f
+    amp f = toneAmp fr f
     strongest = maximum (0 : [ amp f | f <- tbFreqs (hcBank cfg) ])
     pairOn (a, b) = amp a > hcSquelch cfg && amp b > hcSquelch cfg && amp a >= 0.5 * strongest && amp b >= 0.5 * strongest
     iniPair = pairOn (1375, 2002)
@@ -781,4 +787,4 @@ handshakeStep cfg st fr v22 inp = (st'', HsOut tx status rxRate (hsRole st'') hd
 
 -- | The handshake as a stage over tone frames (no V.22 receiver).
 handshakeStage :: HsConfig -> Stage ToneFrame HsOut
-handshakeStage cfg = Stage (initialHandshake cfg) (\s fr -> handshakeStep cfg s fr Nothing noHsIn)
+handshakeStage cfg = Stage (initialHandshake cfg) (\s fr -> handshakeStep cfg s fr noHsIn)

@@ -4,6 +4,7 @@
 -- (which FSK standard and channel is present, answer tones seen).
 module Modec.Detect
   ( ToneFrame (..)
+  , ampAt
   , ToneBankConfig (..)
   , defaultToneBank
   , diagnosticToneBank
@@ -29,10 +30,20 @@ import Modec.Stream
 -- | One measurement frame: time of the frame end in seconds, estimated
 -- amplitude (full scale = 1) at each configured frequency, and the RMS
 -- of the frame.
+--
+-- A frame carries the frequencies it was measured at, not just the
+-- amplitudes, so that reading one is a question about the frame alone.
+-- Four banks are in flight here -- the handshake's, the diagnostic one,
+-- 'detectFsk'\'s widened one and the call-progress one -- and they
+-- deliberately differ in both length and window, so a frame read against
+-- the wrong list does not fail: it answers about a frequency that was
+-- never measured, or about the wrong one entirely, and the answer is
+-- plausible.  That is the failure this field exists to make impossible.
 data ToneFrame = ToneFrame
-  { tfTime :: !Double
-  , tfAmps :: !(VU.Vector Double)
-  , tfRms  :: !Double
+  { tfTime  :: !Double
+  , tfFreqs :: !(VU.Vector Double)   -- ^ the bank that measured it
+  , tfAmps  :: !(VU.Vector Double)
+  , tfRms   :: !Double
   } deriving (Show)
 
 data ToneBankConfig = ToneBankConfig
@@ -73,7 +84,7 @@ toneBank fs cfg = Stage (BankState 0 win VS.empty) step
                                   th = w * fromIntegral (nEnd - win + i)
                               in (a + x * cos th, b + x * sin th)) (0, 0) buf
             in toneAmplitudeW hsum (re * re + im * im)
-      in ToneFrame (fromIntegral nEnd / fs) amps (rms buf)
+      in ToneFrame (fromIntegral nEnd / fs) freqs amps (rms buf)
     step (BankState start nextEnd kept) chunk =
       let ext = kept VS.++ chunk
           total = start + VS.length ext
@@ -88,17 +99,22 @@ toneBank fs cfg = Stage (BankState 0 win VS.empty) step
 toneFrames :: Double -> ToneBankConfig -> Signal -> [ToneFrame]
 toneFrames fs cfg x = concatStage (toneBank fs cfg) [x]
 
+-- | Amplitude at a frequency, given the list it was measured against
+-- and the amplitudes.  0 if that frequency is not in the list.
+ampAt :: VU.Vector Double -> VU.Vector Double -> Double -> Double
+ampAt freqs amps f = case VU.elemIndex f freqs of
+  Just i | i < VU.length amps -> VU.unsafeIndex amps i
+  _ -> 0
+
 -- | Amplitude of a frequency in a frame (0 if not measured).
-toneAmp :: ToneBankConfig -> ToneFrame -> Double -> Double
-toneAmp cfg fr f = case lookup f (zip (tbFreqs cfg) (VU.toList (tfAmps fr))) of
-  Just a  -> a
-  Nothing -> 0
+toneAmp :: ToneFrame -> Double -> Double
+toneAmp fr = ampAt (tfFreqs fr) (tfAmps fr)
 
 -- | The dominant tone of a frame, if one is above @squelch@ and at least
 -- @ratio@ times every other measured tone.
-dominant :: ToneBankConfig -> Double -> Double -> ToneFrame -> Maybe Double
-dominant cfg squelch ratio fr =
-  case sortBy (comparing (Down . snd)) (zip (tbFreqs cfg) (VU.toList (tfAmps fr))) of
+dominant :: Double -> Double -> ToneFrame -> Maybe Double
+dominant squelch ratio fr =
+  case sortBy (comparing (Down . snd)) (zip (VU.toList (tfFreqs fr)) (VU.toList (tfAmps fr))) of
     ((f, a) : rest)
       | a > squelch && all (\(_, b) -> a >= ratio * b) rest -> Just f
     _ -> Nothing
@@ -134,7 +150,7 @@ detectFsk fs x = sortBy (comparing (Down . snd)) [ (s, score s) | s <- fskStanda
       , tbWindowSec = 0.08 }
     frames = toneFrames fs cfg x
     n = max 1 (length frames)
-    energy fr s = let m = toneAmp cfg fr (fskMark s); sp = toneAmp cfg fr (fskSpace s) in m * m + sp * sp
+    energy fr s = let m = toneAmp fr (fskMark s); sp = toneAmp fr (fskSpace s) in m * m + sp * sp
     winner fr = case sortBy (comparing (Down . snd)) [ (s, energy fr s) | s <- fskStandards ] of
       ((s, e) : rest) | e > 9e-6 && all (\(_, e') -> e >= 2 * e') rest -> Just (fskName s)
       _ -> Nothing
@@ -179,7 +195,7 @@ toneRuns = toneRunsWith defaultToneBank
 
 -- | 'toneRuns' with a bank of your choosing.
 toneRunsWith :: ToneBankConfig -> Double -> Signal -> [ToneRun]
-toneRunsWith cfg fs x = go (map (\fr -> (dominant cfg 3e-3 1.5 fr, tfTime fr)) frames)
+toneRunsWith cfg fs x = go (map (\fr -> (dominant 3e-3 1.5 fr, tfTime fr)) frames)
   where
     frames = toneFrames fs cfg x
     go [] = []

@@ -208,7 +208,7 @@ sigOfFrame pp fr
       (s : _) -> Just s
       [] -> Nothing
   where
-    amp = toneAmp progressToneBank fr
+    amp = toneAmp fr
     peak = VU.maximum (tfAmps fr)
     strong f = amp f >= ppRelative pp * peak
     loudestOf = maximumBy (comparing amp)
@@ -266,13 +266,16 @@ addAmps a b
   | VU.null b = a
   | otherwise = VU.zipWith (+) a b
 
+progressFreqsV :: VU.Vector Double
+progressFreqsV = VU.fromList progressFreqs
+
 -- | The loudest frequency of a band over a whole run.
 segFreq :: [Double] -> Seg -> Double
 segFreq band s
   | VU.null (segAmps s) || null band = 0
   | otherwise = maximumBy (comparing amp) band
   where
-    amp f = maybe 0 id (lookup f (zip progressFreqs (VU.toList (segAmps s))))
+    amp = ampAt progressFreqsV (segAmps s)
 
 -- | Frames to runs.  A frame is taken to cover the hop beginning at
 -- its window centre, so a run's boundaries fall at the midpoints of
