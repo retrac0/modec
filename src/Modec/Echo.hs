@@ -217,11 +217,26 @@ echoBlock cfg adapt rx st0 = (st', out)
               -- the echo's share of the line directly.  A filter
               -- reaching empty line predicts nothing -- leakage pulls
               -- an unexcited filter to zero -- and says so.
+              --
+              -- The predicted-echo rule applies only once the search has
+              -- found something.  Dialled at an echo test that turned
+              -- out not to reflect, the filter sat at its default delay
+              -- adapting on a far end that was talking, grew taps out of
+              -- gradient noise, and that rule read their output as an
+              -- echo worth removing: measured, a return loss of minus
+              -- 0.8 dB, which is a canceller making the line worse than
+              -- it found it.  A filter that has not been aimed at
+              -- anything has no business predicting anything, and the
+              -- half-duplex rule -- which measures the residual against
+              -- what arrived, and is only valid while the far end is
+              -- quiet -- is the only evidence left in that case.
+              aimed = esFound st0 /= Nothing
               on' | ep' <= 1e-18 = on
                   | adapt, rp' < 0.5 * ep' = True
                   | adapt, rp' > 0.9 * ep' = False
-                  | yp' > ecOnRatio cfg * ep' = True
-                  | yp' < 0.25 * ecOnRatio cfg * ep' = False
+                  | aimed, yp' > ecOnRatio cfg * ep' = True
+                  | aimed, yp' < 0.25 * ecOnRatio cfg * ep' = False
+                  | not aimed = False
                   | otherwise = on
           in go (i + 1) w' ep' rp' yp' on' ((if on' then e else d) : acc)
 

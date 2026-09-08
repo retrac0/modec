@@ -27,6 +27,7 @@ import qualified Network.Socket.ByteString as NB
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import Text.Printf (printf)
+import Data.List (intercalate)
 import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
@@ -130,8 +131,20 @@ runModem o = do
   hSetBinaryMode stdout True
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
-      cfg0 = defaultModemConfig fs (moRole o) (moModes o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+      -- One builder, used by both the plain path and the SIP one.  They
+      -- were two, kept in step by hand, and they were not in step: the
+      -- SIP path -- which is every real call -- silently dropped
+      -- --max-evm, and then --probe, because each was added to whichever
+      -- one the author happened to be looking at.
+      configFor role =
+        let c0 = defaultModemConfig fs role (moModes o)
+        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o
+              , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
+              , mcV32Rates = v32Offered o, mcMnp = mnpCfg
+              , mcHandshake = (mcHandshake c0)
+                  { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o
+                  , hcV8OfferAll = moV8All o } }
+      cfg = configFor (moRole o)
       -- The rate and whether the link can go synchronous belong to the
       -- link rather than to the command line, so those two are left for
       -- Modec.Modem to fill in once the call is established.
@@ -250,10 +263,7 @@ runModem o = do
       let lineNode = case moAudio o of
             AudioSipLoop prefix -> Just (prefix ++ "-line")
             _ -> Nothing
-          cfgFor role = let c0 = defaultModemConfig fs role (moModes o)
-                        in c0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o
-                              , mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg
-                              , mcHandshake = (mcHandshake c0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+          cfgFor = configFor
           -- A call we placed watches the line for what the network
           -- plays back at it; a call we answered does not.
           startCall role = LineCall (modemInit (cfgFor role)) (cfgFor role)
@@ -280,7 +290,8 @@ runModem o = do
                 delay = maybe "" (printf ", echo at %.0f ms" . (\d -> fromIntegral d / (fs / 1000) :: Double))
                               (modemEchoDelay st')
                 erle = maybe "" (printf ", return loss %.1f dB") (modemEchoErle st')
-                line = evm ++ delay ++ erle
+                line = intercalate ", " (filter (not . null) [evm, dropComma delay, dropComma erle])
+                dropComma x = case x of { (',' : ' ' : r) -> r; _ -> x }
             when (k `mod` 250 == 249 && not (null line)) $ say ("line: " ++ line)
 
           report ev = case ev of
@@ -503,6 +514,7 @@ runModem o = do
                       LineCall st c watch -> do
                         let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack fwd else [])
                         traceStep st st'
+                        telemetry st'
                         writeBlock (encodeS16 audio)
                         when (online && not (null rxBytes)) $ sendBytes (B.pack rxBytes)
                         -- Listen for what the network is playing back
