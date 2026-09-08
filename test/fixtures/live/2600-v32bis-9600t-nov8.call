@@ -1,0 +1,28 @@
+# The same board and the same audio as 2600-v32bis-9600t-mnp4, driven
+# down the classic ladder with no V.8 at all.
+#
+# V.32 is from 1988 and V.8 from 1994, so a V.32 modem has to start up
+# without one -- and this one could not.  V.32 had no rung in the
+# fallback ladder, so offering it alongside anything else meant it was
+# reachable only through a CM/JM exchange, and a call to a V.32 board
+# that did not speak V.8 settled for V.22bis at a quarter of the speed.
+# 5.4.1 has the calling modem, after the answer tone, transmit carrier
+# state A and listen for one of two incoming tones at 600 and 3000 Hz;
+# the ladder has that rung now, and the tone bank has the two bins it
+# needs to hear it with.
+#
+# The far end's half of this recording is unchanged -- it is a real
+# board's alternating pair, not a synthesised one -- so what is being
+# tested is only whether this end finds its way into Figure 4 without
+# being told to.  The trace goes OAnsEnding, OAfterAns, Starting32, and
+# then the whole of 5.4.1 in order.
+source:    recordings/20260907T233626-+15642442600.wav
+seconds:   30.0
+role:      originate
+modes:     v32bis,v32,v22bis
+v8:        no
+mnp:       4
+connect:   V32bis 9600
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

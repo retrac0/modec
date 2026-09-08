@@ -1,0 +1,27 @@
+# V.32bis at 9600 trellis with MNP class 4 over it, 8 Sep 2026 -- the
+# first V.32 call that carried an interactive session rather than a
+# banner and then noise.
+#
+# What this one pins is the fix that made it possible.  A level in
+# Modec.QAM.RevTracker is a correlation over the tracked mean square of
+# the input, and that average is slow, so a signal returning after a gap
+# reads high for two or three blocks while it catches up.  One such
+# block used to convince the calling modem that the far end had gone
+# back to the start of Figure 4, so it went back to AA -- which this
+# board answered by restarting for real, and the two of them went round
+# the start-up together until the call timed out.  Every "no rate signal
+# R3" and "no E from the answering modem" against 2600.network was that.
+#
+# The recording contains the board restarting once for real, so a
+# regression in either direction shows up here: too eager and the
+# livelock comes back, too slow and the genuine restart is missed.
+source:    recordings/20260907T233626-+15642442600.wav
+seconds:   30.0
+role:      originate
+modes:     v32bis,v32,v22bis
+v8:        yes
+mnp:       4
+connect:   V32bis 9600
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

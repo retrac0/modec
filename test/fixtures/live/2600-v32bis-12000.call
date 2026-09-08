@@ -1,0 +1,21 @@
+# V.32bis at 12000 bit/s, 8 Sep 2026, with the rate chosen rather than
+# pinned: this end offered everything it had and the two modems settled
+# on 12000 through the R1/R2/R3 exchange.
+#
+# 12000 was held out of the offer for as long as it had only ever run
+# down a pair of pipes at 30 dB.  This is the evidence that took it out
+# of that category -- a real line, MNP class 4 negotiated over it, and a
+# decision error that sat between 0.003 and 0.007 for the length of the
+# call.  It is also the only fixture here whose rate is the product of a
+# negotiation, so restrictRates, bestCommonRate and the rate signals all
+# have to agree for it to come out at 12000 rather than 9600.
+source:    recordings/20260907T234436-+15642442600.wav
+seconds:   32.0
+role:      originate
+modes:     v32bis,v32,v22bis
+v8:        yes
+mnp:       4
+connect:   V32bis 12000
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0
