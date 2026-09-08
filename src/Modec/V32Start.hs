@@ -33,6 +33,7 @@ module Modec.V32Start
   , V32Start
   , v32StartInit
   , v32StartAfterAnswerTone
+  , v32StartOffer
   , v32RetrainInit
   , V32Listen (..)
   , v32ListenInit
@@ -162,6 +163,8 @@ data V32Start = V32Start
   , vsSeenTrn :: !Bool
   , vsFar     :: !Direction      -- ^ the far end's scrambler
   , vsRevAt   :: [(Double, Int)] -- ^ reversals seen in this block
+  , vsACLimit :: !Int            -- ^ symbols to hold the pair in AAC before giving up
+  , vsACHold  :: !Int            -- ^ symbols of the pair to send before reacting to AA
   , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
   , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
@@ -319,6 +322,21 @@ heardOpening l = case vlDir l of
 v32ListenRetrain :: Direction -> V32Listen -> Bool
 v32ListenRetrain _ l = vlRun l >= 5
 
+-- | An answering modem offering V.32 on spec, per A.2.2, with a bound
+-- on how long it will hold the pair.
+--
+-- The unbounded form waits twenty-five seconds in AAC, which is right
+-- for a modem that knows V.32 was agreed and has nothing else to try.
+-- An automode answerer is guessing, and every one of those seconds it
+-- spends transmitting 600 and 3000 Hz that no V.22, V.21 or Bell caller
+-- understands.  Note 5 forbids /disconnecting/ inside three seconds of
+-- the pair; falling back to another rung is not disconnecting, and the
+-- ladder below V.32 is outside this Recommendation's scope anyway.
+v32StartOffer :: Double -> Direction -> RateSeq -> Double -> V32Start
+v32StartOffer fs dir offer secs =
+  (v32StartAfterAnswerTone fs dir offer)
+    { vsACLimit = max 1 (round (secs * 2400)), vsACHold = 512 }
+
 v32StartAfterAnswerTone :: Double -> Direction -> RateSeq -> V32Start
 v32StartAfterAnswerTone fs dir offer =
   let st = v32StartInit fs dir offer
@@ -342,7 +360,7 @@ v32StartInit fs dir offer = V32Start
   , vsTurns = [], vsPrevSym = (0, 0)
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACRun = 0, vs1800Run = 0 }
+  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0 }
   where
     role = case dir of { Calling -> Calling'; Answering -> Answering' }
     p = v32Params fs
@@ -785,9 +803,20 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | vsSince s >= sym 7200 -> enter AAC s { vsSrc = TxAltAC True }
         | otherwise -> s { vsSrc = TxTone2100 }
       AAC
-        | vs1800Run s >= sym 64 && vsSince s >= sym 128 ->
+        -- 5.4.2 asks for the pair "for an even number of symbol
+        -- intervals greater than or equal to 128" and sets no upper
+        -- bound.  The floor is right when both ends entered the start-up
+        -- together, which is what V.8 or a V.32-only configuration
+        -- gives.  An answering modem offering the pair out of its own
+        -- ladder is talking to a caller that must first /notice/ it --
+        -- about 120 ms -- and flipping at 53 ms put the first reversal
+        -- on the line before the caller was watching for it, so
+        -- 'v32StartOffer' asks for four times the floor.  A real V.32
+        -- caller holds carrier state A and listens from 5.4.1's second
+        -- paragraph onward, so the extra wait costs it nothing.
+        | vs1800Run s >= sym 64 && vsSince s >= sym (vsACHold s) ->
             enter ACA (rearm s) { vsMark = Just (vsN s), vsSrc = TxAltAC False }
-        | tooLong 60000 s -> enter (V32Fail "no calling modem") s
+        | tooLong (vsACLimit s) s -> enter (V32Fail "no calling modem") s
         | otherwise -> s
       ACA | vsSince s < sym 32 -> s
       ACA -> case revAt 1800 of

@@ -174,8 +174,7 @@ current.
   1300 Hz from the Bell 103 mark 30 Hz away and stay short enough for a
   continuous-phase carrier to add up over it.
 
-Not yet: V.32 in automode -- it is reached by `--mode v32` or by V.8
-choosing it, but it is not in the probe rotation; V.34 or anything else above 9600; SIP/RTP spoken directly
+Not yet: V.34 or anything else above 14400; SIP/RTP spoken directly
 rather than through baresip; ring detection (a sound card carries no
 ringing, so ATS0 answers on sustained line energy instead); a native
 PipeWire node (pw-cat child processes are used instead); V.22bis guard

@@ -84,6 +84,7 @@ module Modec.Handshake
   , HsState
   , hsPhaseName
   , initialHandshake
+  , handshakeAfterV32
   , HsIn (..)
   , noHsIn
   , handshakeStep
@@ -174,6 +175,7 @@ data HsConfig = HsConfig
   , hcAnsGap      :: Double           -- ^ answer: silence after ANS (55-95 ms)
   , hcProbe       :: Double           -- ^ answer automode: time per standard before switching
   , hcQualify     :: Double           -- ^ FSK carrier must persist this long to count
+  , hcV32Offer    :: Double           -- ^ answer automode: seconds to hold the V.32 pair before falling back
   , hcDrop        :: Double           -- ^ carrier loss for this long drops the connection
   , hcTimeout     :: Double           -- ^ give up after this long
   , hcV8          :: Bool             -- ^ answer with ANSam and exchange V.8 CM/JM menus
@@ -185,7 +187,7 @@ defaultHsConfig role = HsConfig
   { hcRole = role, hcModes = allStandards, hcBank = defaultToneBank
   , hcSquelch = 3e-3, hcDomRatio = 1.5
   , hcBilling = 2.0, hcAnsDuration = 3.0, hcAnsGap = 0.075, hcProbe = 1.5
-  , hcQualify = 0.3, hcDrop = 0.5, hcTimeout = 45, hcV8 = False, hcV8OfferAll = False }
+  , hcQualify = 0.3, hcV32Offer = 2.0, hcDrop = 0.5, hcTimeout = 45, hcV8 = False, hcV8OfferAll = False }
 
 -- | Apply a mode set, adjusting whatever the modes themselves imply.
 --
@@ -245,13 +247,14 @@ data V22Report = V22Report
 -- the timings are measured against.
 data HsIn = HsIn
   { hiV8     :: [V8Event]      -- ^ V.8 signals off the async V.21 receiver
+  , hiV32Peer :: !Bool         -- ^ the far end's V.32 opening signal is on the line
   , hiAnsam  :: !Bool          -- ^ ANSam was confirmed in this block
   , hiPump   :: Maybe V22Report -- ^ what the data pump's receiver sees
   }
 
 -- | Nothing was received.
 noHsIn :: HsIn
-noHsIn = HsIn [] False Nothing
+noHsIn = HsIn [] False False Nothing
 
 -- | What the handshake wants from the modem this hop.
 data HsOut = HsOut
@@ -270,6 +273,9 @@ data HsStatus
   -- of its own, on the sample clock, so the modem hands the line to
   -- "Modec.V32Start" rather than straight to a data pump.
   | HsStartV32
+  -- | ...and the same, speculatively, from an answering modem's own
+  -- ladder rather than from an agreement.
+  | HsOfferV32
   | HsDropped
   | HsFailed String
   deriving (Eq, Show)
@@ -305,6 +311,10 @@ data Phase
   | Connected Standard Rate
   -- | V.8 chose V.32; the line is about to change hands.
   | V32Handover
+  -- | The answering ladder is offering V.32 on spec, per A.2.2.  The
+  -- line changes hands the same way, but the start-up is told it may
+  -- give up quickly and come back here.
+  | V32Offer
   | V8NoMode                     -- ^ V.8 ran but found nothing in common
   | Done
   deriving (Eq, Show)
@@ -314,6 +324,7 @@ data HsState = HsState
   , hsRole      :: !Role     -- ^ effective modem role
   , hsFamily    :: !Standard  -- ^ which V.22-family standard is being negotiated
   , hsTried212  :: !Bool     -- ^ a Bell 212A attempt already failed; prefer Bell 103
+  , hsTriedV32  :: !Bool     -- ^ V.32 has been offered once and not taken up
   , hsPhaseAt   :: !Double   -- ^ time the phase was entered
   , hs112At     :: !Double   -- ^ time circuit 112 went ON (S1 exchanged)
   , hsToneSince :: !(Maybe (Double, Double))  -- ^ current dominant tone and when it started
@@ -326,12 +337,49 @@ data HsState = HsState
   , hsT         :: !Double
   }
 
+-- | Back to the answering ladder after a V.32 offer nothing took up.
+--
+-- Almost nothing needs restoring: the handshake was never torn down, it
+-- was simply not stepped while the start-up had the line.  What it
+-- cannot do is resume in 'V32Handover', which is a dead end -- so it
+-- comes back on the rung after the one that made the offer, with the
+-- offer marked spent.
+--
+-- The clock does not need rebasing either, and that is worth saying
+-- because it looks as though it should: the handshake's time comes from
+-- the tone bank, the tone bank is stepped only while the mode is
+-- 'Modec.Modem.Handshaking', so time did not pass here at all.  A
+-- fifteen-second detour costs the ladder nothing and hcTimeout is
+-- measured against the same frozen clock.
+handshakeAfterV32 :: HsConfig -> HsState -> HsState
+handshakeAfterV32 cfg st = st
+  { hsPhase = AProbe resume, hsPhaseAt = hsT st, hsTriedV32 = True }
+  where
+    order = probesFor (hcModes cfg)
+    -- the rung after the one that made the offer, wrapping as the
+    -- rotation does
+    resume = case dropWhile (/= V22) order of
+      (_ : n : _) -> n
+      _ -> case order of { (p : _) -> p; [] -> Bell103 }
+
+-- | One probe per family, in the traditional order, skipping families
+-- this modem is not configured for.  V.32 is not among them: it is
+-- offered once from inside the V.22 rung rather than taking a turn in
+-- the rotation.
+probesFor :: [Standard] -> [Standard]
+probesFor modes =
+  [ p | (p, needed) <- [ (V22, any (`elem` modes) [V22, V22bis])
+                       , (V21, V21 `elem` modes)
+                       , (V23, V23 `elem` modes)
+                       , (Bell103, Bell103 `elem` modes || Bell212A `elem` modes) ]
+      , needed ]
+
 -- | The current phase, by name, for tracing.
 hsPhaseName :: HsState -> String
 hsPhaseName = show . hsPhase
 
 initialHandshake :: HsConfig -> HsState
-initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) V22 False 0 0 Nothing (-1) False Nothing 0 Nothing Nothing 0
+initialHandshake cfg = HsState (case hcRole cfg of Answer -> ABilling; Originate -> OListen) (hcRole cfg) V22 False False 0 0 Nothing (-1) False Nothing 0 Nothing Nothing 0
 
 fskTx, fskRx :: Role -> Standard -> FskSpec
 fskTx role s = case linkFor role s of
@@ -437,8 +485,25 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     -- An answering modem that steps through a fallback ladder may hold
     -- each rung open for only a second or two.
     fskOnly = not v22Allowed && (allowed V21 || allowed Bell103 || v23Allowed)
-    -- the answering V.32 modem's alternating pair, either sideband
-    v32Heard = heardFor 600 >= hcQualify cfg || heardFor 3000 >= hcQualify cfg
+    -- The far end's opening V.32 signal -- the answerer's alternating
+    -- pair to a caller, the caller's AA to an answerer -- off the phase
+    -- trackers rather than the tone bank.
+    --
+    -- The bank cannot do this job in either direction.  Towards a
+    -- caller, the pair puts near-equal energy at 600 and 3000, so
+    -- neither is dominant and 'heardFor' returns nothing for both;
+    -- against a real board one sideband happened to be twice the other
+    -- and it worked by luck.  Towards an answerer, 1800 sits two bins
+    -- from V.21 channel 2's space at a 40 ms window, where Detect says
+    -- they are not separable at all.
+    v32Heard = hiV32Peer inp
+    -- ...and the mirror of it: an answering modem may offer V.32 once,
+    -- and does not come back to it.  Nothing in V.32 says to fall back
+    -- to another modulation at all -- Note 5 permits only disconnecting,
+    -- and not within 3 s of the pair -- but this modem answers for V.21
+    -- and Bell 103 too, which are outside V.32's scope entirely.  It
+    -- stays on the line, so that floor does not bind.
+    offerV32 = role == Answer && any isV32 modes && not (hsTriedV32 st)
     -- An FSK mark we recognise is on the line right now.  Not
     -- 'qualified', which wants the full hcQualify of it: the V.22
     -- receiver makes up its mind about a steady tone faster than the
@@ -501,8 +566,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
               _ -> hsLastTone st
     -- one probe per family, in the traditional order, skipping families
     -- this modem is not configured for
-    probeOrder = [ p | (p, needed) <- [ (V22, v22Allowed), (V21, allowed V21), (V23, v23Allowed)
-                                      , (Bell103, allowed Bell103 || allowed Bell212A) ], needed ]
+    probeOrder = probesFor modes
     rotating = length probeOrder > 1
     nextProbe s = case dropWhile (/= s) probeOrder of
       (_ : n : _) -> n
@@ -534,11 +598,18 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
             Just MV21 | canRun MV21 -> enter (AProbe V21)
             _ -> enter V8NoMode
       AAns
+        -- A.2.2: "If signal AA is detected at any time during the
+        -- transmission of the V.25 answer sequence, the modem shall
+        -- continue as defined 5.4.2 at the second paragraph."  A calling
+        -- V.32 modem holds carrier state A throughout our answer tone,
+        -- so there is nothing to wait for once it has been heard.
+        | offerV32 && v32Heard -> (enter V32Offer) { hsTriedV32 = True }
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
         | inPhase >= hcAnsDuration cfg -> enter AGap
       AGap
         | inPhase >= hcAnsGap cfg -> enter (AProbe firstProbe)
       AProbe V22
+        | offerV32 && v32Heard -> (enter V32Offer) { hsTriedV32 = True }
         | s1Seen -> enter112 AV22S1
         | scrambledAnySeen, not otherFsk -> (enter AV22Ones) { hsFamily = V22 }
         | allowed Bell103 && qualified Bell103 -> enter (Connected Bell103 R1200)
@@ -557,6 +628,18 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         -- modulation it was not speaking.  V.8bis hid this for as long
         -- as it existed: the answerer never reached the V.22 probe.
         | u11Seen, not otherFsk -> (enter AV22Ones) { hsFamily = V22 }
+        -- A.2.2 again, this time the fourth paragraph.  The answering
+        -- automode ladder is ANS, then USB1 for Ta = 1500 +/- 50 ms
+        -- while listening for S1 or SB1, and only then the alternating
+        -- pair of 5.4.2.  This probe /is/ USB1 -- it transmits
+        -- TxV22 HighChannel R1200 TxU11 -- and hcProbe is 1.5 s, so the
+        -- rung goes here rather than straight after the answer tone.
+        --
+        -- Note 2 gives the reason for that order, and it is not
+        -- cosmetic: sending the pair early risks "being received and
+        -- possibly misinterpreted as a loss of carrier by some
+        -- implementations of V.22 bis modems".
+        | offerV32, inPhase >= hcProbe cfg -> (enter V32Offer) { hsTriedV32 = True }
         | rotating && inPhase >= hcProbe cfg -> enter (AProbe (nextProbe V22))
         | otherwise -> st'
       -- the Bell probe transmits 2225 Hz, which serves Bell 103 and
@@ -694,6 +777,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     tx = case hsPhase st'' of
       -- the V.32 start-up puts its own signals on the line from here
       V32Handover -> TxSilence
+      V32Offer -> TxSilence
       ABilling -> TxSilence
       AV8Ansam -> TxAnsam
       AV8JM -> case hsV8Peer st'' of
@@ -716,7 +800,21 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
                                       else TxMark v21Channel1
       OV8CJ -> if hsPhaseAt st'' == t then TxBits v21Channel1 cjBits else TxMark v21Channel1
       OV8Gap -> TxSilence
-      OAfterAns -> if fskOnly then TxMark (fskTx role preferredFsk) else TxSilence
+      -- 5.4.1: "The modem shall repetitively transmit carrier state A."
+      -- A calling V.32 modem holds a steady 1800 Hz from here while it
+      -- listens for the answerer's pair, and A.2.2 has the answering
+      -- modem pre-empt its whole ladder on hearing it.  Sending silence
+      -- instead meant no V.32 answerer could ever detect us, and two
+      -- modecs that both offered V.32 settled on V.22bis because the
+      -- answerer's USB1 probe arrived before either had said anything
+      -- about V.32.
+      --
+      -- A.2.2 Note 1 knows this tone lands on top of the 1800 Hz V.22bis
+      -- guard tone and says so; the Recommendation accepts the overlap.
+      OAfterAns
+        | any isV32 modes -> TxTone 1800
+        | fskOnly -> TxMark (fskTx role preferredFsk)
+        | otherwise -> TxSilence
       OReply s -> TxMark (fskTx Originate s)
       OV22Wait -> TxSilence
       OV22S1 -> TxV22 LowChannel R1200 TxS1
@@ -763,6 +861,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         Just m -> "V.8: far end selected " ++ modName m ++ ", which this modem does not run"
         Nothing -> "V.8: no modulation in common")
       (_, V32Handover) -> HsStartV32
+      (_, V32Offer) -> HsOfferV32
       (_, Connected s r) | isV22Family s -> HsConnected s (v22LinkAt (hsRole st'') r)
       (_, Connected s _) -> HsConnected s (linkFor (hsRole st'') s)
       _ -> HsBusy

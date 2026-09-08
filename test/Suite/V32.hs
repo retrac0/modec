@@ -812,6 +812,30 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
         assertBool (show r ++ ": EVM " ++ show evm ++ ", " ++ show (length got)
                     ++ " bits, best " ++ show best)
           (fst best == 0)
+  , testCase "an answering modem gives up on a caller that never comes" $ do
+      -- The path nothing covered: an answerer transmits the alternating
+      -- pair into a line with nobody on it.  5.4.2 Note 5 lets it
+      -- disconnect once the pair has run for three seconds and not
+      -- before, so the unbounded form waits far longer than that.  An
+      -- answerer offering V.32 out of its own ladder cannot: every one
+      -- of those seconds it spends putting 600 and 3000 Hz on a line
+      -- that may have a V.22 or Bell caller on the other end.
+      let fs = 8000
+          run st0 maxT = go (0 :: Int) st0
+            where
+              go t st
+                | fromIntegral t * 160 / fs > (maxT :: Double) = (Nothing, fromIntegral t * 160 / fs)
+                | otherwise = case v32StartStep st (VS.replicate 160 0) of
+                    (_, _, V32Failed why) -> (Just why, fromIntegral t * 160 / fs)
+                    (st', _, _) -> go (t + 1) st'
+          (unbounded, tUnb) = run (v32StartAfterAnswerTone fs Answering allRates) 40
+          (offered, tOff) = run (v32StartOffer fs Answering allRates 2.0) 40
+      assertEqual "the unbounded form still gives up" (Just "no calling modem") unbounded
+      assertBool ("unbounded gave up after " ++ show tUnb ++ " s, wanted well past Note 5's three")
+        (tUnb > 3 && tUnb < 30)
+      assertEqual "so does the bounded one" (Just "no calling modem") offered
+      assertBool ("bounded gave up after " ++ show tOff ++ " s, wanted about two")
+        (tOff > 1.5 && tOff < 3.5)
   , testCase "two V.32 modems reach 9600 trellis" $ do
       let (so, sa, trace, nt, mt) = v32StartDuplex 25 20 160
       -- both ends offer everything, so Table 5/V.32 bis has them settle

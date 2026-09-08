@@ -13,6 +13,7 @@ module Modec.Modem
   , modemStep
   , modemStatus
   , RetrainCause (..)
+  , V32Entry (..)
   , modemConnected
   , modemV32Evm
   , modemEchoErle
@@ -206,7 +207,7 @@ data Mode
   = Handshaking
   -- | The V.32 start-up of Figure 4, which runs on the sample clock and
   -- so cannot be driven by the handshake's 20 ms tick.
-  | Starting32 V32Start
+  | Starting32 V32Start V32Entry
   | DataFsk Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
   | DataV22 V22Channel V22Channel Rate AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
   | DataV32 Role V32Rate V32Data AsyncRx Bool
@@ -242,6 +243,14 @@ data RetrainCause
   = RetrainLocal      -- ^ our receiver stopped being able to read the line
   | RetrainFarEnd     -- ^ the far end started the signal that opens one
   deriving (Eq, Show)
+
+-- | Whether the V.32 start-up may retreat if nothing answers it.
+--
+-- V.8 choosing V.32, or V.32 being the only mode configured, is definite
+-- evidence and there is nowhere to retreat to.  An answering modem
+-- offering the alternating pair on spec is guessing, and A.2.2 has a
+-- ladder waiting for it when the guess is wrong.
+data V32Entry = V32Committed | V32Offered deriving (Eq, Show)
 
 data ModemState = ModemState
   { msMode    :: Mode
@@ -285,7 +294,7 @@ modemInit cfg
   -- through a capabilities exchange that cannot name the one thing it
   -- can do.
   | [s] <- hcModes hs, isV32 s, not (hcV8 hs) =
-      base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) }
+      base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) V32Committed }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
@@ -435,7 +444,7 @@ modemV22Rx st = (msV22Rx st, msRxRate st)
 modemPhase :: ModemState -> String
 modemPhase st = case msMode st of
   Handshaking -> hsPhaseName (msHs st)
-  Starting32 s32 -> "Starting32 " ++ show (v32Phase s32)
+  Starting32 s32 _ -> "Starting32 " ++ show (v32Phase s32)
   DataFsk s _ _ _ _ -> "Data " ++ show s
   DataV22 _ _ r _ _ -> "Data V22 " ++ show r
   DataV32 _ r _ _ _ -> "Data V32 " ++ show r
@@ -457,7 +466,7 @@ modemEchoErle = fmap echoErle . msEcho
 -- is over, or if it never ran.
 modemV32Phase :: ModemState -> Maybe (V32Phase, Bool)
 modemV32Phase st = case msMode st of
-  Starting32 s32 -> Just (v32Phase s32, v32EchoAdapt s32)
+  Starting32 s32 _ -> Just (v32Phase s32, v32EchoAdapt s32)
   _ -> Nothing
 
 -- | The V.32 receiver's decision error, for tracing.
@@ -466,7 +475,7 @@ modemV32Phase st = case msMode st of
 -- Figure 4.  'Nothing' outside the V.32 start-up.
 modemV32Bits :: ModemState -> Maybe [Bool]
 modemV32Bits st = case msMode st of
-  Starting32 s32 -> Just (v32Bits s32)
+  Starting32 s32 _ -> Just (v32Bits s32)
   _ -> Nothing
 
 modemV32Evm :: ModemState -> Maybe Double
@@ -522,9 +531,19 @@ modemStep cfg st0 rxBlock newBytes =
               let (rxSt', o) = v22RxBlock fs ch rxBlock rxSt
                   z = foldl (\acc b -> if b then 0 else acc + 1) (msZeros st) (roBits o)
               in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
+          -- The calling modem's AA, off the same 1800 Hz tracker the
+          -- data-mode retrain listener uses.  It cannot come off the
+          -- tone bank: 1800 sits two bins from V.21 channel 2's space at
+          -- 1850 in a 40 ms window, which Detect says outright are "not
+          -- separable at all" there, and it is the TTY space tone as
+          -- well.  The tracker measures phase, holds the pair apart, and
+          -- already counts a duration rather than an instant -- which is
+          -- what 5.4.2 asks for.
+          listen' = fmap (v32ListenBlock rxBlock) (msListen st)
+          v32Peer = maybe False (v32ListenRetrain (dirOfRole (hcRole hs))) listen'
           -- the block's events go to the first frame of the block only;
           -- the pump report is a running state and goes to every frame
-          hsInFor i = if i == 0 then HsIn v8Evs ansamHit report
+          hsInFor i = if i == 0 then HsIn v8Evs v32Peer ansamHit report
                                 else noHsIn { hiPump = report }
           (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr (hsInFor i) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
           (cmd, status, rxRate, role') =
@@ -539,7 +558,7 @@ modemStep cfg st0 rxBlock newBytes =
             (Nothing, _) -> Nothing
             (Just spec, Just cur@(sp, _, _, _)) | fskName sp == fskName spec -> Just cur
             (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), v8RxInit)
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros' }
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros', msListen = listen' }
       in case status of
            HsConnected s link ->
              let mode = case link of
@@ -554,8 +573,22 @@ modemStep cfg st0 rxBlock newBytes =
            -- is what ANSam was -- so the start-up begins at the answering
            -- modem's alternating AC rather than repeating it.
            HsStartV32 ->
+             -- An answering modem that reached here from its own ladder
+             -- rather than from a V.8 agreement is guessing, and has
+             -- somewhere to go back to.  It also cannot afford the
+             -- twenty-five seconds the start-up would otherwise spend
+             -- on the alternating pair: that whole time it is
+             -- transmitting 600 and 3000 Hz, which no V.22, V.21 or Bell
+             -- caller understands.
              let s32 = v32StartAfterAnswerTone fs (dirOfRole (hcRole hs)) (v32Offer cfg)
-                 st2 = st1 { msMode = Starting32 s32
+                 st2 = st1 { msMode = Starting32 s32 V32Committed
+                           , msEcho = Just (echoInit (mcEcho cfg)) }
+             in (st2, VS.replicate n 0, [], v8Menus)
+           -- A.2.2: the answering ladder offering the pair on spec.  The
+           -- same handoff, bounded, and with somewhere to go back to.
+           HsOfferV32 ->
+             let s32 = v32StartOffer fs (dirOfRole (hcRole hs)) (v32Offer cfg) (hcV32Offer hs)
+                 st2 = st1 { msMode = Starting32 s32 V32Offered
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
            HsFailed why ->
@@ -570,12 +603,12 @@ modemStep cfg st0 rxBlock newBytes =
           (framer', bytes) = stepStage framer d
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
       in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) (LineOctets bytes)
-    Starting32 s32 ->
+    Starting32 s32 entry ->
       let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
           (s32', audio, status) = v32StartStep s32 rxClean
           st1 = st { msEcho = pushEcho audio echo' }
       in case status of
-           V32Busy -> (st1 { msMode = Starting32 s32' }, audio, [], [])
+           V32Busy -> (st1 { msMode = Starting32 s32' entry }, audio, [], [])
            V32Connected r ->
              let link = V32Link (hcRole hs) r
                  std = if v32Bis s32' then V32bis else V32
@@ -588,6 +621,28 @@ modemStep cfg st0 rxBlock newBytes =
                            , msStatus = HsConnected std link, msSettled = 0
                            , msMnp = mnpFor cfg link }
              in (st2, audio, [], [EvConnected std link])
+           -- Nothing took the offer up, and there is a ladder waiting.
+           --
+           -- The handshake was never torn down -- it was simply not
+           -- stepped while the start-up had the line -- so coming back
+           -- is a matter of moving it off V32Handover, which is a dead
+           -- end, and marking the offer spent.  The clock does not need
+           -- rebasing: the tone bank is stepped only in this branch's
+           -- Handshaking sibling, so no handshake time passed at all
+           -- and hcTimeout is measured against the same frozen clock.
+           --
+           -- The V.22 receiver does get restarted.  It was not stepped
+           -- either, and its carrier state is however many seconds
+           -- stale; handing that to the probe that follows would have it
+           -- deciding about a tone that stopped before the offer began.
+           V32Failed _ | entry == V32Offered ->
+             let listenCh = case hcRole hs of
+                   { Originate -> HighChannel; Answer -> LowChannel }
+             in ( st1 { msMode = Handshaking
+                      , msHs = handshakeAfterV32 hs (msHs st1)
+                      , msV22Rx = Just (listenCh, v22RxInit fs)
+                      , msEcho = Nothing }
+                , audio, [], [] )
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsFailed why }, audio, [], [EvFailed why])
     DataV32 role rate pump framer armed ->

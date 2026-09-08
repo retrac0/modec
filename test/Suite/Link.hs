@@ -225,6 +225,51 @@ modemTests = testGroup "full modem duplex" $
           ("started at " ++ show s ++ " and moved to " ++ show e ++ ", which is not lower")
           (rateBitRate e < rateBitRate s)
         _ -> assertFailure ("no connection and rate change: " ++ show (evO ++ evA))
+  , testCase "V.32 both ends with no V.8 at all, down the classic ladder" $ do
+      -- Annex A.2.2 is an integral part of the Recommendation and this
+      -- is the ladder it defines: the answering modem sends ANS while
+      -- listening for the calling modem's carrier state A, then USB1 for
+      -- Ta = 1500 +/- 50 ms, and only then the alternating pair of
+      -- 5.4.2.  V.32 is six years older than V.8 and needs none of it.
+      --
+      -- Before this the answering side had no V.32 rung at all -- it
+      -- could only be reached through a CM/JM exchange -- so two modecs
+      -- that both offered V.32 settled on V.22bis at a sixth of the
+      -- speed.
+      -- Held at 9600 trellis so the assertion is about the ladder and
+      -- not about rate selection: unpinned this reaches 14400, which is
+      -- the top of what the receiver carries and retrains its way down
+      -- again, and the text queued at the moment of connection goes with
+      -- it.  Which rates get negotiated is what the 12000 case above is
+      -- for.
+      let cfg role = (defaultModemConfig 8000 role [V32bis, V32, V22bis])
+                       { mcV32Rates = Just (chosen V32R9600T) }
+          (rxO, rxA, evO, evA) = modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
+      -- V32 rather than V32bis because pinning to one rate clears B4,
+      -- which is how Note 1 has a modem say it is not speaking V.32bis
+      assertBool ("originate events " ++ show evO)
+        (any (\e -> case e of EvConnected s (V32Link _ V32R9600T) -> isV32 s; _ -> False) evO)
+      assertBool ("answer events " ++ show evA)
+        (any (\e -> case e of EvConnected s (V32Link _ V32R9600T) -> isV32 s; _ -> False) evA)
+      assertBool ("answer heard " ++ show rxA) (textO `isInfixOf` rxA)
+      assertBool ("originate heard " ++ show rxO) (textA `isInfixOf` rxO)
+  , testCase "an answerer offering V.32 still falls back to a caller without it" $ do
+      -- The other half, and the reason the offer is bounded.  A modem
+      -- that offers the alternating pair is guessing: for as long as it
+      -- holds it, it is transmitting 600 and 3000 Hz that no V.22, V.21
+      -- or Bell caller understands.  It gives up after hcV32Offer and
+      -- comes back to the rung after the V.22 probe with the offer spent,
+      -- so the rest of the ladder is still reachable.
+      let answerer = defaultModemConfig 8000 Answer [V32bis, V32, V22bis, V22, V21, Bell103]
+      forM_ [ ([V22bis, V22], "V22bis", 45)
+            , ([V21], "V21", 45) ] $ \(callerModes, want, budget) -> do
+        let (rxO, rxA, evO, _) =
+              modemDuplex (defaultModemConfig 8000 Originate callerModes) answerer
+                          30 textO textA budget
+            got = [ show s | EvConnected s _ <- evO ]
+        assertBool (want ++ ": originate events " ++ show evO) (got == [want])
+        assertBool (want ++ ": answer heard " ++ show rxA) (textO `isInfixOf` rxA)
+        assertBool (want ++ ": originate heard " ++ show rxO) (textA `isInfixOf` rxO)
   , testCase "a V.32 call notices when the far end stops" $ do
       -- It could not.  The carrier watchdog was handed "the decision
       -- error is under 1e3", which is an EWMA of a squared error on a
