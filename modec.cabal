@@ -37,7 +37,6 @@ library
                       Modec.MnpFrame
                       Modec.Mnp
                       Modec.V8
-                      Modec.V8bis
                       Modec.Hayes
                       Modec.Dtmf
                       Modec.Progress

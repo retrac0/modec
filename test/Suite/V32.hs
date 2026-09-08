@@ -761,7 +761,7 @@ v32ListenTests = testGroup "the retrain listener does not hear data"
           step (l, worst) blk =
             let l' = v32ListenBlock blk l
             in (l', max worst (if v32ListenRetrain (other dir) l' then 1 else 0 :: Int))
-          (_, fired) = foldl step (v32ListenInit 8000, 0) (chunksOf 160 sig)
+          (_, fired) = foldl step (v32ListenInit 8000 (other dir), 0) (chunksOf 160 sig)
       assertEqual "a data signal asked for a retrain" 0 fired
   | r <- allV32Rates, dir <- [Calling, Answering] ]
   where other d = case d of { Calling -> Answering; Answering -> Calling }

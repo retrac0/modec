@@ -135,7 +135,6 @@ cmdP = hsubparser
               <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32,v32bis (default: all but v32 and v32bis)")
                 <|> pure H.allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
-      <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> switch (long "v8" <> help "V.8: answer with ANSam and exchange CM/JM capability menus")
       <*> switch (long "probe" <> help "do not place a call: hold a V.32 carrier and measure the echo path of whatever is on the line")
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full. A survey option: the mode it then selects will not be one this modem can run")
@@ -198,7 +197,6 @@ cmdP = hsubparser
       <$> modesP
       <*> switch (long "v8" <> help "V.8: exchange CM/JM capability menus before the modem start-up")
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full")
-      <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> dialMnpP
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
                        <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this")
@@ -209,8 +207,8 @@ cmdP = hsubparser
                   <> help "do not place a call: hold a V.32 carrier and measure the echo path")
       <*> optional (option (maybeReader v32RateReader) (long "v32-rate" <> metavar "BPS"
             <> help "hold V.32 to one rate: 4800, 7200, 9600, 9600t, 12000 or 14400"))
-    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy probe v32rate = defaultModemOpts
-      { moModes = modes, moV8 = v8, moV8All = v8all, moNoV8bis = noV8bis
+    mkDialModem modes v8 v8all mnp evm amp rdir ignoreBusy probe v32rate = defaultModemOpts
+      { moModes = modes, moV8 = v8, moV8All = v8all
       , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir
       , moIgnoreBusy = ignoreBusy, moProbe = probe, moV32Rates = v32rate }
     modesP =

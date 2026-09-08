@@ -34,7 +34,7 @@ module Modec.V32Start
   , v32StartInit
   , v32StartAfterAnswerTone
   , v32RetrainInit
-  , V32Listen
+  , V32Listen (..)
   , v32ListenInit
   , v32ListenBlock
   , v32ListenRetrain
@@ -162,6 +162,7 @@ data V32Start = V32Start
   , vsSeenTrn :: !Bool
   , vsFar     :: !Direction      -- ^ the far end's scrambler
   , vsRevAt   :: [(Double, Int)] -- ^ reversals seen in this block
+  , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
   }
@@ -274,27 +275,48 @@ data V32Listen = V32Listen
   { vlRev1800 :: !RevTracker
   , vlRev600  :: !RevTracker
   , vlRev3000 :: !RevTracker
+  , vlDir     :: !Direction
+  , vlRun     :: !Int        -- ^ blocks the opening tone has been up
   }
 
-v32ListenInit :: Double -> V32Listen
-v32ListenInit fs = V32Listen (revInit fs 1800) (revInit fs 600) (revInit fs 3000)
+v32ListenInit :: Double -> Direction -> V32Listen
+v32ListenInit fs dir =
+  V32Listen (revInit fs 1800) (revInit fs 600) (revInit fs 3000) dir 0
 
 v32ListenBlock :: Signal -> V32Listen -> V32Listen
-v32ListenBlock rx l = V32Listen
-  (fst (revBlock rx (vlRev1800 l)))
-  (fst (revBlock rx (vlRev600 l)))
-  (fst (revBlock rx (vlRev3000 l)))
+v32ListenBlock rx l = l'
+  { vlRun = if heardOpening l' then vlRun l + 1 else 0 }
+  where
+    l' = l { vlRev1800 = fst (revBlock rx (vlRev1800 l))
+           , vlRev600 = fst (revBlock rx (vlRev600 l))
+           , vlRev3000 = fst (revBlock rx (vlRev3000 l)) }
 
 -- | Whether the far end has started the signal that opens a retrain:
 -- AA at 1800 Hz from a calling modem, the alternating pair at 600 and
 -- 3000 from an answering one.  Neither is anything a data signal
 -- produces -- both directions are spread across the band -- so a level
 -- this high at one frequency is a modem that has stopped sending data.
-v32ListenRetrain :: Direction -> V32Listen -> Bool
-v32ListenRetrain dir l = case dir of
+-- | Is the far end's opening signal on the line this block?
+heardOpening :: V32Listen -> Bool
+heardOpening l = case vlDir l of
   -- we are the caller, so the far end is the answering modem
-  Calling -> revLevel (vlRev600 l) > 0.45 || revLevel (vlRev3000 l) > 0.45
-  Answering -> revLevel (vlRev1800 l) > 0.45
+  Calling -> strong (vlRev600 l) || strong (vlRev3000 l)
+  Answering -> strong (vlRev1800 l)
+  where
+    -- A level is a correlation divided by the signal's own root mean
+    -- square, so on a line with nothing on it it is noise over noise and
+    -- reads whatever it likes.
+    strong t = revPower t > 1e-5 && revLevel t > 0.45
+
+-- | ...and has been for long enough to mean it.
+--
+-- A modem restarting Figure 4 holds its opening signal for seconds.  A
+-- few blocks of it is what a line makes when it stops: the level is
+-- normalised by a signal that has just gone, so it spikes exactly once
+-- as the far end hangs up -- and a hang-up read as a retrain takes the
+-- call round the start-up again instead of ending it.
+v32ListenRetrain :: Direction -> V32Listen -> Bool
+v32ListenRetrain _ l = vlRun l >= 5
 
 v32StartAfterAnswerTone :: Double -> Direction -> RateSeq -> V32Start
 v32StartAfterAnswerTone fs dir offer =
@@ -318,7 +340,8 @@ v32StartInit fs dir offer = V32Start
   , vsMark = Nothing, vsTrip = Nothing
   , vsTurns = [], vsPrevSym = (0, 0)
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
-  , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False }
+  , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
+  , vsACRun = 0 }
   where
     role = case dir of { Calling -> Calling'; Answering -> Answering' }
     p = v32Params fs
@@ -351,10 +374,23 @@ symbols st k = round (fromIntegral k * vsSps st)
 observe :: V32Start -> Signal -> V32Start
 observe st rx = st
   { vsRev1800 = r18, vsRev600 = r6, vsRev3000 = r30
+  -- How long the answering modem's opening pair has been on the line.
+  --
+  -- A level is a coherent correlation over the signal's own tracked mean
+  -- square, and that average is slow, so any signal arriving after a
+  -- gap reads high for two or three blocks while the average catches up.
+  -- Measured on a real board: 1.8 s of silence, then its rate signal
+  -- came back reading 0.66 at 3000 Hz for three blocks and 0.14
+  -- thereafter.  A single block of that was enough to convince this end
+  -- the far end had restarted, and it went back to AA -- which the far
+  -- end then answered by restarting for real, and the two of them went
+  -- round Figure 4 together until the call timed out.
+  , vsACRun = if acNow then vsACRun st + 1 else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
   , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsDescr = descr', vsBits = bits'
   , vsQuiet = quiet' }
   where
+    acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
     (r18, e18) = revBlock rx (vsRev1800 st)
     (r6, e6) = revBlock rx (vsRev600 st)
     (r30, e30) = revBlock rx (vsRev3000 st)
@@ -638,19 +674,15 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
     -- Only in the calling modem's phases past the point where it has
     -- answered AC once, and only after a second of it, so a transient
     -- cannot throw a start-up that is otherwise going well.
-    -- 0.45 and not acHeard's 0.30.  OListen uses the lower figure while
-    -- the line is otherwise idle; here the far end may be sending a rate
-    -- signal, which is a four-point signal spread across the band, and a
-    -- coherent correlation at 600 or 3000 reads a good deal more of that
-    -- than it does of silence.  At 0.30 this threw away a start-up that
-    -- was working -- the recording in the corpus -- a second after it
-    -- reached R2.
-    strongAC = heard 600 > 0.45 || heard 3000 > 0.45
-    restarted = strongAC && vsSince st0 > sym 2400 && case vsPhase st0 of
+    -- a quarter second of it, not one block: see 'observe'
+    restarted = vsACRun st0 >= 12 && vsSince st0 > sym 2400 && case vsPhase st0 of
       OTrainR1 -> True
       OHoldS -> True
       OCond -> True
       OR2 -> True
+      -- and OB1: a board that restarted once will do it again, and one
+      -- did, while this end sat sending E at it for thirty seconds
+      OB1 -> True
       _ -> False
     tooLong limit s = vsSince s > sym limit
 

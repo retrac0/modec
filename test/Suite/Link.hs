@@ -56,7 +56,7 @@ handshakeTests = testGroup "handshake simulation"
       assertEqual "originate" (FskLink v23Backward v23Forward) (linkFor Originate V23)
       assertEqual "answer" (FskLink v23Forward v23Backward) (linkFor Answer V23)
   , testCase "answerer respects V.25 timing" $ do
-      let (_, a) = simulateCall (defaultHsConfig Originate) { hcV8bis = False } (defaultHsConfig Answer) { hcV8bis = False } 30 20
+      let (_, a) = simulateCall (defaultHsConfig Originate) (defaultHsConfig Answer) 30 20
           tr = sdTrace a
           ansStart = case [ t | (t, TxTone 2100) <- tr ] of { (t : _) -> t; [] -> -1 }
           ansLen = runLength (== TxTone 2100) tr
@@ -65,14 +65,14 @@ handshakeTests = testGroup "handshake simulation"
       assertBool ("ANS duration " ++ show ansLen) (maybe False (\d -> d >= 2.6 && d <= 4.0) ansLen)
       assertBool ("gap " ++ show gapLen) (maybe False (\d -> d >= 0.055 && d <= 0.095) gapLen)
   , testCase "no answer -> caller fails after timeout" $ do
-      let cfg = (defaultHsConfig Originate) { hcTimeout = 5, hcV8bis = False }
-          (o, _) = simulateCall cfg (defaultHsConfig Answer) { hcBilling = 100, hcV8bis = False } 30 8
+      let cfg = (defaultHsConfig Originate) { hcTimeout = 5 }
+          (o, _) = simulateCall cfg (defaultHsConfig Answer) { hcBilling = 100 } 30 8
       assertEqual "status" (HsFailed "timeout") (sdStatus o)
   ]
   where
     fsk = [V21, Bell103]
     call name so sa expect = testCase name $ do
-      let (o, a) = simulateCall (withModes so (defaultHsConfig Originate)) { hcV8bis = False } (withModes sa (defaultHsConfig Answer)) { hcV8bis = False } 30 20
+      let (o, a) = simulateCall (withModes so (defaultHsConfig Originate)) (withModes sa (defaultHsConfig Answer)) 30 20
       assertEqual "originate" (HsConnected expect (linkFor Originate expect)) (sdStatus o)
       assertEqual "answer" (HsConnected expect (linkFor Answer expect)) (sdStatus a)
 
@@ -135,7 +135,7 @@ modemTests = testGroup "full modem duplex" $
       -- the V.32 start-up -- which must begin at the answering modem's
       -- AC, because ANSam has already been the answer tone.
       let cfg r = withV8 (defaultModemConfig 8000 r [V32, V22bis, V22])
-          withV8 c = c { mcHandshake = (mcHandshake c) { hcV8 = True, hcV8bis = False } }
+          withV8 c = c { mcHandshake = (mcHandshake c) { hcV8 = True } }
           (rxO, rxA, evO, evA) = modemDuplex (cfg Originate) (cfg Answer) 30 textO textA 45
       -- the far end's menu is reported first, and must name V.32
       assertBool ("originate events " ++ show evO)
@@ -244,22 +244,10 @@ modemTests = testGroup "full modem duplex" $
         (any (\e -> case e of EvConnected V32 _ -> True; _ -> False) evO)
       assertBool ("expected a drop after the line went quiet, got " ++ show evO)
         (EvDropped `elem` evO)
-  , testCase "automode call with V.8bis -> V.22bis 2400 bit/s, roles reversed, text both ways" $ do
-      let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 18
-      -- the station that received MS (the caller) becomes the answering modem on the high channel
-      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22bis (V22Link HighChannel LowChannel R2400) : _) -> True; _ -> False)
-      assertBool ("answer events " ++ show evA) (case evA of (EvConnected V22bis (V22Link LowChannel HighChannel R2400) : _) -> True; _ -> False)
-      assertEqual "text from answer to originate" textA rxO
-      assertEqual "text from originate to answer" textO rxA
-  , testCase "automode call without V.8bis -> V.22bis at 2400 bit/s" $ do
-      let (rxO, rxA, evO, evA) = modemDuplex (noV8 (defaultModemConfig 8000 Originate allStandards)) (noV8 (defaultModemConfig 8000 Answer allStandards)) 30 textO textA 16
+  , testCase "automode call -> V.22bis at 2400 bit/s" $ do
+      let (rxO, rxA, evO, evA) = modemDuplex (defaultModemConfig 8000 Originate allStandards) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 16
       assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22bis (V22Link LowChannel HighChannel R2400) : _) -> True; _ -> False)
       assertBool ("answer events " ++ show evA) (case evA of (EvConnected V22bis (V22Link HighChannel LowChannel R2400) : _) -> True; _ -> False)
-      assertEqual "text from answer to originate" textA rxO
-      assertEqual "text from originate to answer" textO rxA
-  , testCase "V.8bis answerer, caller without V.8bis -> classic start-up" $ do
-      let (rxO, rxA, evO, _) = modemDuplex (noV8 (defaultModemConfig 8000 Originate allStandards)) (defaultModemConfig 8000 Answer allStandards) 30 textO textA 20
-      assertBool ("originate events " ++ show evO) (case evO of (EvConnected V22bis (V22Link LowChannel HighChannel R2400) : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
       assertEqual "text from originate to answer" textO rxA
   , testCase "V.22-only caller (no S1) -> 1200 bit/s" $ do
@@ -314,9 +302,9 @@ modemTests = testGroup "full modem duplex" $
       let (rxO, _, evO, _) = modemDuplex (defaultModemConfig 8000 Originate [Bell103]) (defaultModemConfig 8000 Answer [Bell212A, Bell103]) 25 textO textA 14
       assertBool ("originate events " ++ show evO) (case evO of (EvConnected Bell103 _ : _) -> True; _ -> False)
       assertEqual "text from answer to originate" textA rxO
-  , testCase "a Bell-only modem never sends the ITU answer tone or V.8bis" $ do
+  , testCase "a Bell-only modem never sends the ITU answer tone" $ do
       let (_, a) = simulateCall (defaultHsConfig Originate) { hcModes = [Bell103] } (defaultHsConfig Answer) { hcModes = [Bell212A, Bell103] } 30 12
-      assertBool ("answer trace " ++ show (sdTrace a)) (not (any (\(_, c) -> c == TxTone 2100 || isDual c) (sdTrace a)))
+      assertBool ("answer trace " ++ show (sdTrace a)) (not (any (\(_, c) -> c == TxTone 2100) (sdTrace a)))
   , testCase "Bell 103 fixed, no handshake, 20 dB" $ do
       let cfg r = (defaultModemConfig 8000 r [Bell103]) { mcNoHandshake = True }
           (rxO, rxA, _, _) = modemDuplex (cfg Originate) (cfg Answer) 20 textO textA 6
@@ -324,8 +312,6 @@ modemTests = testGroup "full modem duplex" $
       assertEqual "originate to answer" textO rxA
   ]
   where
-    isDual c = case c of { TxDual {} -> True; _ -> False }
-    noV8 c = c { mcHandshake = (mcHandshake c) { hcV8bis = False } }
     textO = map (fromIntegral . fromEnum) "Hello from the caller, 0123456789 !\r\n"
     textA = map (fromIntegral . fromEnum) "Answerer here; all bytes: \255\0\128 end\r\n"
 

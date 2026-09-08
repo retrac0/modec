@@ -20,7 +20,6 @@ import Modec.V22
 import Modec.Hdlc
 import Modec.MnpFrame
 import Modec.Mnp
-import Modec.V8bis
 import Data.Bits (testBit, xor)
 import Modec.Stream
 import Modec.FSK
@@ -173,15 +172,11 @@ hdlcTests = testGroup "HDLC and V.8bis messages"
           bad = take 20 line ++ [not (line !! 20)] ++ drop 21 line
           (_, frames) = hdlcRxBits hdlcRxInit (replicate 8 True ++ bad ++ replicate 8 True)
       assertEqual "frames" [] frames
-  , testCase "V.8bis CL, MS and ACK encode/decode" $ do
-      assertEqual "CL" (CL [ModeV21, ModeV22, ModeV22bis]) (decodeMessage (encodeMessage (CL [ModeV21, ModeV22, ModeV22bis])))
-      assertEqual "MS" (MS ModeV22bis) (decodeMessage (encodeMessage (MS ModeV22bis)))
-      assertEqual "ACK(1)" (Ack 1) (decodeMessage (encodeMessage (Ack 1)))
-      assertEqual "NAK(3)" (Nak 3) (decodeMessage (encodeMessage (Nak 3)))
-      assertEqual "CL octets" [0x22, 0x80, 0x80, 0x80, 0x81, 0x09, 0x00, 0xCE] (encodeMessage (CL [ModeV21, ModeV22, ModeV22bis]))
-  , testCase "V.8bis message over V.21 through the line" $ do
+  , testCase "an HDLC frame over V.21 through the line" $ do
       let fs = 8000
-          info = encodeMessage (CL [ModeV22bis, ModeV22])
+          -- any octets will do; these are what a V.8bis capabilities
+          -- list used to be, from back when this modem spoke one
+          info = [0x22, 0x80, 0x80, 0x80, 0x81, 0x09, 0x00, 0xCE]
           bits = replicate 30 True ++ hdlcFrameBits 3 2 info ++ replicate 30 True
           sig = applyChannel fs (telephoneChannel 20) (txFilter fs v21Channel2 (VS.map (* 0.5) (modulateBits fs v21Channel2 bits)))
           rxBits = concatStage (fskDiscriminator fs v21Channel2 defaultDemodParams >>> fskSyncBits fs v21Channel2 defaultDemodParams) [sig, flushSilence fs v21Channel2]

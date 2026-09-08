@@ -47,6 +47,7 @@ module Modec.QAM
   , revRearm
   , revBlock
   , revLevel
+  , revPower
   ) where
 
 import qualified Data.Vector.Storable as VS
@@ -483,6 +484,15 @@ revRearm t = t
 -- window length -- around 0.16 here.
 revLevel :: RevTracker -> Double
 revLevel = rtLevel
+
+-- | The mean square of what the tracker is listening to.
+--
+-- 'revLevel' divides by this, so on a line with nothing on it the ratio
+-- is noise over noise and can read anything at all.  Anyone using a
+-- level as evidence that a particular tone is present has to check
+-- there is a signal to have a tone in.
+revPower :: RevTracker -> Double
+revPower = rtPow
 
 -- | Feed a block; returns the global sample indices at which the tone
 -- reversed phase.

@@ -81,7 +81,6 @@ data ModemOpts = ModemOpts
   , moRole     :: Role
   , moModes    :: [Standard]        -- ^ modes to negotiate, best first
   , moNoHandshake :: Bool
-  , moNoV8bis  :: Bool
   , moV8       :: Bool
   , moProbe    :: Bool
   , moV8All    :: Bool
@@ -111,7 +110,7 @@ data ModemOpts = ModemOpts
 defaultModemOpts :: ModemOpts
 defaultModemOpts = ModemOpts
   { moRate = 8000, moBlockMs = 20, moRole = Originate, moModes = allStandards
-  , moNoHandshake = False, moNoV8bis = False, moV8 = False, moV8All = False, moProbe = False
+  , moNoHandshake = False, moV8 = False, moV8All = False, moProbe = False
   , moMaxEvm = 1.0, moV32Rates = Nothing, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
@@ -142,7 +141,7 @@ runModem o = do
               , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
               , mcV32Rates = v32Offered o, mcMnp = mnpCfg
               , mcHandshake = (mcHandshake c0)
-                  { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o
+                  { hcV8 = moV8 o || moV8All o
                   , hcV8OfferAll = moV8All o } }
       cfg = configFor (moRole o)
       -- The rate and whether the link can go synchronous belong to the

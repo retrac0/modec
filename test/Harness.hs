@@ -47,7 +47,6 @@ simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
             TxMark sp -> fskMark sp
             TxData sp -> fskMark sp
             TxV22 ch _ _ -> if ch == HighChannel then 2250 else 1050   -- unscrambled ones, as a tone
-            TxDual f1 _ _ -> f1
             TxBits sp _ -> fskMark sp
           w = 2 * pi * f / fs
           sig = VS.generate blk (\i -> if f == 0 then 0 else 0.5 * sin (sdPhase s + w * fromIntegral i))
@@ -75,7 +74,7 @@ callerAgainstU11 modes maxT = go 0 (toneBank fs (hcBank cfg)) (initialHandshake 
   where
     fs = 8000
     blk = 160 :: Int
-    cfg = (withModes modes (defaultHsConfig Originate)) { hcV8bis = False }
+    cfg = (withModes modes (defaultHsConfig Originate))
     -- 2100 Hz answer tone for three seconds, then the answerer's
     -- unscrambled binary 1 on the high channel, for ever
     audioAt t

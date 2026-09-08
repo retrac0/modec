@@ -49,7 +49,6 @@ import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateM
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
-import Modec.Hdlc
 import Modec.Mnp
 import Modec.V8
 
@@ -140,11 +139,6 @@ txBlock fs amp fr guard cmd n st = case cmd of
   TxMark spec -> fsk spec False
   TxData spec -> fsk spec True
   TxBits spec bits -> fsk spec False `withQueuedBits` bits
-  TxDual f1 f2 g ->
-    let w1 = 2 * pi * f1 / fs
-        w2 = 2 * pi * f2 / fs
-        sig = VS.generate n (\i -> 0.5 * amp * g * (sin (txPhase st + w1 * fromIntegral i) + sin (txPhase2 st + w2 * fromIntegral i)))
-    in (st { txPhase = wrap (txPhase st + w1 * fromIntegral n), txPhase2 = wrap (txPhase2 st + w2 * fromIntegral n), txFir = Nothing }, sig)
   -- ANSam: 2100 Hz with a 15 Hz envelope between 0.8 and 1.2 of average
   -- (7.2/V.8).  No phase reversals: those exist only to disable network
   -- echo cancellers, and the Recommendation says not to send them when
@@ -257,7 +251,6 @@ data ModemState = ModemState
   , msTxCmd   :: TxCmd
   , msV22Rx   :: Maybe (V22Channel, V22RxState)   -- ^ receiver on the remote's V.22 channel
   , msRole    :: Role        -- ^ effective role the V.22 receiver channel follows
-  , msHdlc    :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], HdlcRx)
   , msV8      :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], V8Rx)
   , msAnsam   :: Ansam
   , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
@@ -303,12 +296,13 @@ modemInit cfg
     fs = mcRate cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200
+             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing (ansamInit fs) R1200
              echo0 listen0 0 0 0 0 0 HsBusy [] Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
     echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
-    listen0 = if any isV32 (hcModes hs) then Just (v32ListenInit fs) else Nothing
+    listen0 = if any isV32 (hcModes hs)
+                then Just (v32ListenInit fs (dirOfRole (hcRole hs))) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -509,16 +503,8 @@ modemStep cfg st0 rxBlock newBytes =
       (st, VS.replicate n 0, [], [])
     Handshaking ->
       let (bank', frames) = stepStage (msBank st) rxBlock
-          -- synchronous V.21 receiver for V.8bis messages, when the handshake asks for one
-          (hdlc', hdlcFrames) = case msHdlc st of
-            Nothing -> (Nothing, [])
-            Just (spec, disc, sync, hrx) ->
-              let (disc', d) = stepStage disc rxBlock
-                  (sync', bits) = stepStage sync d
-                  (hrx', fsOut) = hdlcRxBits hrx bits
-              in (Just (spec, disc', sync', hrx'), fsOut)
-          -- the same arrangement for V.8's CM, JM and CJ, which are
-          -- async octets rather than HDLC frames
+          -- a V.21 receiver for V.8's CM, JM and CJ, which are async
+          -- octets on whichever channel the handshake names
           (v8rx', v8Evs) = case msV8 st of
             Nothing -> (Nothing, [])
             Just (spec, disc, sync, vrx) ->
@@ -538,29 +524,22 @@ modemStep cfg st0 rxBlock newBytes =
               in (Just (ch, rxSt'), Just (V22Report (roEnergy o) (roAngleErr o) (roU11Run o) (roOnesRun o) z (roS1Run o) (roOnes2400 o)), z)
           -- the block's events go to the first frame of the block only;
           -- the pump report is a running state and goes to every frame
-          hsInFor i = if i == 0 then HsIn hdlcFrames v8Evs ansamHit report
+          hsInFor i = if i == 0 then HsIn v8Evs ansamHit report
                                 else noHsIn { hiPump = report }
           (hsState', outs) = foldl (\(h, acc) (i, fr) -> let (h', o) = handshakeStep hs h fr (hsInFor i) in (h', acc ++ [o])) (msHs st, []) (zip [0 :: Int ..] frames)
-          (cmd, status, rxRate, role', hdlcWant) =
-            if null outs then (msTxCmd st, HsBusy, msRxRate st, msRole st, fmap (\(s, _, _, _) -> s) (msHdlc st))
-            else let o = last outs in (hoTx o, hoStatus o, hoRxRate o, hoRole o, hoHdlc o)
+          (cmd, status, rxRate, role') =
+            if null outs then (msTxCmd st, HsBusy, msRxRate st, msRole st)
+            else let o = last outs in (hoTx o, hoStatus o, hoRxRate o, hoRole o)
           v8Want = if null outs then fmap (\(s, _, _, _) -> s) (msV8 st) else hoV8 (last outs)
           v8Menus = [ EvV8Menu m | o <- outs, Just m <- [hoV8Menu o] ]
           -- switch the receiver's decision rate when the handshake says so
           v22a = if rxRate /= msRxRate st then fmap (\(c, r) -> (c, v22RxSetRate rxRate r)) v22' else v22'
-          -- a V.8bis mode select reverses the roles: listen on the other channel
-          v22'' = if role' /= msRole st
-                    then Just (case role' of { Originate -> HighChannel; Answer -> LowChannel }, v22RxInit fs)
-                    else v22a
-          hdlc'' = case (hdlcWant, hdlc') of
-            (Nothing, _) -> Nothing
-            (Just spec, Just cur@(s, _, _, _)) | fskName s == fskName spec -> Just cur
-            (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), hdlcRxInit)
+          v22'' = v22a
           v8'' = case (v8Want, v8rx') of
             (Nothing, _) -> Nothing
             (Just spec, Just cur@(sp, _, _, _)) | fskName sp == fskName spec -> Just cur
             (Just spec, _) -> Just (spec, fskDiscriminator fs spec (mcDemod cfg), fskSyncBits fs spec (mcDemod cfg), v8RxInit)
-          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msHdlc = hdlc'', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros' }
+          st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros' }
       in case status of
            HsConnected s link ->
              let mode = case link of
@@ -692,6 +671,13 @@ modemStep cfg st0 rxBlock newBytes =
           -- still live -- long enough that it is the link and not a
           -- burst, and short enough to be worth doing something about.
           wantRetrain
+            -- Nothing at all on the line is a hang-up, and belongs to
+            -- the carrier watchdog.  A retrain is for a line that is
+            -- still there and has stopped being readable; asking for one
+            -- when the far end has simply gone takes the call round
+            -- Figure 4 instead of ending it, and the watchdog never gets
+            -- its turn because the retrain suspends it.
+            | not present = Nothing
             | maybe False (v32ListenRetrain (dirOfRole role)) listen' = Just RetrainFarEnd
             | bad' >= round (1.0 / blockSecs) = Just RetrainLocal
             | otherwise = Nothing
