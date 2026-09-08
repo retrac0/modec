@@ -835,10 +835,18 @@ v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
           tone = [ (t, "tone at " ++ show (round f :: Int) ++ " Hz")
                  | (f, lv) <- levels, lv > 0.45, not (toneWas f st) ]
           cond = [ (t, "conditioning signal (S)") | isConditioning (vsTurns st1), not (vsSeenS st) ]
-          rate = [ (t, "rate signal " ++ showRates r) | Just r <- [detectRate (vsBits st1)], not (vsSeenTrn st) ]
+          -- Every rate signal whose content changes, rather than only
+          -- the first one seen.  The first is R1; what a stalled
+          -- start-up needs read back to it is whether R2 and R3 ever
+          -- followed, and gating on "have we seen TRN yet" hid exactly
+          -- that.
+          heardRate = detectRate (vsBits st1)
+          rate = [ (t, "rate signal " ++ showRates r)
+                 | Just r <- [heardRate], Just r /= vsPeer st ]
           eSig = [ (t, "signal E " ++ showRates r) | Just (_, r) <- [detectE Nothing (vsBits st1)] ]
           st2 = st1 { vsSeenS = vsSeenS st || not (null cond)
-                    , vsSeenTrn = vsSeenTrn st || not (null rate) }
+                    , vsSeenTrn = vsSeenTrn st || not (null rate)
+                    , vsPeer = case heardRate of { Just _ -> heardRate; Nothing -> vsPeer st } }
       in go st2 (n + blk) cs (reverse (revs ++ tone ++ cond ++ rate ++ eSig) ++ acc)
     toneWas f st = revLevel (case f of { 1800 -> vsRev1800 st; 600 -> vsRev600 st; _ -> vsRev3000 st }) > 0.45
     showRates r = unwords (["4800" | rsCan4800 r] ++ ["7200" | rsCan7200 r] ++ ["9600" | rsCan9600 r]

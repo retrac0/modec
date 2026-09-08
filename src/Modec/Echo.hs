@@ -274,7 +274,14 @@ echoBlock cfg adapt rx st0 = (st', out)
 echoSearch :: EchoConfig -> EchoState -> Maybe (Int, Double)
 echoSearch cfg st
   | VS.length rxW < 256 = Nothing
-  | null scores = Nothing
+  | length scores < 512 = Nothing
+  -- A peak at either end of the range is the range's edge, not an echo.
+  -- There is nothing beyond it to compare against, so the mean and the
+  -- rival are both taken over a one-sided sample and both flatter it.
+  -- Dialled at a board that had no echo to give, the search reported
+  -- 499 ms -- one millisecond inside a 500 ms window -- for the whole
+  -- of a call, at a return loss of 0.0 dB.
+  | bestLag <= lo + edge || bestLag >= ecSearch cfg - edge = Nothing
   | best > ecPeak cfg * avg, avg > 0
   , best > 2 * rival = Just (bestLag, best / avg)
   | otherwise = Nothing
@@ -315,6 +322,7 @@ echoSearch cfg st
     -- converging.  Comparing against the mean does not catch it -- a
     -- comb of peaks lifts the mean too -- and this does.
     rival = maximum (0 : [ c | (c, l) <- scores, abs (l - bestLag) > 160 ])
+    edge = 2 * ecPre cfg
 
 -- | Point the filter at a delay the search found, reaching 'ecPre' in
 -- front of it so the leading edge of the reflection is inside the span.
