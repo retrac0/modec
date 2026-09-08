@@ -560,6 +560,23 @@ runModem o = do
                             EvMnp (MnpUp cls _ _) ->
                               modemEvent (EvProtocol ("MNP CLASS " ++ show cls))
                             EvMnp _ -> return ()
+                            -- 5.5 is not a Hayes result code.  The call
+                            -- is up throughout a retrain and the DTE is
+                            -- told nothing, which is the point of it;
+                            -- 'report' has already put both in the log.
+                            --
+                            -- This case was missing, and every event
+                            -- here is matched without a catch-all, so
+                            -- the first retrain on a live call killed
+                            -- the modem outright: dialled a board that
+                            -- connected at 9600 trellis and asked for a
+                            -- retrain a second later, and the process
+                            -- died of a non-exhaustive pattern with the
+                            -- call still up.  Nothing in the suite could
+                            -- see it -- the tests drive Modec.Modem and
+                            -- never this.
+                            EvRetrain _ -> return ()
+                            EvRate _ -> return ()
                     modifyIORef' blockRef (+ 1)
                     done <- readIORef doneRef
                     unless done loop
