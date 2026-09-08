@@ -163,6 +163,7 @@ data V32Start = V32Start
   , vsFar     :: !Direction      -- ^ the far end's scrambler
   , vsRevAt   :: [(Double, Int)] -- ^ reversals seen in this block
   , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
+  , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
   }
@@ -341,7 +342,7 @@ v32StartInit fs dir offer = V32Start
   , vsTurns = [], vsPrevSym = (0, 0)
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACRun = 0 }
+  , vsACRun = 0, vs1800Run = 0 }
   where
     role = case dir of { Calling -> Calling'; Answering -> Answering' }
     p = v32Params fs
@@ -386,11 +387,15 @@ observe st rx = st
   -- end then answered by restarting for real, and the two of them went
   -- round Figure 4 together until the call timed out.
   , vsACRun = if acNow then vsACRun st + 1 else 0
+  -- 5.4.2 wants 1800 Hz "detected ... for 64 symbol periods" before the
+  -- answering modem acts on it, which is a duration and not an instant.
+  , vs1800Run = if tone1800 then vs1800Run st + VS.length rx else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
   , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsDescr = descr', vsBits = bits'
   , vsQuiet = quiet' }
   where
     acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
+    tone1800 = revPower r18 > 1e-5 && revLevel r18 > 0.45
     (r18, e18) = revBlock rx (vsRev1800 st)
     (r6, e6) = revBlock rx (vsRev600 st)
     (r30, e30) = revBlock rx (vsRev3000 st)
@@ -720,8 +725,10 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       OHoldS
         | vsSince s >= maybe (sym 256) id (vsTrip s) ->
             let (ps, sc, q) = conditioningRun dir 1400
+                -- 5.4.1: R2 excludes anything absent from R1
+                r2 = maybe (vsOffer s) (restrictRates (vsOffer s)) (vsPeer s)
             in enter OCond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
-                             , vsSrc = TxCoded (cycle (rateSeqBits (vsOffer s)))
+                             , vsSrc = TxCoded (cycle (rateSeqBits r2))
                              , vsAdapt = True }
         | otherwise -> s
       OCond
@@ -778,7 +785,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | vsSince s >= sym 7200 -> enter AAC s { vsSrc = TxAltAC True }
         | otherwise -> s { vsSrc = TxTone2100 }
       AAC
-        | heard 1800 > 0.45 && vsSince s >= sym 128 ->
+        | vs1800Run s >= sym 64 && vsSince s >= sym 128 ->
             enter ACA (rearm s) { vsMark = Just (vsN s), vsSrc = TxAltAC False }
         | tooLong 60000 s -> enter (V32Fail "no calling modem") s
         | otherwise -> s

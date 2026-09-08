@@ -82,6 +82,7 @@ module Modec.V32
   , decodeESeq
   , rateSeqCleardown
   , bestCommonRate
+  , restrictRates
   , ratesBelow
   , chosenRate
   ) where
@@ -760,6 +761,24 @@ ratesBelow r offer =
       V32R9600 -> c { rsCan9600 = False }
       V32R7200 -> c { rsCan7200 = False }
       V32R4800 -> c { rsCan4800 = False }
+
+-- | Our offer, narrowed to what the far end said it could do.
+--
+-- 5.4.1: "R2 shall exclude rates and operational modes not appearing in
+-- the previously received rate signal R1."  Sending the whole menu
+-- regardless is a plain violation, and it stopped mattering only
+-- because what we offered happened to be a subset of what the boards
+-- did; with 12000 and 14400 in the offer it no longer is.
+--
+-- B4 and B8 go the same way, which is Note 1 doing its work: a far end
+-- that did not announce V.32bis must not be answered as though it had.
+restrictRates :: RateSeq -> RateSeq -> RateSeq
+restrictRates ours theirs = RateSeq
+  { rsCan2400 = both rsCan2400, rsCan4800 = both rsCan4800
+  , rsCan9600 = both rsCan9600, rsTrellis = both rsTrellis
+  , rsCan7200 = both rsCan7200, rsCan12000 = both rsCan12000
+  , rsCan14400 = both rsCan14400 }
+  where both f = f ours && f theirs
 
 -- | The best rate both ends can run, given what the far end offered and
 -- what we can do.  §5.4.1: a reply must exclude anything absent from the
