@@ -292,7 +292,14 @@ runModem o = do
                 erle = maybe "" (printf ", return loss %.1f dB") (modemEchoErle st')
                 line = intercalate ", " (filter (not . null) [evm, dropComma delay, dropComma erle])
                 dropComma x = case x of { (',' : ' ' : r) -> r; _ -> x }
-            when (k `mod` 250 == 249 && not (null line)) $ say ("line: " ++ line)
+            -- Only once there is something to say.  A V.32 call has a
+            -- canceller from the first block, so reporting whenever one
+            -- exists prints "return loss 0.0 dB" every five seconds
+            -- through a handshake that has not started cancelling
+            -- anything.
+            when (k `mod` 250 == 249 && (modemV32Evm st' /= Nothing
+                                         || modemEchoDelay st' /= Nothing)) $
+              say ("line: " ++ line)
 
           report ev = case ev of
             EvConnected st link -> do
