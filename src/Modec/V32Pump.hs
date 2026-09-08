@@ -30,6 +30,9 @@ module Modec.V32Pump
   , V32Data
   , v32DataInit
   , v32DataFrom
+  , v32DataResume
+  , v32DataRxState
+  , v32DataTxState
   , v32DataRx
   , v32DataTx
   , v32DataEvm
@@ -370,6 +373,28 @@ v32DataInit fs r = V32Data
 -- has already brought into lock.
 v32DataFrom :: QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
 v32DataFrom rx tx code st = st { vdRx = rx, vdTx = tx, vdCode = code }
+
+-- | The receiver and transmitter a retrain has to carry back into the
+-- start-up, so the symbol clock and carrier phase do not restart in the
+-- middle of a signal.
+v32DataRxState :: V32Data -> QamRxState
+v32DataRxState = vdRx
+
+v32DataTxState :: V32Data -> QamTxState
+v32DataTxState = vdTx
+
+-- | Come out of a retrain, possibly at a different rate.
+--
+-- A fresh pump for the rate that was agreed, carrying the receiver,
+-- transmitter and scrambler the start-up finished with, and the only
+-- thing worth keeping from the old one: 'vdBits', which is data the
+-- terminal handed over and the line has not carried yet.  Everything
+-- else was counted in the old rate's symbols and would be nonsense in
+-- the new one -- the traceback, the symbols held for it, and the part
+-- of a symbol the coder had left over.
+v32DataResume :: Double -> V32Rate -> QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
+v32DataResume fs r rx tx code old =
+  (v32DataInit fs r) { vdRx = rx, vdTx = tx, vdCode = code, vdBits = vdBits old }
 
 v32DataEvm :: V32Data -> Double
 v32DataEvm = qamRxEvm . vdRx

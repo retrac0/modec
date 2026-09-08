@@ -45,7 +45,7 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, v32Rates, v32bisRates)
-import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataRx, v32DataTx, v32DataEvm, v32DataPower)
+import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Hdlc
@@ -66,6 +66,7 @@ data ModemConfig = ModemConfig
   , mcEcho      :: EchoConfig    -- ^ echo canceller tuning, for the modes that need one
   , mcMaxEvmV32 :: Double  -- ^ stop passing bytes when the decision error exceeds this much of the constellation's own margin
   , mcMinPowerV32 :: Double  -- ^ below this received power the V.32 carrier is gone
+  , mcRetrainMax :: Int    -- ^ how many retrains one call may spend before giving up
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -91,6 +92,9 @@ defaultModemConfig fs role modes = ModemConfig
   -- silent line at 1e-9.  Anywhere between is a threshold; this is two
   -- orders below the one and far above the other.
   , mcMinPowerV32 = 1e-5
+  -- A line bad enough to want a fifth retrain is not going to be fixed
+  -- by one; past this the call is over.
+  , mcRetrainMax = 4
   , mcMaxEvm = 1.0
   }
 
@@ -100,6 +104,8 @@ data ModemEvent
   | EvFailed String
   | EvV8Menu V8Menu        -- ^ the far end's V.8 capabilities
   | EvMnp MnpEvent         -- ^ the error-correcting protocol's state
+  | EvRetrain RetrainCause -- ^ 5.5: the link is being trained again
+  | EvRate V32Rate         -- ^ a retrain settled on a different rate
   deriving (Eq, Show)
 
 -- | Streaming transmitter: phase-continuous tones, FSK with a byte
@@ -207,7 +213,32 @@ data Mode
   | DataFsk Standard FskSpec FskSpec (Stage Signal Discriminated) (Stage Discriminated [Word8])
   | DataV22 V22Channel V22Channel Rate AsyncRx Bool   -- ^ the Bool: framer armed (idle mark seen after lock)
   | DataV32 Role V32Rate V32Data AsyncRx Bool
+  -- | 5.5: back in Figure 4 mid-call, with everything the session needs
+  -- held aside until it comes out the other side.
+  | Retrain32 V32Start Held
   | Finished
+
+-- | What a retrain has to give back when it finishes.  The call has not
+-- ended -- the terminal must not see it end -- so the framer, the pump
+-- and the count of how many of these we have already spent all wait
+-- here.  The pump is kept for the bits it is holding: 'vdBits' is data
+-- the terminal handed over that has not reached the line yet, and
+-- dropping it would lose bytes the far end never had a chance to see.
+data Held = Held
+  { hdRole   :: !Role
+  , hdRate   :: !V32Rate
+  , hdPump   :: !V32Data
+  , hdFramer :: !AsyncRx
+  , hdCount  :: !Int
+  , hdWhy    :: !RetrainCause
+  }
+
+-- | Why a retrain started, for tracing and for deciding when to stop
+-- trying.
+data RetrainCause
+  = RetrainLocal      -- ^ our receiver stopped being able to read the line
+  | RetrainFarEnd     -- ^ the far end started the signal that opens one
+  deriving (Eq, Show)
 
 data ModemState = ModemState
   { msMode    :: Mode
@@ -221,7 +252,10 @@ data ModemState = ModemState
   , msV8      :: Maybe (FskSpec, Stage Signal Discriminated, Stage Discriminated [Bool], V8Rx)
   , msAnsam   :: Ansam
   , msRxRate  :: Rate        -- ^ decision rate currently set on that receiver
-  , msEcho    :: Maybe EchoState  -- ^ echo canceller, for the modes that share a band
+  , msEcho    :: Maybe EchoState
+  , msListen  :: Maybe V32Listen  -- ^ watching for the far end to retrain
+  , msBad     :: !Int      -- ^ consecutive blocks the V.32 receiver could not be trusted
+  , msRetrains :: !Int     -- ^ how many retrains this call has spent  -- ^ echo canceller, for the modes that share a band
   , msZeros   :: !Int        -- ^ consecutive descrambled zeros seen (for the handshake)
   , msLost    :: !Double     -- ^ seconds of missing carrier in data mode
   , msSettled :: !Double     -- ^ seconds spent in data mode so far
@@ -250,10 +284,11 @@ modemInit cfg
     listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
              (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing Nothing (ansamInit fs) R1200
-             echo0 0 0 0 HsBusy [] Nothing
+             echo0 listen0 0 0 0 0 0 HsBusy [] Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
     echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
+    listen0 = if any isV32 (hcModes hs) then Just (v32ListenInit fs) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -390,6 +425,7 @@ modemPhase st = case msMode st of
   DataFsk s _ _ _ _ -> "Data " ++ show s
   DataV22 _ _ r _ _ -> "Data V22 " ++ show r
   DataV32 _ r _ _ _ -> "Data V32 " ++ show r
+  Retrain32 s32 h -> "Retraining V32 from " ++ show (hdRate h) ++ ", " ++ show (v32Phase s32)
   Finished -> "Finished"
 
 -- | The echo canceller's return loss enhancement, for tracing: how much
@@ -428,6 +464,10 @@ modemConnected st = case msMode st of
   DataFsk {} -> True
   DataV22 {} -> True
   DataV32 {} -> True
+  -- A retrain is not a disconnection.  The call is up, the terminal has
+  -- not been told anything, and saying otherwise here would have the
+  -- Hayes layer report NO CARRIER in the middle of 5.5 working.
+  Retrain32 {} -> True
   _ -> False
 
 -- | Process one block of received audio and newly queued bytes.  Returns
@@ -617,10 +657,60 @@ modemStep cfg st0 rxBlock newBytes =
             | otherwise =
                 let (f', bs) = if armed && trust then asyncRxBits framer gotBits else (framer, [])
                 in (f', LineOctets bs)
-          st1 = st { msEcho = echo', msZeros = onesRun' }
-      in finishDataWith (v32Audio role rate pump') st1
-           (DataV32 role rate pump' framer' armed') (V32Link role rate)
-           (v32DataPower pump' > mcMinPowerV32 cfg) line
+          listen' = fmap (v32ListenBlock rxBlock) (msListen st)
+          present = v32DataPower pump' > mcMinPowerV32 cfg
+          -- How long the receiver has been unable to read a line that is
+          -- still carrying something.  Not the same question as the
+          -- carrier watchdog's: that one asks whether the far end is
+          -- still there, this one whether we can still understand it.
+          bad' = if present && not trust then msBad st + 1 else 0
+          held = Held role rate pump' framer' (msRetrains st) RetrainLocal
+          -- 5.5.  Either end may ask, and the far end asking is a tone
+          -- where a data signal never puts one.  Ours is a receiver that
+          -- has spent a second unable to read a line that is plainly
+          -- still live -- long enough that it is the link and not a
+          -- burst, and short enough to be worth doing something about.
+          wantRetrain
+            | maybe False (v32ListenRetrain (dirOfRole role)) listen' = Just RetrainFarEnd
+            | bad' >= round (1.0 / blockSecs) = Just RetrainLocal
+            | otherwise = Nothing
+          blockSecs = fromIntegral (max 1 n) / fs
+          st1 = st { msEcho = echo', msZeros = onesRun', msListen = listen', msBad = bad' }
+      in case wantRetrain of
+           Just why | hdCount held < mcRetrainMax cfg ->
+             let s32 = v32RetrainInit fs (dirOfRole role) (v32Offer cfg)
+                         (why == RetrainLocal)
+                         (v32DataRxState pump') (v32DataTxState pump') Nothing
+                 (txSt, audio) = transmit TxSilence st1
+             in ( st1 { msMode = Retrain32 s32 held { hdWhy = why, hdCount = hdCount held + 1 }
+                      , msTx = txSt, msBad = 0, msRetrains = msRetrains st + 1 }
+                , audio, [], [EvRetrain why] )
+           _ -> finishDataWith (v32Audio role rate pump') st1
+                  (DataV32 role rate pump' framer' armed') (V32Link role rate)
+                  present line
+    -- 5.5, running.  Figure 4 all over again, with the session held
+    -- aside: the terminal is not told, MNP is not stepped, and the
+    -- carrier watchdog does not run -- the start-up contains silences
+    -- longer than hcDrop by design, so a watchdog left on would drop
+    -- every retrain it was there to make possible.
+    Retrain32 s32 held ->
+      let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
+          (s32', audio, status) = v32StartStep s32 rxClean
+          st1 = st { msEcho = pushEcho audio echo' }
+      in case status of
+           V32Busy -> (st1 { msMode = Retrain32 s32' held }, audio, [], [])
+           V32Connected r ->
+             let role = hdRole held
+                 link = V32Link role r
+                 pump = v32DataResume fs r (v32StartRx s32') (v32StartTx s32')
+                          (v32StartCoder s32') (hdPump held)
+                 st2 = st1 { msMode = DataV32 role r pump (hdFramer held) False
+                           , msStatus = HsConnected (if v32Bis s32' then V32bis else V32) link
+                           , msSettled = 0, msBad = 0 }
+             in (st2, audio, [], [EvRate r | r /= hdRate held])
+           V32Failed why ->
+             (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }
+             , audio, [], [EvFailed why, EvDropped])
     DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
             Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)

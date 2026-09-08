@@ -33,6 +33,11 @@ module Modec.V32Start
   , V32Start
   , v32StartInit
   , v32StartAfterAnswerTone
+  , v32RetrainInit
+  , V32Listen
+  , v32ListenInit
+  , v32ListenBlock
+  , v32ListenRetrain
   , v32StartStep
   , v32Phase
   , v32Elapsed
@@ -226,6 +231,71 @@ v32Bis s = rateSeqV32bis (vsOffer s) && maybe False rateSeqV32bis (vsPeer s)
 -- sequence, and §5.4.2's \"after the Recommendation V.25 answer
 -- sequence\" is already satisfied.  Sending a second one would only
 -- confuse a far end that has finished listening for it.
+-- | Back into Figure 4 from a call already in progress, per 5.5.
+--
+-- A retrain needs no phases of its own, because the start-up already
+-- has both of the entry points one wants.  A calling modem asking for
+-- one transmits AA -- steady 1800 Hz -- and the answering modem's AAC
+-- is written to react to exactly that; an answering modem asking
+-- transmits its alternating AC at 600 and 3000, and the calling modem's
+-- OListen is written to react to that.  So the whole of a retrain is
+-- putting both ends back into the machine at the right phase and
+-- letting it run: TRN retrains both equalisers, R1 R2 R3 re-agree the
+-- rate for nothing, and E and B1 hand back to the data pump through the
+-- same code the first handover uses.
+--
+-- The receiver and transmitter carry over rather than restarting, for
+-- the reason 'v32DataFrom' carries them the other way: the symbol clock
+-- and the carrier phase are still good even when the equaliser is not,
+-- and restarting them mid-signal costs more than it saves.  The round
+-- trip carries over too, as a fallback for the timers, and is measured
+-- again anyway.
+v32RetrainInit :: Double -> Direction -> RateSeq -> Bool
+               -> QamRxState -> QamTxState -> Maybe Int -> V32Start
+v32RetrainInit fs dir offer initiating rx tx trip =
+  (v32StartInit fs dir offer)
+    { vsPhase = phase, vsSrc = src, vsRx = rx, vsTx = tx, vsTrip = trip }
+  where
+    (phase, src) = case (dir, initiating) of
+      -- AAC both sends the alternating pair and listens for the
+      -- caller's 1800, so the answering modem enters there either way
+      (Answering, _) -> (AAC, TxAltAC True)
+      (Calling, True) -> (OAA, TxState StA)
+      (Calling, False) -> (OListen, TxNothing)
+
+-- | Listening for the far end to go back to training, from data mode.
+--
+-- This runs on the raw block and owes nothing to the data receiver,
+-- which is the point: the reason to want a retrain is that the receiver
+-- has stopped working, so anything that noticed only through the
+-- receiver would go deaf exactly when it was needed.  'RevTracker'
+-- measures tone energy on the audio itself.
+data V32Listen = V32Listen
+  { vlRev1800 :: !RevTracker
+  , vlRev600  :: !RevTracker
+  , vlRev3000 :: !RevTracker
+  }
+
+v32ListenInit :: Double -> V32Listen
+v32ListenInit fs = V32Listen (revInit fs 1800) (revInit fs 600) (revInit fs 3000)
+
+v32ListenBlock :: Signal -> V32Listen -> V32Listen
+v32ListenBlock rx l = V32Listen
+  (fst (revBlock rx (vlRev1800 l)))
+  (fst (revBlock rx (vlRev600 l)))
+  (fst (revBlock rx (vlRev3000 l)))
+
+-- | Whether the far end has started the signal that opens a retrain:
+-- AA at 1800 Hz from a calling modem, the alternating pair at 600 and
+-- 3000 from an answering one.  Neither is anything a data signal
+-- produces -- both directions are spread across the band -- so a level
+-- this high at one frequency is a modem that has stopped sending data.
+v32ListenRetrain :: Direction -> V32Listen -> Bool
+v32ListenRetrain dir l = case dir of
+  -- we are the caller, so the far end is the answering modem
+  Calling -> revLevel (vlRev600 l) > 0.45 || revLevel (vlRev3000 l) > 0.45
+  Answering -> revLevel (vlRev1800 l) > 0.45
+
 v32StartAfterAnswerTone :: Double -> Direction -> RateSeq -> V32Start
 v32StartAfterAnswerTone fs dir offer =
   let st = v32StartInit fs dir offer

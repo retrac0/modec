@@ -4,6 +4,7 @@ module Suite.Link (handshakeTests, modemTests, telnetTests, v8Tests) where
 
 import qualified Data.ByteString as B
 import Control.Monad (forM_)
+import Data.List (isInfixOf)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -190,6 +191,22 @@ modemTests = testGroup "full modem duplex" $
                   ++ show (length rxA') ++ " the other, which should be almost none"
                   ++ " until the receiver is good enough to carry it")
         (length rxO' < 8 && length rxA' < 8)
+  , testCase "a V.32 call wrecked mid-session retrains and carries on" $ do
+      -- 5.5.  Half a second of noise loud enough that no receiver could
+      -- read through it, on one direction only, and then the line is
+      -- fine again.  Before this there was no way out of data mode
+      -- except the end of the call: a link that went bad stayed bad and
+      -- went on handing up whatever it could make of the noise.
+      let cfg role = defaultModemConfig 8000 role [V32]
+          (rxO, rxA, evO, evA) =
+            modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA 14 14.5
+      assertBool ("originate events " ++ show evO)
+        (any (\e -> case e of EvRetrain _ -> True; _ -> False) (evO ++ evA))
+      -- and the session is still there afterwards: the second text is
+      -- sent only once the line has been clean again for three seconds,
+      -- so it can only arrive through a link that put itself back
+      assertBool ("answer heard " ++ show rxA) (textO `isInfixOf` rxA)
+      assertBool ("originate heard " ++ show rxO) (textA `isInfixOf` rxO)
   , testCase "a V.32 call notices when the far end stops" $ do
       -- It could not.  The carrier watchdog was handed "the decision
       -- error is under 1e3", which is an EWMA of a squared error on a

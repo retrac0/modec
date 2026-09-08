@@ -1,6 +1,6 @@
 -- | Calls that never touch a line: two state machines connected by
 -- audio, in blocks, through the channel simulator.
-module Harness (Side (..), simulateCall, callerAgainstU11, runLength, modemDuplex, grace, modemDuplexCut, modemDuplexFor, modemDuplexEcho, modemDuplexStream) where
+module Harness (Side (..), simulateCall, callerAgainstU11, runLength, modemDuplex, grace, modemDuplexCut, modemDuplexFor, modemDuplexDisturb, modemDuplexEcho, modemDuplexStream) where
 
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
@@ -155,6 +155,49 @@ modemDuplexFor stop cfgO cfgA snr textO textA maxT cutAt =
                           Nothing -> if full then Just t else Nothing
           in go (t + fromIntegral blk / fs) so' sa' audioA audioO sentO' sentA' fullAt'
                 rxO' rxA' (reverse eO ++ evO) (reverse eA ++ evA)
+      where out = (reverse rxO, reverse rxA, reverse evO, reverse evA)
+
+-- | A call that is wrecked for a while and has to put itself back
+-- together: 5.5's retrain, provoked.
+--
+-- Text goes both ways twice, once before the disturbance and once after,
+-- so the test can tell a link that survived from one that merely
+-- reported something.  The disturbance is noise loud enough that no
+-- receiver could read through it, applied to one direction only, which
+-- is what a burst of impulse noise or a route change looks like.
+modemDuplexDisturb :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8]
+                   -> Double -> Double
+                   -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
+modemDuplexDisturb cfgO cfgA snr first second from until_ =
+  go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0)
+     False False False False [] [] [] []
+  where
+    fs = mcRate cfgO
+    blk = 160 :: Int
+    maxT = 90
+    impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
+    wreck t x
+      | t >= from && t < until_ = addNoise (round (t * 977)) 0.5 x
+      | otherwise = x
+    go t so sa fromA fromO s1o s1a s2o s2a rxO rxA evO evA
+      | t >= maxT = out
+      | otherwise =
+          let up o = modemConnected o
+              -- the first text as soon as we are up, the second once the
+              -- disturbance is over and done with
+              qO | up so, not s1o = first
+                 | up so, s1o, not s2o, t >= until_ + 3 = second
+                 | otherwise = []
+              qA | up sa, not s1a = first
+                 | up sa, s1a, not s2a, t >= until_ + 3 = second
+                 | otherwise = []
+              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t fromA) qO
+              (sa', audioA, bytesA, eA) = modemStep cfgA sa (wreck t (impair 2 t fromO)) qA
+          in go (t + fromIntegral blk / fs) so' sa' audioA audioO
+                (s1o || not (null qO)) (s1a || not (null qA))
+                (s2o || (s1o && not (null qO))) (s2a || (s1a && not (null qA)))
+                (reverse bytesO ++ rxO) (reverse bytesA ++ rxA)
+                (reverse eO ++ evO) (reverse eA ++ evA)
       where out = (reverse rxO, reverse rxA, reverse evO, reverse evA)
 
 -- | As 'modemDuplex', but each side also hears its own transmit coming
