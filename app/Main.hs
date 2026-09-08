@@ -59,6 +59,7 @@ data ReplayOpts = ReplayOpts
   , roSeconds :: Maybe Double
   , roLine    :: Bool
   , roImpair  :: [String]
+  , roChannel :: Maybe String
   , roMint    :: Maybe String
   , roDir     :: FilePath
   , roPath    :: FilePath
@@ -116,7 +117,9 @@ cmdP = hsubparser
       <*> optional (option auto (long "seconds" <> metavar "S" <> help "stop after this much of the recording"))
       <*> switch (long "line" <> help "report the receiver's decision error and symbol timing twice a second")
       <*> many (strOption (long "impair" <> metavar "K=V"
-             <> help "degrade the recording first: snr, freq, rate, dropout, echo, clip, hum, jitter, slips, seed. Repeatable"))
+             <> help "degrade the recording first, on top of --channel. Line: snr, freq, rate, gain, dc, band, clip, hum, seed. Analogue: softclip, harm2, harm3, sing, singgain, wobble, phasejit. Time: jitter, slips, wow, flutter. Digital span: ulaw, alaw, biterr, loss, burst, stuck. Transient: impulse, hits. Repeatable"))
+      <*> optional (strOption (long "channel" <> metavar "NAME"
+             <> help "start from a named channel rather than an ideal one: ideal, telephone, voip, long-loop, handset, tape, noisy"))
       <*> optional (strOption (long "mint" <> metavar "NAME"
              <> help "write NAME.wav (trimmed to --seconds), NAME.txt (this decode) and NAME.call into the fixture directory"))
       <*> strOption (long "fixture-dir" <> value "test/fixtures/live" <> showDefault <> metavar "DIR")
@@ -400,7 +403,7 @@ runReplay ro = do
       trimmed = case roSeconds ro of
         Nothing -> wavSamples w
         Just s -> VS.take (round (s * fs)) (wavSamples w)
-      x = Ch.applyChannel fs (impairments (roImpair ro)) trimmed
+      x = Ch.applyChannel fs (impairments (roChannel ro) (roImpair ro)) trimmed
       rc = (defaultReplayConfig cfg)
              { rcEvery = if roLine ro then Just 0.5 else Nothing }
       r = replay rc x
@@ -423,26 +426,67 @@ describeEvent e = case e of
   EvV8Menu _ -> "V.8 menu"
   EvMnp m -> "MNP " ++ show m
 
--- | The channel simulator, driven from repeated @--impair K=V@ options,
--- so a fixture can be asked what it survives without leaving the file.
-impairments :: [String] -> Ch.Channel
-impairments = foldl one Ch.idealChannel
+-- | The channel simulator, driven from a named profile and repeated
+-- @--impair K=V@ options, so a fixture can be asked what it survives
+-- without leaving the file.
+--
+-- An unknown key is an error rather than a shrug.  It used to be
+-- ignored silently, which meant a misspelt sweep reported the numbers
+-- for an unimpaired line and looked like very good news.
+impairments :: Maybe String -> [String] -> Ch.Channel
+impairments name = foldl one base
   where
+    base = case name of
+      Nothing -> Ch.idealChannel
+      Just n -> case Ch.profile n of
+        Just c -> c
+        Nothing -> error ("no such channel: " ++ n)
     one ch kv = case break (== '=') kv of
       (k, '=' : v) -> set ch k (read v :: Double)
-      _ -> ch
+      _ -> error ("--impair wants KEY=VALUE, got " ++ show kv)
     set ch k val = case k of
+      -- the line
       "snr"     -> ch { Ch.chSnrDb = Just val }
       "freq"    -> ch { Ch.chFreqOffsetHz = val }
       "rate"    -> ch { Ch.chRateOffset = val }
-      "dropout" -> ch { Ch.chDropout = Just (0.02, val) }
-      "echo"    -> ch { Ch.chEcho = Just (0.02, val) }
+      "gain"    -> ch { Ch.chGain = fromDb val }
+      "dc"      -> ch { Ch.chDcOffset = val }
+      "band"    -> ch { Ch.chBandpass = Just (val, 3400) }
       "clip"    -> ch { Ch.chClip = Just val }
       "hum"     -> ch { Ch.chHum = Just (50, val) }
+      "seed"    -> ch { Ch.chSeed = round val }
+      "dropout" -> ch { Ch.chDropout = Just (0.02, val) }
+      "echo"    -> ch { Ch.chEcho = Just (0.02, val) }
+      -- analogue
+      "softclip" -> ch { Ch.chNonlin = Just (Ch.SoftClip val) }
+      "harm2"   -> ch { Ch.chNonlin = Just (Ch.Polynomial val (a3Of ch)) }
+      "harm3"   -> ch { Ch.chNonlin = Just (Ch.Polynomial (a2Of ch) val) }
+      "sing"    -> ch { Ch.chSing = Just (val, snd (singOf ch)) }
+      "wobble"  -> ch { Ch.chWobble = Just (val, 4) }
+      "phasejit" -> ch { Ch.chPhaseJitter = Just (val, 60) }
+      "singgain" -> ch { Ch.chSing = Just (fst (singOf ch), val) }
+      -- time
       "jitter"  -> ch { Ch.chJitter = Ch.WalkJitter val (4 * val) }
       "slips"   -> ch { Ch.chJitter = Ch.Slips 1.0 val }
-      "seed"    -> ch { Ch.chSeed = round val }
-      _         -> ch
+      "wow"     -> ch { Ch.chJitter = Ch.WowFlutter [(val / 100, 1)] }
+      "flutter" -> ch { Ch.chJitter = Ch.WowFlutter [(val / 100, 25)] }
+      -- the digital span
+      "ulaw"    -> ch { Ch.chCodec = if val /= 0 then Just Ch.Ulaw else Nothing }
+      "alaw"    -> ch { Ch.chCodec = if val /= 0 then Just Ch.Alaw else Nothing }
+      "biterr"  -> ch { Ch.chBitError = Just val }
+      "loss"    -> ch { Ch.chLoss = Just (Ch.Loss 0.02 (val * 2) 0.5 Ch.RepeatFrame) }
+      "burst"   -> ch { Ch.chLoss = Just (lossOf ch) { Ch.lsToGood = 1 / max 1 val } }
+      "stuck"   -> ch { Ch.chStuck = Just (Ch.Stuck val 0.02 0xFF) }
+      -- transient
+      "impulse" -> ch { Ch.chImpulse = Just (Ch.Impulse val 0.3 1400 0.002) }
+      "hits"    -> ch { Ch.chHits = Just (Ch.Hits val 0.006 (-6)) }
+      _         -> error ("no such impairment: " ++ k)
+    a2Of ch = case Ch.chNonlin ch of { Just (Ch.Polynomial a _) -> a; _ -> 0 }
+    a3Of ch = case Ch.chNonlin ch of { Just (Ch.Polynomial _ a) -> a; _ -> 0 }
+    singOf ch = case Ch.chSing ch of { Just p -> p; Nothing -> (0.004, 0.7) }
+    lossOf ch = case Ch.chLoss ch of
+      Just l -> l
+      Nothing -> Ch.Loss 0.02 0.0005 0.5 Ch.RepeatFrame
 
 -- | Write the three files a corpus fixture is made of: the recording
 -- trimmed to what the test needs, this decode as the reference, and a

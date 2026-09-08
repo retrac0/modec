@@ -1,6 +1,6 @@
 -- | V.32 and V.32bis: the coding layer, the data pump, the start-up of
 -- Figure 4, and the echo canceller that makes it possible.
-module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests) where
+module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests) where
 
 import Control.Monad (forM_, replicateM)
 import Data.List (nub)
@@ -439,15 +439,6 @@ v32PumpTests = testGroup "V.32 data pump"
     -- 12000 and 14400 pack 64 and 128 points into the same band, so they
     -- want a quieter line than anything else here does
     top = common ++ [ delay1, fastClock ]
-
--- | An echo path with several taps at fractional delays -- what a
--- hybrid actually returns.  Modec.Channel's chEcho is a single real tap
--- at a whole number of samples, which a linear FIR cancels exactly; a
--- canceller measured against that reports a number it will not repeat on
--- a telephone line.
-echoPath :: [(Double, Double)] -> Signal -> Signal
-echoPath taps x = VS.generate (VS.length x) $ \i ->
-  sum [ g * sampleAt x (fromIntegral i - d) | (d, g) <- taps ]
 
 -- Run the canceller the way Modec.Modem will: cancel the received block
 -- first, then remember the block we transmitted.  A modem produces its

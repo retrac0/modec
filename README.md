@@ -48,11 +48,31 @@ the limits.
 
 ## What works
 
-Measured through the channel simulator (`Modec.Channel`: telephone
-band-pass, AWGN by SNR, clock and carrier offset, sinusoidal /
-random-walk / slip jitter, dropouts, echo, clipping, hum, level, all
-deterministic from a seed). Error free means no byte in the payload
-wrong, not a bit error rate.
+Measured through the channel simulator (`Modec.Channel`, all of it
+deterministic from a seed):
+
+- **the line** -- telephone band-pass, AWGN by SNR, level, DC, group
+  delay, clock and carrier offset, hum, clipping
+- **the loop and the hybrid** -- soft clip and a polynomial nonlinearity,
+  so harmonics and intermodulation; echo as one tap, as several at
+  fractional delays, or round a feedback loop, which is how a circuit
+  near its singing margin rings
+- **the carrier system** -- carrier wobble, and phase jitter in degrees
+  peak to peak at power-line rates
+- **the medium** -- wow, flutter and scrape, in percent speed deviation
+- **the digital span** -- G.711 µ-law and A-law, bit errors in the PCM
+  codes, stuck codes, bursty frame loss on a Gilbert-Elliott chain with
+  silence, hold-last or repeat-frame concealment, and frame slips
+- **transients** -- impulse noise arriving Poisson and ringing, gain
+  hits and dropouts
+
+Named profiles bundle these into paths that exist: `voip` (the one every
+recording here came through), `long-loop`, `handset`, `tape`, `noisy`.
+What each impairment does is checked against its own closed form -- the
+harmonics against the polynomial's coefficients, companding against the
+level sweep, the ring-down against the loop gain -- in `cabal test
+--test-options='-p "what the channel does"'`. Error free means no byte
+in the payload wrong, not a bit error rate.
 
 | Mode | Error free through the simulator | Cross-checked against |
 | --- | --- | --- |
@@ -177,6 +197,7 @@ cabal run modec -- detect recording.wav                           # which standa
 cabal run modec -- progress recording.wav                        # dial tone, ringing, busy, congestion, SIT
 cabal run modec -- dtmf recording.wav                            # DTMF digits, with timings
 cabal run modec -- replay --mode v22bis,v22 recording.wav        # the whole modem over a recorded call
+cabal run modec -- replay --mode v22bis,v22 --channel voip --impair impulse=20 recording.wav
 # 5-bit text telephone (TTY/TDD): text in, text out, not bytes
 printf 'HELLO GA SK' | cabal run modec -- encode --tty45 -o tty.wav
 cabal run modec -- decode --tty45 tty.wav                         # --tty50 for the 50 baud line

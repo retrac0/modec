@@ -14,6 +14,12 @@ module Modec.Channel
   , Hits (..)
   , idealChannel
   , telephoneChannel
+  , voipTrunk
+  , longLoop
+  , carbonHandset
+  , tapeArchive
+  , noisySwitched
+  , profile
   , applyChannel
   , mixAt
   , echoPath
@@ -34,6 +40,29 @@ data Jitter
     -- ^ random walk of the delay, clamped
   | Slips { jEverySec :: Double, jSamples :: Double }
     -- ^ jitter-buffer style: the delay toggles by @jSamples@ every @jEverySec@
+  | WowFlutter [(Double, Double)]
+    -- ^ Speed variation, as @(deviation as a fraction, Hz)@ components
+    -- summed: wow below about 6 Hz, flutter above it, scrape higher
+    -- still.  The units are the ones DIN 45507 uses, because this is a
+    -- transport impairment -- a cassette, an answering machine, an
+    -- acoustically coupled recording -- and not something a telephone
+    -- circuit does.  A line's equivalents are 'chFreqOffsetHz' and
+    -- 'chRateOffset', which are separate and stay separate.
+    --
+    -- The delay is the integral of the speed deviation, not the
+    -- deviation itself, so a component of amplitude @A@ at @f@ Hz swings
+    -- the delay by @A*fs\/(2*pi*f)@ samples either way: the same one
+    -- percent is 25 samples at 0.5 Hz and a fifth of a sample at 30 Hz.
+    -- What stays fixed is the frequency deviation, @A@ times the
+    -- carrier, whatever the rate -- one percent is ±18 Hz on V.32's
+    -- 1800 Hz carrier, which is past where a call stops connecting at
+    -- all.  Real cassette wow and flutter is 0.1 to 0.3 percent.
+    --
+    -- 'SineJitter' is this impairment held by the other end: it makes
+    -- the /delay/ sinusoidal rather than its integral, so @SineJitter 3
+    -- 2@ at 8 kHz is 0.47 percent of speed deviation.  Components are
+    -- summed before interpolating rather than cascaded, so that however
+    -- many there are the signal is resampled once.
   deriving (Show)
 
 -- | A memoryless nonlinearity: the same input sample always gives the
@@ -42,14 +71,38 @@ data Jitter
 -- saturating transformer or a carbon microphone does to a signal.
 data Nonlinearity
   = SoftClip Double
-    -- ^ @tanh (d*x) \/ tanh d@, normalised so full scale stays full
-    -- scale.  Odd symmetric, so it makes only odd harmonics: the third,
-    -- the fifth, and nothing at twice the fundamental.
+    -- ^ @tanh (d*x) \/ d@: unity gain for a small signal, saturating at
+    -- @1\/d@ for a large one, which is what a saturating amplifier does.
+    -- Odd symmetric, so it makes only odd harmonics -- the third, the
+    -- fifth, and nothing at twice the fundamental.
+    --
+    -- Normalising by @tanh d@ instead would hold full scale at full
+    -- scale, and would be wrong: its small-signal gain is @d \/ tanh d@,
+    -- which is 3 at a drive of 3 and 5 at a drive of 5.  That is an
+    -- amplifier, not a distortion, and every level-dependent stage
+    -- downstream would quietly be measuring something else.
   | Polynomial Double Double
-    -- ^ @x + a2*x^2 - a3*x^3@.  The second-order term is the one that
-    -- matters on a V.22 call: twice the low channel's 1200 Hz carrier is
-    -- 2400 Hz, which is the high channel's carrier, so an asymmetric
-    -- device puts one direction's energy directly onto the other's.
+    -- ^ @x + a2*x^2 - a3*x^3@, with the mean removed, and @a3@ held at
+    -- or below 1\/3.
+    --
+    -- The second-order term is the one that matters on a V.22 call.
+    -- Twice the low channel's 1200 Hz carrier is 2400 Hz, the high
+    -- channel's carrier; and with both directions on the line the
+    -- second-order /intermodulation/ is worse still, because the
+    -- difference product of 2400 and 1200 lands back on 1200 -- 6 dB
+    -- above the harmonic, and on the originating receiver rather than
+    -- the answering one.
+    --
+    -- Two constraints, both of which bite.  Past @a3 = 1\/3@ the curve
+    -- folds: its slope reaches zero inside the range and the output gets
+    -- /quieter/ as the input grows, which is not a distorting device but
+    -- a broken one, so @a3@ is clamped.  And @a2*x^2@ has a mean of
+    -- @a2*rms^2@, a DC offset a transformer-coupled amplifier would not
+    -- pass, so it is subtracted.
+    --
+    -- For a calibration: a sine of amplitude @A@ comes out with its
+    -- second harmonic at @a2*A\/2@ and its third at @a3*A^2\/4@ relative
+    -- to the fundamental.
   deriving (Show)
 
 -- | How a digital span carries a sample.
@@ -63,6 +116,13 @@ data Codec
 -- arrived.  It matters: a jitter buffer that repeats the last frame
 -- hands a demodulator a plausible carrier with the wrong phase, which
 -- is a different problem from handing it silence.
+-- Worth knowing before writing a test against 'RepeatFrame': at 8 kHz
+-- a 20 ms frame is exactly 160 samples, so repeating one advances any
+-- carrier that is a multiple of 50 Hz by a whole number of cycles.
+-- Every carrier in this project is -- 1070, 1270, 1650, 1800, 2025,
+-- 2100, 2225, 2400 -- so frame repetition introduces no carrier phase
+-- step at all.  The damage is to the data and to symbol timing, and a
+-- test looking for a phase hit will measure exactly zero.
 data Conceal = Silence | HoldLast | RepeatFrame
   deriving (Eq, Show)
 
@@ -125,9 +185,56 @@ data Channel = Channel
   , chDropout      :: !(Maybe (Double, Double))  -- ^ (block seconds, probability a block is zeroed)
   , chClip         :: !(Maybe Double)         -- ^ hard clip level
   , chHum          :: !(Maybe (Double, Double))  -- ^ (Hz, amplitude)
-  , chSnrDb        :: !(Maybe Double)         -- ^ AWGN, full-band SNR relative to the signal at that point
+  , chSnrDb        :: !(Maybe Double)
+    -- ^ AWGN, full-band SNR against the signal /as it arrives at this
+    -- stage/, which is the last one.  So the ratio is what is held
+    -- fixed, not the noise power: a channel that compresses, companded
+    -- or resonant, is quieter by the time the noise is added, and its
+    -- noise is quieter with it.  Two conditions at \"SNR 12 dB\" are
+    -- therefore not the same noise floor unless everything upstream of
+    -- them matches.
     -- * The handset and the loop
   , chNonlin       :: !(Maybe Nonlinearity)
+  , chWobble       :: !(Maybe (Double, Double))
+    -- ^ (peak deviation in Hz, rate in Hz) -- a carrier supply that will
+    -- not sit still, which is 'chFreqOffsetHz' with a wobble on it
+    -- rather than a constant.
+  , chPhaseJitter  :: !(Maybe (Double, Double))
+    -- ^ (degrees peak to peak, Hz) -- phase modulation of the carrier
+    -- at power-line rates, 20 to 300 Hz, which is how the ITU specifies
+    -- it and how a line is measured.  Ten degrees peak to peak is the
+    -- limit for a good circuit; a few degrees is ordinary.
+    --
+    -- Not the same impairment as wow, and not interchangeable with it.
+    -- A delay modulation shifts every component in proportion to its
+    -- frequency; carrier phase jitter shifts every component by the same
+    -- angle.  For a tone the two are indistinguishable, but V.32
+    -- occupies 600 to 3000 Hz, and standing in for one with the other
+    -- would put five times more jitter at the top of that band than at
+    -- the bottom.
+    --
+    -- Sinusoidal phase modulation of @b@ radians peak at @f@ is
+    -- identical to frequency modulation of @b*f@ Hz peak, so this and
+    -- 'chWobble' are one mechanism with two dials: 15 degrees peak to
+    -- peak at 60 Hz is 0.131 rad, which is 7.9 Hz of deviation -- next
+    -- to the 7 Hz of /static/ offset the V.32 tests treat as a hard
+    -- case, which is why a realistic setting is a few degrees.
+  , chSing         :: !(Maybe (Double, Double))
+    -- ^ (round-trip delay in seconds, loop gain) -- a four-wire circuit
+    -- close to its singing margin, where the signal goes round the loop
+    -- through two hybrids and comes back at almost the level it left.
+    -- It rings, which is the point: the response is a comb with peaks
+    -- every 1\/delay Hz and a ring-down of @gain^k@.
+    --
+    -- This, and not a resonator, is how a telephone circuit rings.  A
+    -- single resonant pole pair was the obvious thing to reach for and
+    -- it models nothing here: bridged taps are notches and they are a
+    -- DSL problem anyway, and loading coils are a low-pass ladder that
+    -- 'chBandpass' and 'chDelayDist' already stand in for.  Feedback
+    -- round a loop is the mechanism that is really there.
+    --
+    -- The gain is clamped below 1: at 1 the circuit is not ringing, it
+    -- is oscillating, and the simulation would never return.
   , chEchoTaps     :: ![(Double, Double)]
     -- ^ (delay in samples, linear gain) -- a dispersive hybrid return.
     -- 'chEcho' is one tap at a whole number of samples, which a linear
@@ -153,7 +260,8 @@ idealChannel = Channel
   { chSeed = 1, chGain = 1, chDcOffset = 0, chEcho = Nothing, chBandpass = Nothing, chDelayDist = 0
   , chFreqOffsetHz = 0, chRateOffset = 0, chJitter = NoJitter, chDropout = Nothing
   , chClip = Nothing, chHum = Nothing, chSnrDb = Nothing
-  , chNonlin = Nothing, chEchoTaps = []
+  , chNonlin = Nothing, chWobble = Nothing, chPhaseJitter = Nothing
+  , chSing = Nothing, chEchoTaps = []
   , chCodec = Nothing, chBitError = Nothing, chStuck = Nothing, chLoss = Nothing
   , chSlip = Nothing
   , chImpulse = Nothing, chHits = Nothing }
@@ -161,6 +269,83 @@ idealChannel = Channel
 -- | A plain but realistic analogue line: 300-3400 Hz band, given SNR.
 telephoneChannel :: Double -> Channel
 telephoneChannel snr = idealChannel { chBandpass = Just (300, 3400), chSnrDb = Just snr }
+
+-- | The path every recording in @test\/fixtures\/live@ came through:
+-- G.711 on a voip.ms trunk, a POTS line and an ATA at the far end.
+--
+-- Calibrated rather than guessed.  Take the steadiest tone in a
+-- recording and measure how far it stands above everything else in the
+-- band: the codec-free loopback in @docs\/recordings\/v32@ manages 34 dB,
+-- and real trunk calls manage 21.6 dB (a V.22bis call) and 16.8 dB (a
+-- V.32 one).  Companding alone accounts for about 37 dB, so it is not
+-- the whole story -- the rest is the resampling the capture path does
+-- and the analogue loop at the far end, which is why there is noise
+-- here as well as a codec.
+--
+-- The loss rate is deliberately far below anything that would break a
+-- call.  A 20 ms frame is twelve symbols at V.22's 600 baud and
+-- forty-eight at V.32's 2400, so a lost frame is not recoverable
+-- whatever conceals it; one percent loss takes down every call there
+-- is.  What is interesting at this rate is whether the receiver comes
+-- back, and how fast.
+voipTrunk :: Channel
+voipTrunk = idealChannel
+  { chBandpass = Just (300, 3400)
+  , chCodec = Just Ulaw
+  , chLoss = Just (Loss 0.02 0.0002 0.5 RepeatFrame)
+  , chSnrDb = Just 24
+  }
+
+-- | A long subscriber loop: quiet, band-limited hard, and with the
+-- group delay a loading-coil ladder leaves at the band edges.
+longLoop :: Channel
+longLoop = idealChannel
+  { chBandpass = Just (300, 3000)
+  , chDelayDist = 3
+  , chGain = fromDb (-12)
+  , chSnrDb = Just 26
+  }
+
+-- | A call held in front of a handset rather than wired to a line: a
+-- carbon microphone's asymmetric distortion, a narrow band, and mains
+-- hum picked up on the way.
+carbonHandset :: Channel
+carbonHandset = idealChannel
+  { chNonlin = Just (Polynomial 0.12 0.25)
+  , chBandpass = Just (400, 2800)
+  , chHum = Just (60, 0.02)
+  , chSnrDb = Just 22
+  }
+
+-- | Modem audio recovered from a cassette.  Wow at the capstan's
+-- rotation, flutter above it, and scrape flutter higher still; 0.25
+-- percent unweighted is an ordinary domestic deck, and rather more than
+-- a telephone line ever does.  Not a channel: a medium.
+tapeArchive :: Channel
+tapeArchive = idealChannel
+  { chJitter = WowFlutter [(0.0015, 0.9), (0.001, 6), (0.0005, 33)]
+  , chBandpass = Just (300, 3400)
+  , chSnrDb = Just 32
+  , chDropout = Just (0.02, 0.001)
+  }
+
+-- | A switched connection having a bad day: impulse noise from
+-- switching, transient hits, hum, and a moderate noise floor.
+noisySwitched :: Channel
+noisySwitched = idealChannel
+  { chBandpass = Just (300, 3400)
+  , chImpulse = Just (Impulse 3 0.25 1400 0.002)
+  , chHits = Just (Hits 0.5 0.006 (-4))
+  , chHum = Just (50, 0.01)
+  , chSnrDb = Just 24
+  }
+
+-- | Look a profile up by name, for a command line.
+profile :: String -> Maybe Channel
+profile n = lookup n
+  [ ("ideal", idealChannel), ("telephone", telephoneChannel 25)
+  , ("voip", voipTrunk), ("long-loop", longLoop), ("handset", carbonHandset)
+  , ("tape", tapeArchive), ("noisy", noisySwitched) ]
 
 -- | Add @other@ to @x@ at @levelDb@ relative to the RMS of @x@.
 mixAt :: Double -> Signal -> Signal -> Signal
@@ -177,7 +362,7 @@ mixAt levelDb other x = VS.zipWith (+) x (VS.map (* g) (VS.take (VS.length x) (o
 applyChannel :: Double -> Channel -> Signal -> Signal
 applyChannel fs ch =
     noise . hum . clip . impulse . dropout . hits . slip . span_ . rate . jitter
-      . freqOff . delayDist . bandpass . echo . nonlin . gainDc
+      . wobble . freqOff . delayDist . bandpass . sing . echo . nonlin . gainDc
   where
     -- Seeds are per impairment so that turning one on does not change
     -- what another one does.  2, 3 and 4 belong to the walk jitter, the
@@ -192,9 +377,12 @@ applyChannel fs ch =
       Nothing -> x
       Just (SoftClip d)
         | d <= 0 -> x
-        | otherwise -> let k = tanh d in VS.map (\v -> tanh (d * v) / k) x
-      Just (Polynomial a2 a3) ->
-        VS.map (\v -> v + a2 * v * v - a3 * v * v * v) x
+        | otherwise -> VS.map (\v -> tanh (d * v) / d) x
+      Just (Polynomial a2 a30) ->
+        let a3 = min (1 / 3) a30
+            y = VS.map (\v -> v + a2 * v * v - a3 * v * v * v) x
+            dc = if VS.null y then 0 else VS.sum y / fromIntegral (VS.length y)
+        in VS.map (subtract dc) y
 
     -- One tap at a whole number of samples, several taps at fractional
     -- ones, or both.  Each reflects the signal arriving at the hybrid,
@@ -233,6 +421,16 @@ applyChannel fs ch =
       Slips every s ->
         let per = max 1 (round (every * fs)) :: Int
         in variableDelay (\i -> s * fromIntegral ((i `div` per) `mod` 2)) x
+      WowFlutter comps ->
+        let ms = [ (a * fs / (2 * pi * f), f) | (a, f) <- comps, f > 0, a /= 0 ]
+            -- enough bias to keep the read inside the signal, and clear
+            -- of the interpolator's six-sample reach
+            d0 = 2 * sum (map fst ms) + 6
+        in if null ms then x else
+             VS.generate (VS.length x) $ \i ->
+               let t = fromIntegral i / fs
+                   d = d0 - sum [ m * (1 - cos (2 * pi * f * t)) | (m, f) <- ms ]
+               in sampleAtFast x (fromIntegral i - d)
 
     rate x
       | chRateOffset ch == 0 = x
@@ -257,6 +455,47 @@ applyChannel fs ch =
     noise x = case chSnrDb ch of
       Nothing -> x
       Just snr -> addNoise (seed 4) (rms x / fromDb snr) x
+
+    -- Frequency and phase modulation of the carrier, which are the same
+    -- thing written two ways, so they share one phase and one pass.
+    -- 'frequencyShift' does this with a fixed rate; the oscillator is
+    -- what has to change, not the Hilbert pair it mixes against.
+    --
+    -- The Hilbert is 129 taps at 8 kHz, so the first and last 64 samples
+    -- are computed against a truncated kernel and the unwanted sideband
+    -- is not cancelled there.  Anything measuring instantaneous phase
+    -- has to discard them.
+    wobble x = case (chWobble ch, chPhaseJitter ch) of
+      (Nothing, Nothing) -> x
+      (w, j) ->
+        let n = VS.length x
+            xq = firCentered (firHilbert (2 * round (fs / 125) + 1)) x
+            ph = VS.generate n $ \i ->
+                   let t = fromIntegral i / fs
+                       fm = case w of
+                         Just (dev, rate) | rate > 0 -> (dev / rate) * (1 - cos (2 * pi * rate * t))
+                         _ -> 0
+                       pm = case j of
+                         Just (deg, rate) -> (deg * pi / 360) * sin (2 * pi * rate * t)
+                         _ -> 0
+                   in fm + pm
+        in VS.izipWith (\i v q -> let p = VS.unsafeIndex ph i
+                                  in v * cos p - q * sin p) x xq
+
+    -- A signal that goes round the loop and comes back, over and over.
+    -- 'VS.constructN' is what makes it expressible: each output sample
+    -- can read the ones already written, which is exactly what feedback
+    -- needs and what none of the other stages do.
+    sing x = case chSing ch of
+      Nothing -> x
+      Just (secs, g0) ->
+        let d = max 1 (round (secs * fs)) :: Int
+            g = max (-0.95) (min 0.95 g0)
+            n = VS.length x
+        in VS.constructN n $ \acc ->
+             let i = VS.length acc
+                 back = if i >= d then VS.unsafeIndex acc (i - d) else 0
+             in VS.unsafeIndex x i + g * back
 
     -- The digital span: encode once, damage the codes, decode once.
     -- Working at the code level is the point -- a flipped exponent bit

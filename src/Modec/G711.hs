@@ -6,11 +6,19 @@
 -- step size doubling every segment.  That is the whole point.  A linear
 -- 8-bit quantiser has one step size, so its signal-to-noise ratio falls
 -- a decibel for every decibel the signal drops; a companded one has a
--- step proportional to the signal, so its ratio stays put.  Measured
--- with 'ulawRound' on a 2100 Hz sine: 38.7 dB at full scale and 37.3 dB
--- thirty decibels down, where eight-bit linear gives 49.5 dB and then
--- 18.3 dB.  Companding trades headroom it does not need for dynamic
--- range it does.
+-- step proportional to the signal, so its ratio stays put.
+--
+-- Measured here, sine in and sine out, swept a decibel at a time from
+-- full scale to -40 dBFS at 1004 and 2100 Hz: µ-law stays between
+-- __32.2 and 38.8 dB__ across the whole range and A-law between 31.9
+-- and 39.2, while eight-bit linear runs 49.2, 38.9, 28.5, 18.2, 10.7 dB
+-- at 0, -10, -20, -30 and -40 -- a decibel lost for every decibel down,
+-- exactly as the arithmetic says.  Companding trades headroom it does
+-- not need for dynamic range it does.
+--
+-- The figure is a band rather than a number because it ripples as the
+-- sine's peak crosses a chord boundary; anything asserting a point
+-- value of it will be flaky.
 --
 -- The consequence for a modem is that the quantisation noise is
 -- /signal-correlated/: it tracks the envelope rather than sitting at a
@@ -18,12 +26,23 @@
 -- fixed signal-to-noise ratio, which is all "Modec.Channel"'s @chSnrDb@
 -- can do.
 --
--- Two details worth knowing before using the codes directly.  Both laws
--- store the byte inverted -- µ-law complements every bit, A-law
--- alternates -- so that an idle line, which is all ones or all zeros,
--- carries plenty of transitions for the span to keep timing on.  Which
--- means \"all ones\" is not a loud noise: @0xFF@ in µ-law decodes to
--- exactly zero, while @0x00@ decodes to full-scale negative.
+-- Three details worth knowing before using the codes directly.
+--
+-- Both laws store the byte inverted -- µ-law complements every bit,
+-- A-law alternates -- so that an idle line, which is all ones or all
+-- zeros, carries plenty of transitions for the span to keep timing on.
+-- Which means \"all ones\" is not a loud noise: @0xFF@ in µ-law decodes
+-- to exactly zero, while @0x00@ decodes to full-scale negative.
+--
+-- Neither round trip is gain transparent.  The largest magnitude µ-law
+-- can represent is 32124 and A-law 32256, so a full-scale sine comes
+-- back 0.17 dB or 0.14 dB down.
+--
+-- A-law has no code for zero.  @alawRound 0@ is @+8/32768@, about
+-- -72 dBFS, so an A-law span turns digital silence into a small DC
+-- offset.  µ-law does have a zero, twice over: @0xFF@ and @0x7F@ both
+-- decode to it, which is why exactly one code does not survive a
+-- decode-then-encode round trip.
 --
 -- The reference is the Sun implementation of ITU-T G.711, and the
 -- constants here are its constants.
@@ -75,16 +94,25 @@ ulawBias = 0x84
 ulawClip :: Int
 ulawClip = 32635
 
+-- | Segment ends in the 14-bit domain the encoder works in.
 ulawEnds :: [Int]
-ulawEnds = [0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF]
+ulawEnds = [0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF]
 
+-- | The encoder narrows to 14 bits /before/ taking the magnitude, and
+-- the shift is arithmetic, so a negative sample floors towards minus
+-- infinity and its magnitude rounds up.  That asymmetry is not
+-- something the Recommendation asks for -- it is an artefact of the
+-- reference implementation everyone checks against -- but 381 of the
+-- 65536 inputs encode differently without it, all of them negative, and
+-- being able to diff against @sox@ or spandsp is worth more than the
+-- decibel that symmetric rounding would buy.
 ulawEncode :: Double -> Word8
 ulawEncode x =
-  let p = toPcm x
+  let p = toPcm x `shiftR` 2
       sign = if p < 0 then 0x80 else 0 :: Int
-      mag = min ulawClip (abs p) + ulawBias
+      mag = min (ulawClip `div` 4) (abs p) + (ulawBias `div` 4)
       seg = min 7 (segmentOf ulawEnds mag)
-      man = (mag `shiftR` (seg + 3)) .&. 0x0F
+      man = (mag `shiftR` (seg + 1)) .&. 0x0F
   in fromIntegral (complement (sign .|. (seg `shiftL` 4) .|. man) .&. 0xFF)
 
 ulawDecode :: Word8 -> Double
@@ -117,7 +145,7 @@ alawEncode x =
        then (0x7F `xor` mask) .&. 0xFF
        else let man = if seg < 2 then (mag `shiftR` 1) .&. 0x0F
                                  else (mag `shiftR` seg) .&. 0x0F
-            in ((seg `shiftL` 4) .|. man) `xor` mask .&. 0xFF
+            in (((seg `shiftL` 4) .|. man) `xor` mask) .&. 0xFF
 
 alawDecode :: Word8 -> Double
 alawDecode w =

@@ -32,6 +32,49 @@ sound for these recordings because a live modec already drew out the
 responses in them. What it cannot do is ask how the far end would have
 answered something different.
 
+## What a real call survives
+
+One recorded call -- 2600.network at V.22bis 2400, the fixture at
+`test/fixtures/live/2600-v22bis-2400.wav` -- put back through the
+simulator. It decodes to a 51-byte banner untouched, so anything longer
+than 51 bytes is junk the receiver passed on and anything shorter is
+text it lost.
+
+| | connected | bytes | banner |
+|---|---|---|---|
+| untouched | V.22bis 2400 | 51 | yes |
+| `--impair ulaw=1` | V.22bis 2400 | 51 | yes |
+| `--channel voip` | V.22bis 2400 | 51 | yes |
+| `--impair impulse=8` | V.22bis 2400 | 51 | yes |
+| `--impair impulse=40` | **never connected** | 0 | no |
+| `--impair harm2=0.15` | V.22bis 2400 | 51 | yes |
+| `--impair softclip=4` | V.22bis 2400 | 51 | yes |
+| `--impair wow=0.3` | V.22bis 2400 | 148 | yes |
+| `--impair flutter=0.3` | V.22bis 2400 | 425 | **no** |
+| `--impair biterr=0.001` | V.22bis 2400 | 59 | yes |
+| `--impair sing=0.004 --impair singgain=0.5` | V.22bis 2400 | 89 | yes |
+| `--channel tape` | V.22bis 2400 | 167 | **no** |
+| `--channel noisy` | V.22bis 2400 | 199 | yes |
+
+Three things worth reading off that.
+
+**Re-encoding through µ-law costs nothing**, and neither does the whole
+`voip` profile. That is the right answer and it is the check that the
+profile is honest: a recording put back through a model of the path it
+already came down should not get worse.
+
+**Impulse noise has a cliff.** Eight impulses a second is free and forty
+does not connect at all -- not a degraded connection, no connection. It
+is the sharpest threshold of anything in the simulator, which is why
+impulse noise counts rather than averages on a real line.
+
+**Flutter is worse than wow at the same percentage.** Both are 0.3 % of
+speed and both therefore swing the carrier by the same ±7 Hz; wow does
+it at 1 Hz and the carrier loop follows it, flutter does it at 25 Hz and
+the loop cannot. The call stays up and delivers 425 bytes with the
+banner destroyed -- which is the failure `--max-evm` exists to prevent
+and does not catch here.
+
 ## What the noise sweep found
 
 Similarity to the untouched decode, at full-band SNR:

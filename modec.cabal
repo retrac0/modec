@@ -14,6 +14,7 @@ library
     exposed-modules:  Modec.DSP
                       Modec.Stream
                       Modec.Wav
+                      Modec.G711
                       Modec.FSK
                       Modec.Standards
                       Modec.Channel
@@ -94,6 +95,7 @@ test-suite modec-test
     main-is:          Main.hs
     other-modules:    Corpus
                       Harness
+                      Suite.Channel
                       Suite.Dsp
                       Suite.Fsk
                       Suite.Link

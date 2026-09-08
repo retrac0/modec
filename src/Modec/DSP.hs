@@ -44,6 +44,7 @@ module Modec.DSP
   , wrapTwoPi
     -- * Interpolation and time warping
   , sampleAt
+  , sampleAtFast
   , cubicAt
   , resampleBy
   , variableDelay
@@ -351,6 +352,53 @@ sampleAt x t = go (-5) 0
               u = fromIntegral k - fr
               l = if abs u < a then sinc u * sinc (u / a) else 0
           in go (k + 1) (acc + v * l)
+
+-- | The same interpolation as 'sampleAt', from a table.
+--
+-- 'sampleAt' evaluates twelve Lanczos weights per output sample, and
+-- each one costs two sines: about six hundred nanoseconds a sample,
+-- which is more than the rest of a channel simulation put together.
+-- The weights depend only on the fractional part, so quantise that to
+-- 1\/1024 of a sample and there are only 1024 kernels to have.  Building
+-- them costs a quarter of a millisecond, once, and the interpolation
+-- becomes twelve multiply-adds.
+--
+-- The error that quantisation buys is 1\/1024 of a sample of timing,
+-- which at 2400 Hz is a tenth of a degree of phase -- far below what
+-- any receiver here can see, and far below what Catmull-Rom would cost.
+-- ('cubicAt' is cheaper still, but its response droops 2 dB and its
+-- phase 7 degrees at 2400 Hz; that is harmless at a fixed delay, which
+-- is why the timing loops use it, and not harmless at all under a
+-- delay that moves, because it turns a pure delay modulation into an
+-- amplitude and phase modulation nobody asked for.)
+sampleAtFast :: Signal -> Double -> Double
+sampleAtFast x t = go 0 0
+  where
+    n = VS.length x
+    i0 = floor t :: Int
+    fr = t - fromIntegral i0
+    base = min (delayPhases - 1) (floor (fr * fromIntegral delayPhases)) * 12
+    go !k !acc
+      | k > 11 = acc
+      | otherwise =
+          let i = i0 - 5 + k
+              v = if i < 0 || i >= n then 0 else VS.unsafeIndex x i
+          in go (k + 1) (acc + v * VS.unsafeIndex delayBank (base + k))
+
+delayPhases :: Int
+delayPhases = 1024
+
+-- | 1024 fractional positions of the twelve weights 'sampleAt' uses.
+-- A top-level constant so it is built once for the life of the program
+-- rather than once per call.
+delayBank :: VS.Vector Double
+delayBank = VS.generate (delayPhases * 12) $ \i ->
+  let (ph, k) = i `divMod` 12
+      fr = fromIntegral ph / fromIntegral delayPhases
+      u = fromIntegral (k - 5 :: Int) - fr
+      a = 6
+  in if abs u < a then sinc u * sinc (u / a) else 0
+{-# NOINLINE delayBank #-}
 
 -- | Four-point cubic (Catmull-Rom) interpolation at fractional index
 -- @t@.  Unlike 'sampleAt' this reads without bounds checks, so the
