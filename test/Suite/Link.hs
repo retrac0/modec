@@ -207,6 +207,24 @@ modemTests = testGroup "full modem duplex" $
       -- so it can only arrive through a link that put itself back
       assertBool ("answer heard " ++ show rxA) (textO `isInfixOf` rxA)
       assertBool ("originate heard " ++ show rxO) (textA `isInfixOf` rxO)
+  , testCase "a V.32bis call that keeps breaking falls to a rate it can hold" $ do
+      -- The other half of 5.5: a retrain that goes back in at the rate
+      -- which had just stopped working negotiates its way straight back
+      -- to it.  A modem asking for a retrain therefore narrows its own
+      -- offer on the way in, and a line that keeps breaking walks down
+      -- the rate list instead of hammering the top of it.
+      let cfg role = (defaultModemConfig 8000 role [V32bis])
+                       { mcV32Rates = Just v32bisRates }
+          (_, _, evO, evA) =
+            modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA 14 15
+          started = [ r | EvConnected _ (V32Link _ r) <- evO ++ evA ]
+          ended = [ r | EvRate r <- evO ++ evA ]
+      assertBool ("no rate change in " ++ show (evO ++ evA)) (not (null ended))
+      case (started, ended) of
+        (s : _, e : _) -> assertBool
+          ("started at " ++ show s ++ " and moved to " ++ show e ++ ", which is not lower")
+          (rateBitRate e < rateBitRate s)
+        _ -> assertFailure ("no connection and rate change: " ++ show (evO ++ evA))
   , testCase "a V.32 call notices when the far end stops" $ do
       -- It could not.  The carrier watchdog was handed "the decision
       -- error is under 1e3", which is an EWMA of a squared error on a

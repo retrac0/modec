@@ -44,7 +44,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, v32Rates, v32bisRates)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
@@ -675,10 +675,21 @@ modemStep cfg st0 rxBlock newBytes =
             | bad' >= round (1.0 / blockSecs) = Just RetrainLocal
             | otherwise = Nothing
           blockSecs = fromIntegral (max 1 n) / fs
+          -- A rate change, which is a retrain that narrows what it will
+          -- accept on the way in.  Retraining at the rate that had just
+          -- stopped working negotiates its way straight back to it, and
+          -- a line that cannot hold 14400 will not hold it any better
+          -- for having been asked twice.  So a retrain we asked for
+          -- drops a rate; one the far end asked for does not, because
+          -- it is the far end's judgement of its own receiver and it
+          -- narrows its own offer if it means to.
+          offer' = case wantRetrain of
+            Just RetrainLocal -> ratesBelow rate (v32Offer cfg)
+            _ -> v32Offer cfg
           st1 = st { msEcho = echo', msZeros = onesRun', msListen = listen', msBad = bad' }
       in case wantRetrain of
-           Just why | hdCount held < mcRetrainMax cfg ->
-             let s32 = v32RetrainInit fs (dirOfRole role) (v32Offer cfg)
+           Just why | hdCount held < mcRetrainMax cfg, not (rateSeqCleardown offer') ->
+             let s32 = v32RetrainInit fs (dirOfRole role) offer'
                          (why == RetrainLocal)
                          (v32DataRxState pump') (v32DataTxState pump') Nothing
                  (txSt, audio) = transmit TxSilence st1

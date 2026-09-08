@@ -81,6 +81,7 @@ module Modec.V32
   , decodeESeq
   , rateSeqCleardown
   , bestCommonRate
+  , ratesBelow
   , chosenRate
   ) where
 
@@ -711,6 +712,32 @@ decodeSeq lead bs = case bs of
     , b7, b11, b15 ->
         Just (RateSeq b4 b5 b6 b8 b9 b10 b12)
   _ -> Nothing
+
+-- | The same offer with everything at or above a rate's speed taken out.
+--
+-- What makes a rate change a rate change: a modem that retrains without
+-- narrowing its offer negotiates its way straight back to the rate that
+-- had just stopped working.
+--
+-- By bit rate and not by the order of 'allV32Rates', which sorts by
+-- what to prefer rather than by what will survive.  The two disagree in
+-- one place and it matters: the step below 9600 trellis in that list is
+-- plain 9600, which carries the same 9600 bit\/s with the trellis
+-- thrown away.  Falling back to it makes the link worse at the same
+-- speed, which is the one thing a fallback must not do.  9600
+-- non-trellis is in the Recommendation so that a modem without the
+-- trellis can be interworked with; it is not a rung on this ladder.
+ratesBelow :: V32Rate -> RateSeq -> RateSeq
+ratesBelow r offer =
+  foldl clear offer [ x | x <- allV32Rates, rateBitRate x >= rateBitRate r ]
+  where
+    clear c x = case x of
+      V32R14400 -> c { rsCan14400 = False }
+      V32R12000 -> c { rsCan12000 = False }
+      V32R9600T -> c { rsTrellis = False }
+      V32R9600 -> c { rsCan9600 = False }
+      V32R7200 -> c { rsCan7200 = False }
+      V32R4800 -> c { rsCan4800 = False }
 
 -- | The best rate both ends can run, given what the far end offered and
 -- what we can do.  §5.4.1: a reply must exclude anything absent from the
