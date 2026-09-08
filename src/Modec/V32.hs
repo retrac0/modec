@@ -679,7 +679,8 @@ v32Rates = noRates
 -- for either by name and you get it; offering one that then damages the
 -- session is worse than not offering it.
 v32bisRates :: RateSeq
-v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True, rsCan12000 = True }
+v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True
+                       , rsCan12000 = True, rsCan14400 = True }
 
 rateSeqCleardown :: RateSeq -> Bool
 rateSeqCleardown r = not (or [ rsCan2400 r, rsCan4800 r, rsCan9600 r

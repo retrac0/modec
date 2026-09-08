@@ -205,7 +205,7 @@ withModes ms cfg
       cfg { hcModes = ms
           , hcBank = (hcBank cfg)
               { tbFreqs = fskMark v23Backward : fskSpace v23Backward
-                          : filter (/= 400) (tbFreqs (hcBank cfg)) } }
+                          : tbFreqs (hcBank cfg) } }
   | otherwise = cfg { hcModes = ms }
 
 -- | What the transmitter should be doing right now.
@@ -437,6 +437,8 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     -- An answering modem that steps through a fallback ladder may hold
     -- each rung open for only a second or two.
     fskOnly = not v22Allowed && (allowed V21 || allowed Bell103 || v23Allowed)
+    -- the answering V.32 modem's alternating pair, either sideband
+    v32Heard = heardFor 600 >= hcQualify cfg || heardFor 3000 >= hcQualify cfg
     -- An FSK mark we recognise is on the line right now.  Not
     -- 'qualified', which wants the full hcQualify of it: the V.22
     -- receiver makes up its mind about a steady tone faster than the
@@ -593,6 +595,15 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         | hcV8 cfg && ansamSeen && not (null ourV8Mods) -> enter OV8Wait
         | dom /= Just 2100 && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
       OAfterAns
+        -- 5.4.1: the answering V.32 modem's alternating pair at 600 and
+        -- 3000 Hz.  V.32 is six years older than V.8 and does not need
+        -- one -- without this rung a modem offering V.32 alongside
+        -- anything else could only reach it through a CM/JM exchange,
+        -- and fell back to V.22bis against every V.32 board that did not
+        -- speak V.8.  Entered on hearing the pair rather than on hoping
+        -- for it, so a far end that is not a V.32 answerer never costs
+        -- us the rest of the ladder.
+        | any isV32 modes && v32Heard -> enter V32Handover
         | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
         -- our carrier is already up in FSK-only mode, so the answerer's
         -- carrier is all that is still needed
