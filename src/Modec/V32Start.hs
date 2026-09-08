@@ -635,6 +635,23 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       _ -> Nothing
     -- either sideband of AC reads about 0.5; noise reads about 0.16
     acHeard = heard 600 > 0.3 || heard 3000 > 0.3
+    -- Only in the calling modem's phases past the point where it has
+    -- answered AC once, and only after a second of it, so a transient
+    -- cannot throw a start-up that is otherwise going well.
+    -- 0.45 and not acHeard's 0.30.  OListen uses the lower figure while
+    -- the line is otherwise idle; here the far end may be sending a rate
+    -- signal, which is a four-point signal spread across the band, and a
+    -- coherent correlation at 600 or 3000 reads a good deal more of that
+    -- than it does of silence.  At 0.30 this threw away a start-up that
+    -- was working -- the recording in the corpus -- a second after it
+    -- reached R2.
+    strongAC = heard 600 > 0.45 || heard 3000 > 0.45
+    restarted = strongAC && vsSince st0 > sym 2400 && case vsPhase st0 of
+      OTrainR1 -> True
+      OHoldS -> True
+      OCond -> True
+      OR2 -> True
+      _ -> False
     tooLong limit s = vsSince s > sym limit
 
     step s = case vsPhase s of
@@ -685,6 +702,20 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- symbols -- and moving straight on to E cuts the answering
       -- modem's equaliser short and puts a burst of errors just after
       -- the handover, at the one moment there is nothing to hide it.
+      -- The far end has gone back to the beginning.  An answering modem
+      -- that gives up part way through Figure 4 does not say so: it
+      -- simply starts again, alternating A and C at 600 and 3000 Hz and
+      -- waiting for the calling modem's AA.  Nothing here used to look
+      -- for that, so a caller sat in OR2 transmitting a rate signal at a
+      -- modem that had stopped listening for one, until its own
+      -- eighty-thousand-symbol timer ran out thirty seconds later.
+      --
+      -- Measured on two different boards, both of which restarted about
+      -- four seconds after our conditioning signal and then held AC for
+      -- the rest of the call.  Answering it is the whole of the fix: AC
+      -- is what OListen waits for, and going back to OAA is what it does
+      -- when it hears it.
+      _ | restarted -> enter OAA (rearm s) { vsSrc = TxState StA }
       OR2 | vsSince s < sym 128 -> s
       OR2 -> case detectRate (vsBits s) of
         Just r3 | Just rate <- bestCommonRate (vsOffer s) r3 ->
