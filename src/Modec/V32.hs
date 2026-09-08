@@ -641,10 +641,12 @@ v32Rates = noRates
 --
 -- 7200 is in now that the receiver acquires the data constellation
 -- instead of trying to track it: a call at 7200 delivers both
--- directions exactly, head of the session included.  12000 carries a
--- whole call both ways too, and is still out of the offer because that
--- has only been shown down a pair of pipes at 30 dB and never on a
--- line.  14400 trains, negotiates, and cannot carry data at all: the
+-- directions exactly, head of the session included.  12000 is in too:
+-- dialled at a real board it connects, negotiates MNP class 4 and holds
+-- a session at a decision error of 0.003 to 0.007, which is what took
+-- it out of the "works down a pair of pipes" category.  14400 is not.
+-- It trains and connects and then cannot hold the line -- on that same
+-- board the receiver gave up four seconds in -- and in loopback the
 -- receiver's decision error settles at around half the distance to the
 -- wrong answer -- 39 to 49 % of it with no channel in the way -- and
 -- the gate that keeps noise off the terminal keeps the data off with
@@ -658,7 +660,7 @@ v32Rates = noRates
 -- for either by name and you get it; offering one that then damages the
 -- session is worse than not offering it.
 v32bisRates :: RateSeq
-v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True }
+v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True, rsCan12000 = True }
 
 rateSeqCleardown :: RateSeq -> Bool
 rateSeqCleardown r = not (or [ rsCan2400 r, rsCan4800 r, rsCan9600 r
