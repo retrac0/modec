@@ -443,6 +443,7 @@ data RevTracker = RevTracker
   , rtProj   :: !Double
   , rtLevel  :: !Double
   , rtPow    :: !Double          -- ^ tracked mean square of the input
+  , rtAge    :: !Int             -- ^ samples since the tracker was armed
   , rtSeen   :: !Bool            -- ^ the tone has been steady in this phase
   , rtHold   :: !Int             -- ^ samples to wait before reporting again
   }
@@ -458,7 +459,7 @@ revInit fs f = RevTracker
   -- all, and the tracker reads it as its own.
   , rtWin = max 8 (round (fs / 200))
   , rtHist = [], rtAcc = (0, 0)
-  , rtRef = Nothing, rtProj = 0, rtLevel = 0, rtPow = 0, rtSeen = False, rtHold = 0 }
+  , rtRef = Nothing, rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
 
 -- | Forget what has been heard so far, but not what time it is.
 --
@@ -471,7 +472,7 @@ revInit fs f = RevTracker
 revRearm :: RevTracker -> RevTracker
 revRearm t = t
   { rtHist = [], rtAcc = (0, 0), rtRef = Nothing
-  , rtProj = 0, rtLevel = 0, rtPow = 0, rtSeen = False, rtHold = 0 }
+  , rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
 
 -- | How much of what is arriving is this tone, from 0 to about 0.71.
 --
@@ -520,7 +521,21 @@ revBlock chunk st0 = go 0 st0 []
                       else 0
               -- everything below is gated on the band actually holding
               -- this tone, not on the line being loud
-              tone = lvl > 0.25 && pow > 1e-10
+              -- A level is a correlation over the tracked mean square of
+              -- the input, and that average starts at nothing, so for
+              -- the first few milliseconds after the tracker is armed it
+              -- divides by almost zero and reads high whatever is on the
+              -- line.  Measured over a settled 50 ms window the
+              -- separation is not close -- the alternating pair reads
+              -- 0.32 and 0.63 on its two sidebands, and data, TRN and a
+              -- rate signal all read 0.07 or less -- so the threshold is
+              -- not the difficulty; the warm-up is.  A retrain builds
+              -- fresh trackers, and without this the first blocks of the
+              -- far end's data counted as the answering modem's tone,
+              -- which took this end through AA and CC and into the
+              -- silence of 5.4.1's fifth paragraph, where it stopped
+              -- transmitting the very signal 5.5.2 needs to see.
+              tone = rtAge st >= 4 * rtWin st && lvl > 0.25 && pow > 1e-10
               full = length hist' >= rtWin st
               -- the phase to measure against: whatever was established
               -- before, adopted once the tone is steady
@@ -544,6 +559,7 @@ revBlock chunk st0 = go 0 st0 []
               st1 = st { rtN = t + 1, rtHist = hist', rtAcc = (ar, ai)
                        , rtRef = if crossed then Nothing else ref
                        , rtProj = proj, rtLevel = lvl, rtPow = pow
+                       , rtAge = rtAge st + 1
                        , rtSeen = not crossed && seen && tone
                        , rtHold = if crossed then rtWin st * 2 else max 0 (rtHold st - 1) }
           in if crossed

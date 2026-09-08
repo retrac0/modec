@@ -45,7 +45,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
@@ -603,7 +603,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- making errors at the top, and a marginal 14400 line then
           -- spends a whole call handing the terminal noise between the
           -- bytes it gets right.
-          trust = decisionError < mcMaxEvmV32 cfg * rateMargin rate
+          trust = decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate
           decisionError = sqrt (v32DataEvm pump')
           -- Arm on a *run* of descrambled ones -- the idle both ends send
           -- between characters -- and not on a count of them, since noise
@@ -646,7 +646,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- signal and tracking it: hard to catch, easy to keep.  The
           -- half second is for the line that never gets that good, where
           -- passing bits with errors in them still beats passing none.
-          acquired = decisionError < mcMaxEvmV32 cfg * rateMargin rate / 4 || msSettled st > 0.5
+          acquired = decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate / 4 || msSettled st > 0.5
           onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
           armed' = armed || (onesRun' >= 64 && trust && acquired)
           sync = case msMnp st of

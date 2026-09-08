@@ -51,6 +51,7 @@ module Modec.V32
   , constellation
   , slicePoint
   , rateMargin
+  , rateDecisionMargin
   , subsetPoint
   , gridScale
     -- * Differential encoding (Tables 1 and 2)
@@ -397,6 +398,24 @@ rateMargin r = 0.5 * sqrt (minimum [ dist2 (ps VU.! i) (ps VU.! j)
   where
     ps = pointsFor r
     n = VU.length ps
+
+-- | The margin a /decision/ actually has, which on a trellis alternative
+-- is not the distance between neighbouring points.
+--
+-- The slicer's error is measured against the nearest point, but nothing
+-- downstream believes the slicer: the Viterbi decoder judges a sequence,
+-- and what it has to resolve is the code's free distance.  This suite
+-- asserts that gain at 4 dB for 9600 trellis and 3 dB for the rest, so
+-- taking the smaller of the two -- a factor of root two in amplitude --
+-- is the conservative reading.  Without it a rate is held to the
+-- geometry of a constellation it is not decoded by: at 14400 a receiver
+-- sitting well inside what the trellis can resolve was declared
+-- unreadable, and a call that had connected retrained itself to death
+-- four seconds later.
+rateDecisionMargin :: V32Rate -> Double
+rateDecisionMargin r
+  | rateTrellis r = rateMargin r * sqrt 2
+  | otherwise = rateMargin r
 
 slicePoint :: V32Rate -> Point -> Int
 slicePoint r p = snd (minimum [ (dist2 p (ps VU.! i), i) | i <- [0 .. VU.length ps - 1] ])
