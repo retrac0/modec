@@ -25,6 +25,7 @@ module Modec.DSP
   , fromDb
     -- * Noise and test sources
   , gaussianNoise
+  , uniformNoise
   , addNoise
   , prbs
     -- * FIR filters
@@ -180,6 +181,18 @@ gaussianNoise seed n sigma = VS.unfoldrN n step (fromIntegral seed * 2654435761 
           u2 = unit s2
           g = sqrt (-2 * log u1) * cos (2 * pi * u2)
       in Just (sigma * g, s2)
+    lcg s = (s * 6364136223846793005 + 1442695040888963407) `mod` (2 ^ (64 :: Int))
+    unit s = fromIntegral (s `div` 2048) / 9007199254740992
+
+-- | @n@ deterministic samples uniform on [0, 1), from the same
+-- generator.  Impairments that happen or do not -- a lost frame, a bit
+-- error, an impulse arriving -- need a coin rather than a bell curve,
+-- and the alternative to having one is pushing Gaussians through an erf
+-- approximation, which "Modec.Channel" was doing.
+uniformNoise :: Int -> Int -> Signal
+uniformNoise seed n = VS.unfoldrN n step (fromIntegral seed * 2654435761 + 1 :: Integer)
+  where
+    step !st = let s' = lcg st in Just (unit s', s')
     lcg s = (s * 6364136223846793005 + 1442695040888963407) `mod` (2 ^ (64 :: Int))
     unit s = fromIntegral (s `div` 2048) / 9007199254740992
 

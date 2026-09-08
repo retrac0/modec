@@ -26,6 +26,7 @@ import Network.Socket
 import qualified Network.Socket.ByteString as NB
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
+import Text.Printf (printf)
 import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
@@ -81,6 +82,7 @@ data ModemOpts = ModemOpts
   , moNoHandshake :: Bool
   , moNoV8bis  :: Bool
   , moV8       :: Bool
+  , moProbe    :: Bool
   , moV8All    :: Bool
   , moMaxEvm   :: Double
   , moV32Rates :: Maybe V32.V32Rate  -- ^ hold V.32 to one rate
@@ -108,7 +110,7 @@ data ModemOpts = ModemOpts
 defaultModemOpts :: ModemOpts
 defaultModemOpts = ModemOpts
   { moRate = 8000, moBlockMs = 20, moRole = Originate, moModes = allStandards
-  , moNoHandshake = False, moNoV8bis = False, moV8 = False, moV8All = False
+  , moNoHandshake = False, moNoV8bis = False, moV8 = False, moV8All = False, moProbe = False
   , moMaxEvm = 1.0, moV32Rates = Nothing, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
@@ -129,7 +131,7 @@ runModem o = do
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       cfg0 = defaultModemConfig fs (moRole o) (moModes o)
-      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
+      cfg = cfg0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o, mcV32Rates = v32Offered o, mcMnp = mnpCfg, mcHandshake = (mcHandshake cfg0) { hcV8bis = not (moNoV8bis o), hcV8 = moV8 o || moV8All o, hcV8OfferAll = moV8All o } }
       -- The rate and whether the link can go synchronous belong to the
       -- link rather than to the command line, so those two are left for
       -- Modec.Modem to fill in once the call is established.
@@ -266,6 +268,21 @@ runModem o = do
             k <- readIORef blockRef
             when (modemTxCmd st' /= modemTxCmd st || k `mod` 25 == 0) $
               logMsg (show (fromIntegral (k * blockN) / fs :: Double) ++ " tx " ++ show (modemTxCmd st') ++ " " ++ v22Info st')
+          -- Every five seconds of a V.32 call, what the receiver and the
+          -- canceller think of the line.  All four of these accessors
+          -- existed and nothing called them, so a live call produced a
+          -- recording and a list of phases and no numbers at all -- and
+          -- the numbers are the whole of what a call is for once it is
+          -- connecting at all.
+          telemetry st' = do
+            k <- readIORef blockRef
+            let evm = maybe "" (printf "decision error %.4f" . abs) (modemV32Evm st')
+                delay = maybe "" (printf ", echo at %.0f ms" . (\d -> fromIntegral d / (fs / 1000) :: Double))
+                              (modemEchoDelay st')
+                erle = maybe "" (printf ", return loss %.1f dB") (modemEchoErle st')
+                line = evm ++ delay ++ erle
+            when (k `mod` 250 == 249 && not (null line)) $ say ("line: " ++ line)
+
           report ev = case ev of
             EvConnected st link -> do
               writeIORef outcomeRef ("connected " ++ show st ++ " " ++ describeRate link)
@@ -278,6 +295,13 @@ runModem o = do
               say ("MNP class " ++ show cls ++ ", " ++ show k ++ " outstanding frames, N401 " ++ show n401)
             EvMnp MnpTransparentFallback -> say "no error correction: the far end did not answer"
             EvMnp (MnpDown why) -> say ("MNP link down: " ++ why)
+            -- 5.5 is invisible from the terminal by design -- nothing has
+            -- ended and the DTE is not told -- so the call log is the
+            -- only place it shows up at all.
+            EvRetrain why -> say ("retraining the link: " ++ case why of
+              RetrainLocal -> "this receiver could not read the line"
+              RetrainFarEnd -> "the far end asked")
+            EvRate r -> say ("now running at " ++ show (rateBitRate r) ++ " bit/s")
       if not (moHayes o) && sip == Nothing
         then do
           -- plain mode: one call in the configured role, then exit
@@ -296,6 +320,7 @@ runModem o = do
                         (st', audio, rxBytes, events) = modemStep cfg st rx (B.unpack pending)
                     writeIORef stRef st'
                     traceStep st st'
+                    telemetry st'
                     modifyIORef' blockRef (+ 1)
                     writeBlock (encodeS16 audio)
                     unless (null rxBytes) $ sendBytes (B.pack rxBytes)

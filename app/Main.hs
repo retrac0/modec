@@ -134,6 +134,7 @@ cmdP = hsubparser
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "no-v8bis" <> help "skip the V.8bis capabilities exchange")
       <*> switch (long "v8" <> help "V.8: answer with ANSam and exchange CM/JM capability menus")
+      <*> switch (long "probe" <> help "do not place a call: hold a V.32 carrier and measure the echo path of whatever is on the line")
       <*> switch (long "v8-offer-all" <> help "implies --v8; advertise every V.8 modulation so the far end's menu comes back in full. A survey option: the mode it then selects will not be one this modem can run")
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
              <> help "stop passing bytes to the DTE when the receiver's decision error exceeds this; a good link sits near 0.01 and 20 dB SNR near 0.35, while a converging or collapsing carrier runs past 1. Raise it to pass noisy data through, lower it to pass only what is trustworthy")
@@ -201,10 +202,12 @@ cmdP = hsubparser
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
       <*> recordDirP
       <*> ignoreBusyP
-    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy = defaultModemOpts
+      <*> switch (long "probe"
+                  <> help "do not place a call: hold a V.32 carrier and measure the echo path")
+    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy probe = defaultModemOpts
       { moModes = modes, moV8 = v8, moV8All = v8all, moNoV8bis = noV8bis
       , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir
-      , moIgnoreBusy = ignoreBusy }
+      , moIgnoreBusy = ignoreBusy, moProbe = probe }
     modesP =
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"

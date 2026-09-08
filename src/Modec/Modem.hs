@@ -12,6 +12,7 @@ module Modec.Modem
   , modemInit
   , modemStep
   , modemStatus
+  , RetrainCause (..)
   , modemConnected
   , modemV32Evm
   , modemEchoErle
@@ -67,6 +68,7 @@ data ModemConfig = ModemConfig
   , mcMaxEvmV32 :: Double  -- ^ stop passing bytes when the decision error exceeds this much of the constellation's own margin
   , mcMinPowerV32 :: Double  -- ^ below this received power the V.32 carrier is gone
   , mcRetrainMax :: Int    -- ^ how many retrains one call may spend before giving up
+  , mcProbe    :: Bool     -- ^ measure an echo path instead of placing a call
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -95,6 +97,7 @@ defaultModemConfig fs role modes = ModemConfig
   -- A line bad enough to want a fifth retrain is not going to be fixed
   -- by one; past this the call is over.
   , mcRetrainMax = 4
+  , mcProbe = False
   , mcMaxEvm = 1.0
   }
 
@@ -216,6 +219,12 @@ data Mode
   -- | 5.5: back in Figure 4 mid-call, with everything the session needs
   -- held aside until it comes out the other side.
   | Retrain32 V32Start Held
+  -- | Not a call: a continuous V.32 carrier with the echo canceller
+  -- adapting, for measuring an echo path against something that returns
+  -- what it is sent.  The start-up cannot do this job -- a calling modem
+  -- waits in OListen for an answering modem, and an echo service is not
+  -- one, so it sends a second of V.8bis and then nothing at all.
+  | Probe32 V32Data
   | Finished
 
 -- | What a retrain has to give back when it finishes.  The call has not
@@ -271,6 +280,7 @@ modemInit cfg
   -- AC, which no other mode here would make sense of.  So a modem
   -- configured for V.32 goes straight into Figure 4, and reaches it
   -- otherwise only when V.8 or V.8bis has picked it.
+  | mcProbe cfg = base { msMode = Probe32 (v32DataInit fs V32R9600T) }
   | [s] <- hcModes hs, isV32 s =
       base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) }
   | mcNoHandshake cfg, [s] <- hcModes hs =
@@ -426,6 +436,7 @@ modemPhase st = case msMode st of
   DataV22 _ _ r _ _ -> "Data V22 " ++ show r
   DataV32 _ r _ _ _ -> "Data V32 " ++ show r
   Retrain32 s32 h -> "Retraining V32 from " ++ show (hdRate h) ++ ", " ++ show (v32Phase s32)
+  Probe32 _ -> "Probing the echo path"
   Finished -> "Finished"
 
 -- | The echo canceller's return loss enhancement, for tracing: how much
@@ -722,6 +733,14 @@ modemStep cfg st0 rxBlock newBytes =
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }
              , audio, [], [EvFailed why, EvDropped])
+    Probe32 pump ->
+      -- Adapting throughout: what comes back from a reflection /is/ the
+      -- echo, which is the condition the half-duplex windows exist to
+      -- create and the one this arranges directly.
+      let (echo', _) = cancelEcho True st n rxBlock
+          (pump', audio) = v32DataTx fs Calling V32R9600T (mcTxAmp cfg) n [] pump
+          st1 = st { msEcho = pushEcho audio echo', msMode = Probe32 pump' }
+      in (st1, audio, [], [])
     DataV22 tx rx rate framer armed ->
       let (rxSt', o) = case msV22Rx st of
             Just (_, r) -> v22RxBlock fs rx rxBlock (if msRxRate st == rate then r else v22RxSetRate rate r)
