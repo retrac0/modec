@@ -207,10 +207,12 @@ cmdP = hsubparser
       <*> ignoreBusyP
       <*> switch (long "probe"
                   <> help "do not place a call: hold a V.32 carrier and measure the echo path")
-    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy probe = defaultModemOpts
+      <*> optional (option (maybeReader v32RateReader) (long "v32-rate" <> metavar "BPS"
+            <> help "hold V.32 to one rate: 4800, 7200, 9600, 9600t, 12000 or 14400"))
+    mkDialModem modes v8 v8all noV8bis mnp evm amp rdir ignoreBusy probe v32rate = defaultModemOpts
       { moModes = modes, moV8 = v8, moV8All = v8all, moNoV8bis = noV8bis
       , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir
-      , moIgnoreBusy = ignoreBusy, moProbe = probe }
+      , moIgnoreBusy = ignoreBusy, moProbe = probe, moV32Rates = v32rate }
     modesP =
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"

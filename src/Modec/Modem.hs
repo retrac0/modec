@@ -281,7 +281,17 @@ modemInit cfg
   -- configured for V.32 goes straight into Figure 4, and reaches it
   -- otherwise only when V.8 or V.8bis has picked it.
   | mcProbe cfg = base { msMode = Probe32 (v32DataInit fs V32R9600T) }
-  | [s] <- hcModes hs, isV32 s =
+  -- ...unless V.8 or V.8bis is on, in which case the negotiation comes
+  -- first and picks V.32 itself.  Taking the shortcut regardless meant
+  -- --mode v32 --v8 never sent a CM at all: the modem went straight
+  -- into Figure 4 as the calling side and waited in OListen for an
+  -- alternating AC that the far end, still expecting a V.8 exchange,
+  -- was never going to send.
+  -- V.8 only, and not V.8bis: V.8bis has no codepoint for V.32 at all,
+  -- so leaving the shortcut to it would mean a V.32-only modem sat
+  -- through a capabilities exchange that cannot name the one thing it
+  -- can do.
+  | [s] <- hcModes hs, isV32 s, not (hcV8 hs) =
       base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
