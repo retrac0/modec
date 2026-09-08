@@ -198,15 +198,19 @@ modemTests = testGroup "full modem duplex" $
       -- except the end of the call: a link that went bad stayed bad and
       -- went on handing up whatever it could make of the noise.
       let cfg role = defaultModemConfig 8000 role [V32]
-          (rxO, rxA, evO, evA) =
-            modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA 14 14.5
-      assertBool ("originate events " ++ show evO)
-        (any (\e -> case e of EvRetrain _ -> True; _ -> False) (evO ++ evA))
-      -- and the session is still there afterwards: the second text is
-      -- sent only once the line has been clean again for three seconds,
-      -- so it can only arrive through a link that put itself back
-      assertBool ("answer heard " ++ show rxA) (textO `isInfixOf` rxA)
-      assertBool ("originate heard " ++ show rxO) (textA `isInfixOf` rxO)
+      forM_ [(False, "the answering modem goes deaf"), (True, "the calling modem does")] $ \(wreckCaller, what) -> do
+       let (rxO, rxA, evO, evA) =
+             modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA wreckCaller 14 14.5
+       assertBool (what ++ ": events " ++ show (evO ++ evA))
+         (any (\e -> case e of EvRetrain _ -> True; _ -> False) (evO ++ evA))
+       -- and the session is still there afterwards: the second text is
+       -- sent only once the line has been clean again for three seconds,
+       -- so it can only arrive through a link that put itself back.
+       -- Both ways round, because only the deaf end asks: the other has
+       -- to recognise the request from the tone alone, and the two ends
+       -- watch for different tones.
+       assertBool (what ++ ": answer heard " ++ show rxA) (textO `isInfixOf` rxA)
+       assertBool (what ++ ": originate heard " ++ show rxO) (textA `isInfixOf` rxO)
   , testCase "a V.32bis call that keeps breaking falls to a rate it can hold" $ do
       -- The other half of 5.5: a retrain that goes back in at the rate
       -- which had just stopped working negotiates its way straight back
@@ -216,7 +220,7 @@ modemTests = testGroup "full modem duplex" $
       let cfg role = (defaultModemConfig 8000 role [V32bis])
                        { mcV32Rates = Just v32bisRates }
           (_, _, evO, evA) =
-            modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA 14 15
+            modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA False 14 15
           started = [ r | EvConnected _ (V32Link _ r) <- evO ++ evA ]
           ended = [ r | EvRate r <- evO ++ evA ]
       assertBool ("no rate change in " ++ show (evO ++ evA)) (not (null ended))

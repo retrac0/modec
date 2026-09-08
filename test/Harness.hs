@@ -166,9 +166,9 @@ modemDuplexFor stop cfgO cfgA snr textO textA maxT cutAt =
 -- receiver could read through it, applied to one direction only, which
 -- is what a burst of impulse noise or a route change looks like.
 modemDuplexDisturb :: ModemConfig -> ModemConfig -> Double -> [Word8] -> [Word8]
-                   -> Double -> Double
+                   -> Bool -> Double -> Double
                    -> ([Word8], [Word8], [ModemEvent], [ModemEvent])
-modemDuplexDisturb cfgO cfgA snr first second from until_ =
+modemDuplexDisturb cfgO cfgA snr first second atCaller from until_ =
   go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0)
      False False False False [] [] [] []
   where
@@ -191,8 +191,13 @@ modemDuplexDisturb cfgO cfgA snr first second from until_ =
               qA | up sa, not s1a = first
                  | up sa, s1a, not s2a, t >= until_ + 3 = second
                  | otherwise = []
-              (so', audioO, bytesO, eO) = modemStep cfgO so (impair 1 t fromA) qO
-              (sa', audioA, bytesA, eA) = modemStep cfgA sa (wreck t (impair 2 t fromO)) qA
+              -- which end is made deaf, and so which end asks for the
+              -- retrain: the other has to notice from the tone alone
+              (so', audioO, bytesO, eO) =
+                modemStep cfgO so (side atCaller (impair 1 t fromA)) qO
+              (sa', audioA, bytesA, eA) =
+                modemStep cfgA sa (side (not atCaller) (impair 2 t fromO)) qA
+              side yes x = if yes then wreck t x else x
           in go (t + fromIntegral blk / fs) so' sa' audioA audioO
                 (s1o || not (null qO)) (s1a || not (null qA))
                 (s2o || (s1o && not (null qO))) (s2a || (s1a && not (null qA)))

@@ -1,6 +1,6 @@
 -- | V.32 and V.32bis: the coding layer, the data pump, the start-up of
 -- Figure 4, and the echo canceller that makes it possible.
-module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32StartTests) where
+module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, echoPath, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests) where
 
 import Control.Monad (forM_, replicateM)
 import Data.List (nub)
@@ -755,6 +755,25 @@ v32CallEvm cfgO cfgA maxT = go 0 (modemInit cfgO) (modemInit cfgA) quiet quiet N
           in go (t + 1) so' sa' audA audO (case modemV32Evm so' of
                                              Just e -> Just (abs e)
                                              Nothing -> best)
+
+-- | The retrain listener watches for tones a data signal must never
+-- look like.  The answering modem's cue is 1800 Hz, which is exactly
+-- where the calling modem's data carrier sits, so this is the
+-- assumption the whole of 5.5 rests on: a coherent correlation at the
+-- carrier, over a 5 ms window, averages a modulated signal away.  If it
+-- did not, a modem would retrain on its own far end talking normally --
+-- and would do it again the moment it came back.
+v32ListenTests :: TestTree
+v32ListenTests = testGroup "the retrain listener does not hear data"
+  [ testCase (show r ++ ", " ++ show dir) $ do
+      let sig = v32Modulate 8000 dir r 0.5 (prbs (11, 9) 20000)
+          step (l, worst) blk =
+            let l' = v32ListenBlock blk l
+            in (l', max worst (if v32ListenRetrain (other dir) l' then 1 else 0 :: Int))
+          (_, fired) = foldl step (v32ListenInit 8000, 0) (chunksOf 160 sig)
+      assertEqual "a data signal asked for a retrain" 0 fired
+  | r <- allV32Rates, dir <- [Calling, Answering] ]
+  where other d = case d of { Calling -> Answering; Answering -> Calling }
 
 v32StartTests :: TestTree
 v32StartTests = testGroup "V.32 start-up per Figure 4"
