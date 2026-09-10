@@ -51,6 +51,7 @@ module Modec.V22
   , dibitToStep
   , stepToDibit
   , RxOut (..)
+  , V22Report (..)
   , v22Modulate
   , v22ModulateAt
   , v22Demodulate
@@ -364,6 +365,23 @@ rxRateOf = rxRate
 -- | Current samples-per-symbol estimate of the timing loop.
 rxSpsEstimate :: V22RxState -> Double
 rxSpsEstimate = rxSps
+
+-- | What a V.22 receiver listening to the remote channel currently sees,
+-- as the handshake needs it: the run lengths its timings are measured
+-- against, and how cleanly the phase steps land.
+--
+-- A projection of 'RxOut', built once per audio block.  It lives here
+-- rather than with the handshake because it is the receiver's report --
+-- the handshake is one reader of it, not its owner.
+data V22Report = V22Report
+  { vrEnergy   :: !Double
+  , vrAngleErr :: !Double   -- ^ mean phase-step error in degrees
+  , vrU11Run   :: !Int      -- ^ consecutive symbols of unscrambled ones
+  , vrOnesRun  :: !Int      -- ^ consecutive descrambled ones
+  , vrZerosRun :: !Int      -- ^ consecutive descrambled zeros
+  , vrS1Run    :: !Int      -- ^ consecutive symbols of the S1 double-dibit pattern
+  , vrOnes2400 :: !Int      -- ^ consecutive descrambled ones decided 16-way
+  } deriving (Show)
 
 data RxOut = RxOut
   { roSymbols  :: [(Double, Double)]   -- ^ equalised, derotated symbols in grid units (constellation display)

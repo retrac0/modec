@@ -26,7 +26,6 @@ module Modec.Replay
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 
-import Modec.Link
 import Modec.DSP (Signal)
 import Modec.Modem
 import Modec.V22 (rxEvmEstimate, rxSpsEstimate)

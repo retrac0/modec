@@ -23,6 +23,8 @@ library
                       Modec.Metrics
                       Modec.Detect
                       Modec.Handshake
+                      Modec.Handshake.Cues
+                      Modec.Handshake.Modes
                       Modec.Modem
                       Modec.Replay
                       Modec.Fixture
