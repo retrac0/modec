@@ -677,6 +677,39 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         -- waiting to be told what we have (7.2, 8.1.1)
         | hcV8 cfg && ansamSeen && not (null ourV8Mods) -> enter OV8Wait
         | dom /= Just 2100 && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
+      -- No Bell 212A rung here, and that is not an oversight.  This
+      -- ladder is entered on a 2100 Hz answer tone, which is an ITU
+      -- answerer by definition -- a Bell 212A answering modem sends
+      -- 2225 Hz and nothing else.  What follows a 2100 Hz tone is V.22's
+      -- start-up: unscrambled binary 1, then S1 if the far end is
+      -- 2400-capable, on the timings of 6.3.  Bell 212A has no such
+      -- sequence to offer in reply.
+      --
+      -- The two are the same modem below the handshake.  A chip that
+      -- implements both -- the Teridian 73K222BL, V.22 and Bell 212A on
+      -- one die -- has one DPSK section producing "phase shifts as
+      -- prescribed by the Bell 212A or V.22" standards, one scrambler,
+      -- and bypasses that scrambler "in the Bell 103 or V.21 modes",
+      -- which is to say in FSK and nowhere else.  Selecting Bell rather
+      -- than CCITT changes the tones and only the tones: "In Bell 212A
+      -- mode [it] employs a 2225 Hz answer tone.  [In] V.22 mode [it]
+      -- produces either 550 or 1800 Hz guard tone, recognizes and
+      -- generates a 2100 Hz answer tone".  Same 600 baud, same 1200 and
+      -- 2400 Hz carriers, same dibit-to-quadrant table, same scrambler.
+      --
+      -- So a modem told to speak Bell 212A and dialled at an ITU
+      -- answerer really does have nothing in common with it at 1200:
+      -- not because the modulation differs but because neither end will
+      -- run the other's call setup.  Bell 103 at 300 is what is left,
+      -- and taking it is right.  A caller that wants both puts V22 in
+      -- its modes and reaches 1200 through the rung below -- which is
+      -- what the default modes do.
+      --
+      -- The same source settles the other half of it: "The CCITT V.22
+      -- standard defines synchronous operation at 600 and 1200 bit/s.
+      -- The Bell 212A standard defines synchronous operation only at
+      -- 1200 bit/s."  There is no 2400 bit/s Bell modulation to select,
+      -- which is why 's1Seen' refuses to fire on a Bell 212A call.
       OAfterAns
         -- 5.4.1: the answering V.32 modem's alternating pair at 600 and
         -- 3000 Hz.  V.32 is six years older than V.8 and does not need
