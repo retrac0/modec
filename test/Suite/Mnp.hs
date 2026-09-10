@@ -21,7 +21,7 @@ import Modec.V22
 import Modec.Hdlc
 import Modec.MnpFrame
 import Modec.Mnp
-import Data.Bits (testBit, xor)
+import Data.Bits (complement, testBit, xor)
 import Modec.Stream
 import Modec.FSK
 import Modec.Standards
@@ -442,6 +442,53 @@ mnpTests = testGroup "MNP protocol (V.42 Annex A)"
       assertBool "no LD on the wire"
         (null [ () | Right b <- snd (mode2RxOctets mode2RxInit sent)
                    , Right (FrLD _ _) <- [decodeFrame b] ])
+  , testCase "a far end talking another protocol is fallen through to, not disconnected" $ do
+      -- What a LAPM modem looks like from here: bytes that are not
+      -- characters and not frames either, over and over, and never a
+      -- reply to the link request.  It used to earn an LD, which a V.42
+      -- modem answers by hanging up.  Now it earns silence and a plain
+      -- link, which is what its own fallback wanted.
+      let c = defaultMnpConfig 1200 False
+          -- a frame with its body corrupted: the framer sees the framing
+          -- and a check that fails, which is 'bad' without being a frame
+          damaged = let f = mode2Encode (encodeFrame False (FrLT 1 (map (fromIntegral . fromEnum) "XID SABME ")))
+                        i = length f `div` 2
+                    in take i f ++ [complement (f !! i)] ++ drop (i + 1) f
+          st0 = mnpInit c MnpInitiator
+          step (st, outs) k =
+            let line = if k `mod` (25 :: Int) == 0 then LineOctets damaged else LineOctets []
+                (st', o) = mnpStep c st (MnpIn 0.02 line [] 0 maxBound)
+            in (st', outs ++ [o])
+          ticks = ceiling ((mnT401Lr c * fromIntegral (mnLrTries c) + 3) / 0.02) :: Int
+          (stEnd, os) = foldl step (st0, []) [1 .. ticks]
+          sent = concat [ o | OutOctets o <- map moLine os ]
+      assertEqual "falls through" MnpTransparent (mnpPhase stEnd)
+      assertBool "reported as no error correction" (any (== MnpTransparentFallback) (concatMap moEvents os))
+      assertBool "no LD on the wire"
+        (null [ () | Right b <- snd (mode2RxOctets mode2RxInit sent)
+                   , Right (FrLD _ _) <- [decodeFrame b] ])
+  , testCase "a far end that sent a link request and then gave up is followed" $ do
+      -- V.42 auto-reliable, as a CX93001 in \N3 does it: one link
+      -- request, its own establishment timer, then the DTE's data in
+      -- the clear.  The link request must not disable data detection
+      -- for the rest of the call, or this end offers MNP to a far end
+      -- that has stopped listening and then disconnects a working call.
+      let c = defaultMnpConfig 2400 False
+          lr = mode2Encode (encodeFrame False (FrLR defaultLr))
+          text = map (fromIntegral . fromEnum) "B0000 pack my box with five dozen liquor jugs 9876543210\r\n"
+          st0 = mnpInit c MnpResponder
+          step (st, evs) k =
+            let line | k == (5 :: Int) = LineOctets lr
+                     -- the far end's own timer runs out, then it sends data
+                     | k > round (mnT401Lr c / 0.02) + 5 = LineOctets text
+                     | otherwise = LineOctets []
+                (st', o) = mnpStep c st (MnpIn 0.02 line [] 0 maxBound)
+            in (st', evs ++ moEvents o)
+          ticks = ceiling ((mnT401Lr c * fromIntegral (mnLrTries c) + 3) / 0.02) :: Int
+          (stEnd, evs) = foldl step (st0, []) [1 .. ticks]
+      assertEqual "falls through to a plain link" MnpTransparent (mnpPhase stEnd)
+      assertBool ("and does not report the link down: " ++ show evs)
+        (null [ () | MnpDown _ <- evs ])
   , testCase "a far end already sending data is not abandoned as silent" $ do
       -- This is what a real call did: our link request went unanswered
       -- (or its answer was lost), the far end opened its data phase

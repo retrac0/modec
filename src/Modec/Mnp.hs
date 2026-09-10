@@ -228,6 +228,11 @@ data MnpState = MnpState
   , msSawBad  :: !Bool
   , msSawGood :: !Bool     -- ^ a step of the establishment exchange completed
   , msSawFrame :: !Bool    -- ^ any well formed frame at all arrived
+  , msLastFrameAt :: !Double
+    -- ^ when anything framed last arrived, well formed or damaged.
+    -- Latches say whether there was ever a protocol over there; this
+    -- says whether there is one now, which is the question a far end
+    -- that gave up on error correction mid-call actually poses.
   }
 
 never :: Double
@@ -267,7 +272,7 @@ mnpInit c role = MnpState
       MnpInitiator -> never
       MnpResponder -> mnT401Lr c * fromIntegral (max 1 (mnLrTries c))
   , msT402At = never, msT404At = never, msT403At = never
-  , msSawBad = False, msSawGood = False, msSawFrame = False
+  , msSawBad = False, msSawGood = False, msSawFrame = False, msLastFrameAt = -1 / 0
   }
 
 mnpPhase :: MnpState -> MnpPhase
@@ -330,7 +335,8 @@ mnpStep c st0 inp =
        _ ->
          let (st2, frames, bad, plain) = decodeLine st1 (miLine inp)
              st3 = st2 { msSawBad = msSawBad st2 || bad }
-             st3' = st3 { msSawFrame = msSawFrame st3 || any evidence frames }
+             st3' = st3 { msSawFrame = msSawFrame st3 || any evidence frames
+                        , msLastFrameAt = if bad || not (null frames) then t else msLastFrameAt st3 }
              (st4, evs0) = foldl (handleFrame c) (st3', []) frames
              (st5, evs1) = timers c st4 plain
          in if msPhase st5 == MnpTransparent || msPhase st5 == MnpClosed
@@ -615,7 +621,19 @@ timers c st plain = case msPhase st of
     -- correction and give up on it precisely when it is needed most.  A
     -- damaged frame is likewise evidence of a protocol, not of its
     -- absence.
-    | mnDataDetect c && not (msSawFrame st) && not (msSawBad st)
+    --
+    -- Evidence of a protocol, but not for ever.  This asked whether a
+    -- frame had /ever/ arrived until a CX93001 in @AT\N3@ showed why
+    -- that is the wrong question: auto-reliable sends one link request,
+    -- waits its own establishment timer, gives up, and passes the DTE's
+    -- data straight through.  Seeing that one link request used to
+    -- disable data detection for the rest of the call, so 464 bytes of
+    -- plain ASCII arrived while this end went on offering MNP to a far
+    -- end that had stopped listening, and the call died on the
+    -- disconnect below.  A protocol that is still there keeps framing
+    -- something inside its own timer; one that has gone quiet for
+    -- longer than that has gone.
+    | mnDataDetect c, msT st - msLastFrameAt st >= mnT401Lr c
     , length plain > 16, looksLikeText plain -> fallThrough st
     | msRole st == MnpInitiator && msLrTries st == 0 ->
         ( (sendCtrl st (FrLR (offerLr c)))
@@ -625,10 +643,22 @@ timers c st plain = case msPhase st of
           then ( (sendCtrl st (FrLR (if msRole st == MnpResponder then msNeg st else offerLr c)))
                    { msLrTries = msLrTries st + 1
                    , msT401At = msT st + mnT401Lr c }, [] )
-          -- A.7.2.2: damaged frames were seen, so there is a protocol over
-          -- there and it is worth saying goodbye; silence means there
-          -- never was one, and then no disconnect may be sent at all
-          else if msSawBad st || msSawFrame st
+          -- A.7.2.2: a well formed frame was seen, so there is a protocol
+          -- over there and it is worth saying goodbye; otherwise no
+          -- disconnect may be sent at all.
+          --
+          -- Damaged frames alone used to count as evidence too, on the
+          -- argument that a noisy line turns a real MNP peer into junk.
+          -- The bench said otherwise.  A V.42 modem in auto-reliable
+          -- mode (\N3) speaks LAPM first: its XID and SABME are exactly
+          -- "damaged frames" to this framer, it never answers a link
+          -- request, and it honours the LD this branch then sent by
+          -- hanging up -- 19 s after CONNECT, on a clean V.22bis call
+          -- against a CX93001.  Left alone it would have fallen back to
+          -- plain mode by itself.  Between a noisy MNP peer getting an
+          -- unprotected link and a LAPM peer getting no link, the first
+          -- is the one to have.
+          else if msSawFrame st
             then ( (sendCtrl st (FrLD 1 Nothing)) { msPhase = MnpClosed }
                  , [MnpDown "no reply to the link request"] )
             else fallThrough st

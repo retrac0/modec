@@ -96,6 +96,9 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     return result
 
 MODES = [
+    # trellis or constellation?  9600 non-trellis passed; every trellis rate failed
+    ('v32b-9600t', 'v32bis', 'AT+MS=V32B,0,9600,9600', ['--v32-rate','9600t'], [], 16),
+    ('v32b-4800',  'v32bis', 'AT+MS=V32B,0,4800,4800', ['--v32-rate','4800'],  [], 16),
     ('bell103-long', 'bell103', 'AT+MS=B103,0,300,300', [], [], 24),
     ('v21-long',     'v21',     'AT+MS=V21,0,300,300',  [], [], 24),
     # T2.3: reference in automode, so it will use V.8; modec answers with V.8

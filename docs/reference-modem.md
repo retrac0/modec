@@ -226,6 +226,82 @@ Every failed start-up above is reproducible from its recording with
   bytes over 18 s of scrambled ones. The 9600 fixture is cut at 16.5 s
   to keep that out of the reference decode.
 
+### The four, worked (2026-09-10 evening)
+
+**LAPM interworking: fixed.** The first diagnosis was wrong and the
+recording says so. `AT\N3` is *auto-reliable*, not LAPM-only: the
+CX93001 sends one perfectly well formed MNP link request --
+
+```
+16 10 02 17 01 02 01 06 01 00 00 00 00 ff 02 01 03 03 01 08 04 02 40 00 08 01 02 10 03 0c 18
+   ^DLE STX  len  LR ...                                          ^DLE ETX  ^CRC
+```
+
+-- waits its own establishment timer, gives up, and passes the DTE's
+data through in the clear. `Modec.Mnp` saw that one frame, latched
+`msSawFrame`, and thereby disabled the data detection that would have
+noticed the 464 bytes of plain ASCII arriving next; it went on offering
+MNP to a far end that had stopped listening, and at the end of its
+retries sent the disconnect that killed a working call. The latch is
+now a recency test -- a protocol that is still there frames something
+inside its own timer -- and the same call gives `no error correction:
+the far end did not answer` at 16.9 s and then carries the payload
+clean both ways. Sending LD now also needs a well formed frame, not
+merely a damaged one, so a genuine LAPM-only peer gets silence rather
+than a disconnect it would honour.
+
+**14400: it is not the start-up, and it is not the tables.** Two
+measurements bound it hard.
+
+`--v32-rate 9600t` -- trellis coded, 32 points, Table 3/V.32 -- carries
+496 and 464 bytes without an error against the CX93001. That single
+result exonerates the whole shared path: the trellis encoder, the
+Viterbi decoder, the differential quadrant coding, the echo canceller,
+and above all the start-up-to-data-pump handoff that this document has
+been pointing at since the fork. 9600 trellis goes through every one of
+them.
+
+And the constellations are structurally sound. Counts and uniqueness
+are right; the lattices are what the module claims (odd/odd for 16, 64
+and the 7200 set, the checkerboard for 32 and 128); mean powers are
+10, 10, 10, 42 and 41 as documented; and every one of the four
+trellis sets partitions into **8 subsets with a 9.0 dB partition gain**,
+12000 and 14400 included. Whatever is wrong is not a mistyped point and
+not a broken Ungerboeck partition.
+
+What is left is narrow: the three rates that fail against hardware --
+7200, 12000, 14400 -- are exactly the three the V.32bis figures add,
+and the ones that work are exactly the V.32 ones. Within a correct
+subset partition the remaining freedom is which *uncoded* bits (Q4, Q5,
+Q6) pick which point inside a subset. Get that wrong and a modem talking
+to itself agrees perfectly while a conformant peer reads noise, which
+is the symmetric both-directions-corrupt failure actually observed.
+That is the next thing to check, against the figures rather than
+against modec.
+
+**7200 fails earlier, and differently.** `scripts/diag/v32bits.hs`
+prints the descrambled bits the rate-signal detector is reading. At
+9600t, 12000 and 4800 they are the random-looking stream a converging
+receiver produces. At 7200 they are `1010101010101010`, unchanging, for
+the whole 33 s of `ATrainR2` -- a constant alternation, not a signal.
+The receiver never locks onto the caller's TRN at all, so R2 is on the
+line (`v32trace` finds `rate signal 7200 tcm (V.32bis)` at 17.36 s) and
+cannot be read. Whatever 7200 does differently, it does it before the
+rate signal, and the 16-point odd/odd lattice it uses instead of the
+checkerboard is the obvious suspect.
+
+**Plain V.32 stalls waiting for a signal that may not be coming.**
+Replaying either recording: `AR1` 16.5 s, `ATrainR2` 18.7, `ACond2`
+21.6, **`AR3` 22.3, and nothing after.** `AR3` has exactly two exits,
+signal E or an 80000-symbol timeout, and `detectE` additionally
+requires the sixteen bits *before* E to equal the peer's own rate
+sequence. The reference's S7 gives up before modec's timeout does, so
+the call reads as a silent failure. Whether a V.32 caller sends E at
+all -- §5.3.2 is a V.32bis section -- decides whether the fix is to
+accept a caller that goes straight from R3 to data, or to loosen what
+`detectE` will anchor against. Not yet fixed; the two recordings are
+`sweep-v32-4800-rx.wav` and `sweep-v32-9600-rx.wav`.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores
