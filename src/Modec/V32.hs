@@ -80,6 +80,7 @@ module Modec.V32
   , eSeqBits
   , decodeRateSeq
   , decodeESeq
+  , decodeESeqNear
   , rateSeqCleardown
   , bestCommonRate
   , restrictRates
@@ -630,22 +631,21 @@ allRates = RateSeq True True True True True True True
 
 -- | What this modem offers by default: V.32's 4800 and both 9600s.
 --
--- All three V.32bis rates are implemented and negotiate correctly, and
--- the data pump carries every one of them through a telephone channel
--- once it has the training the start-up provides -- that is what the
--- impairment tests measure, down to 25 dB at 12000 and 14400.  What none
--- of them yet survives is a whole call: 7200 delivers the text with a
--- dozen bytes of rubbish in front of it, 12000 manages one direction of
--- two, and 14400 neither.  Offering a rate that then damages the session
--- is worse than not offering it, so they are opt-in through
--- 'Modec.Modem.mcV32Rates' until that is fixed.
+-- All three V.32bis rates are implemented, negotiate correctly and carry
+-- a call; they stay out of the default offer because reaching them means
+-- saying V.32bis, and a modem that announces V.32bis to every far end it
+-- dials has to be right about more than the modulation.  Ask for them by
+-- name -- @--mode v32bis@, or 'Modec.Modem.mcV32Rates' -- and 'v32bisRates'
+-- is what goes on the line.  'allRates' offers the lot, for measuring.
 --
--- For 14400 at least the ceiling is the receiver's own noise floor
--- rather than the line's: cubic interpolation at 3.3 samples per symbol
--- and a root raised cosine cut at 12 symbols leave about 25 dB of
--- implementation signal to noise, which is enough for 32 points and not
--- for 128.  Raising it means a better interpolator, not a better
--- channel.  'allRates' offers the lot, for measuring exactly that.
+-- The ceiling used to be recorded here as the interpolator's: cubic at
+-- 3.3 samples per symbol and a root raised cosine cut at 12 symbols,
+-- about 25 dB of implementation signal to noise, enough for 32 points
+-- and not for 128.  That was wrong, and 'Modec.V32Pump.narrowTiming' has
+-- the measurement that says so -- with the same interpolator and the
+-- same filter, the trained pump reads 14400 at 8 % of its decision
+-- margin rather than 27 %.  What was eating the other three-quarters
+-- was the timing loop's own noise.
 defaultRates :: RateSeq
 defaultRates = v32Rates
 
@@ -663,22 +663,23 @@ v32Rates = noRates
 -- instead of trying to track it: a call at 7200 delivers both
 -- directions exactly, head of the session included.  12000 is in too:
 -- dialled at a real board it connects, negotiates MNP class 4 and holds
--- a session at a decision error of 0.003 to 0.007, which is what took
--- it out of the "works down a pair of pipes" category.  14400 is not.
--- It trains and connects and then cannot hold the line -- on that same
--- board the receiver gave up four seconds in -- and in loopback the
--- receiver's decision error settles at around half the distance to the
--- wrong answer -- 39 to 49 % of it with no channel in the way -- and
--- the gate that keeps noise off the terminal keeps the data off with
--- it.  The offline pump reaches both rates error-free through a
--- telephone band at 25 dB, so whatever is missing is in the start-up,
--- the handover or the canceller and not in the modulation.  For 14400 the ceiling is the receiver's own noise floor
--- rather than the line's: cubic interpolation at 3.3 samples per symbol
--- and a root raised cosine cut at 12 symbols leave about 25 dB of
--- implementation signal to noise, enough for 32 points and not for 128.
--- Raising it means a better interpolator, not a better channel.  Ask
--- for either by name and you get it; offering one that then damages the
--- session is worse than not offering it.
+-- a session for the length of the call.
+--
+-- 14400 was the last one in, and it took the receiver's timing loop to
+-- get it there.  It had been connecting and then failing to hold the
+-- line -- on a real board the receiver gave up four seconds in, and on
+-- a 46 dB recording of somebody else's 14400 call it retrained itself
+-- to death at the same point -- while the decision error sat at 39 to
+-- 49 % of the distance to the wrong answer with no channel in the way
+-- at all.  That was the acquiring timing gain being used to track as
+-- well as to acquire; 'Modec.V32Pump.narrowTiming' is the whole of the
+-- story.  The same recording now runs at 8 % of the margin with no
+-- channel, 36 % on the recording itself, and holds both directions of
+-- it for as long as there is audio to read.
+--
+-- What it is still not is a default (see 'defaultRates'): 14400 asks
+-- more of a line than 12000 does, and a rate that connects and then
+-- damages the session is worse than one that was never offered.
 v32bisRates :: RateSeq
 v32bisRates = v32Rates { rsCan2400 = True, rsCan7200 = True
                        , rsCan12000 = True, rsCan14400 = True }
@@ -712,6 +713,33 @@ decodeRateSeq = decodeSeq False
 
 decodeESeq :: [Bool] -> Maybe RateSeq
 decodeESeq = decodeSeq True
+
+-- | Signal E, read as the minimum-distance decision it is rather than
+-- as an exact match.
+--
+-- E is sent once.  A rate signal repeats until the far end has had time
+-- to read it, so a bit error in one copy costs a symbol interval and
+-- nothing else; E goes past exactly once, between R3 and the data, and
+-- a receiver that insists on all sixteen bits either catches it on that
+-- one pass or waits out the whole phase for something that is never
+-- coming again.  Measured on a real V.32bis call at 46 dB, answering:
+-- the caller's E arrived one bit wrong, was refused, and an otherwise
+-- perfect start-up -- the receiver reading the four states at 0.038 and
+-- its clock inside a hundred parts per million -- sat in AR3 until the
+-- recording ran out.
+--
+-- One bit, and not two, because of what E has to be told apart from.
+-- Seven of its sixteen bits are structure: the four that lead it and
+-- B7, B11 and B15.  The pattern it is confusable with is a rate signal
+-- in the same place -- which is what actually precedes it, over and
+-- over -- and that differs in all four of the leading bits.  A
+-- threshold below half of four is unambiguous; at two it would not be.
+decodeESeqNear :: [Bool] -> Maybe RateSeq
+decodeESeqNear bs = case bs of
+  [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, _, _, b15]
+    | length (filter not [b0, b1, b2, b3, b7, b11, b15]) <= 1 ->
+        Just (RateSeq b4 b5 b6 b8 b9 b10 b12)
+  _ -> Nothing
 
 -- | §5.3.1: a sequence is only a rate signal if the synchronising bits
 -- are right, which is the whole of the protection it has.  B13 and B14

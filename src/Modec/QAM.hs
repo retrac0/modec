@@ -36,10 +36,13 @@ module Modec.QAM
   , QamSym (..)
   , qamRxEvm
   , qamRxSps
+  , agcSettleSyms
   , qamRxPower
   , qamRxTheta
   , qamRxFreq
   , qamRxReset
+  , qamRxTiming
+  , qamRxUnlock
   , quarterTurns
     -- * Phase reversal tracking
   , RevTracker
@@ -69,13 +72,20 @@ samplesPerSymbol p = qpFs p / qpBaud p
 
 -- | Receiver tuning, and the constellation it decides against.
 data QamRxCfg = QamRxCfg
-  { qrKp        :: !Double  -- ^ Gardner proportional gain
-  , qrKi        :: !Double  -- ^ Gardner integral gain (tracks the far clock)
+  { qrKp        :: !Double  -- ^ Gardner proportional gain, acquiring
+  , qrKi        :: !Double  -- ^ Gardner integral gain, acquiring (tracks the far clock)
+  , qrKpTrack   :: !Double  -- ^ the same, once the loop is on the pulse
+  , qrKiTrack   :: !Double  -- ^ the same, once the loop is on the pulse
+  , qrTrackAt   :: !Double  -- ^ decision error power under which the timing loop narrows (0: never)
   , qrClamp     :: !Double  -- ^ limit on the timing error estimate
   , qrThKp      :: !Double  -- ^ carrier loop proportional gain, per symbol
   , qrThKi      :: !Double  -- ^ carrier loop integral gain, per symbol
   , qrEqMu      :: !Double  -- ^ LMS step
   , qrEqTaps    :: !Int     -- ^ equaliser taps, T/2 spaced
+  , qrAgcRate   :: !Double  -- ^ step of the power estimate the gain divides by
+  , qrAgcSettled :: !Double -- ^ the same after 'agcSettleSyms' symbols
+  , qrLockAt    :: !Double  -- ^ decision error power under which the receiver counts as converged
+  , qrLoopGate  :: !Double  -- ^ once converged, a symbol further than this (squared) from any point steers nothing
   , qrEvmFreeze :: !Double  -- ^ stop adapting above this decision error power
   , qrEvmGiveUp :: !Int     -- ^ symbols of bad decisions before starting over
   , qrAdapt     :: !Bool    -- ^ let the equaliser and the watchdog move at all
@@ -107,9 +117,13 @@ data QamRxCfg = QamRxCfg
 -- of the rate and would cover a quarter of the distortion here.
 defaultRxCfg :: ((Double, Double) -> Int) -> (Int -> (Double, Double)) -> QamRxCfg
 defaultRxCfg slice point = QamRxCfg
-  { qrKp = 0.12, qrKi = 0.0015, qrClamp = 2
+  { qrKp = 0.12, qrKi = 0.0015
+  , qrKpTrack = 0.12, qrKiTrack = 0.0015, qrTrackAt = 0
+  , qrClamp = 2
   , qrThKp = 0.08, qrThKi = 0.0015
   , qrEqMu = 0.002, qrEqTaps = 31
+  , qrAgcRate = 0.05, qrAgcSettled = 0.05
+  , qrLockAt = 1 / 0, qrLoopGate = 1 / 0
   , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrTrack = True, qrPower = 1
   , qrSlice = slice, qrPoint = point }
 
@@ -232,6 +246,9 @@ data QamRxState = QamRxState
   , rxEvm_    :: !Double
   , rxBad     :: !Int
   , rxRecent  :: [Int]
+  , rxLocked  :: !Bool   -- ^ the error has once been under 'qrLockAt'
+  , rxSyms    :: !Int    -- ^ symbols since the receiver last started over
+  , rxTiming  :: !Bool   -- ^ the timing loop has been on the pulse and may narrow
   }
 
 qamRxInit :: QamParams -> QamRxCfg -> QamRxState
@@ -244,7 +261,8 @@ qamRxInit p cfg = QamRxState
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxBad = 0, rxRecent = [] }
+  , rxEvm_ = 0, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
+  , rxTiming = False }
   where
     sps = samplesPerSymbol p
     taps = qrEqTaps cfg
@@ -262,14 +280,37 @@ qamRxReset _ cfg st = st
   , rxEqRe = VS.generate taps (\i -> if i == 2 * (taps `div` 4) then 1 else 0)
   , rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxBad = 0, rxRecent = [] }
+  , rxEvm_ = 0, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
+  , rxTiming = False }
   where taps = qrEqTaps cfg
+
+-- | Forget that the receiver has ever locked, keeping everything it has
+-- learned.  For a handover: the carrier, timing and equaliser trained
+-- on one constellation are exactly what the next one should start
+-- from, but whether they read the next one is not yet known, and the
+-- things that hang off having locked -- the slow gain, the tight freeze
+-- -- would otherwise be applied before it has had the chance.
+qamRxUnlock :: QamRxState -> QamRxState
+qamRxUnlock st = st { rxLocked = False, rxSyms = 0 }
 
 kernel :: QamParams -> VS.Vector Double
 kernel p = rrcKernel (qpFs p) (qpBaud p) (qpRollOff p) (qpSpan p)
 
 qamRxEvm :: QamRxState -> Double
 qamRxEvm = rxEvm_
+
+-- | How long the gain chases its own input before settling down.  A
+-- fifth of a second at 2400 baud: long enough for a receiver starting
+-- cold to find the level, short enough to be over inside B1 and the
+-- first bytes for one that was handed a trained receiver.
+agcSettleSyms :: Int
+agcSettleSyms = 512
+
+-- | Whether the timing loop has narrowed: see 'qrTrackAt'.  For tests
+-- and for tracing, where it is the first thing to ask of a receiver
+-- that is reading the line well and still getting the answer wrong.
+qamRxTiming :: QamRxState -> Bool
+qamRxTiming = rxTiming
 
 qamRxSps :: QamRxState -> Double
 qamRxSps = rxSps
@@ -322,11 +363,79 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               yr = cubicAt extRe tau; yi = cubicAt extIm tau
               hr = cubicAt extRe (tau - sps / 2); hi = cubicAt extIm (tau - sps / 2)
               (pr, pim) = rxPrevSym st
-              pw = 0.95 * rxPower_ st + 0.05 * (yr * yr + yi * yi)
+              -- The gain's own noise.  The power estimate is an
+              -- exponential mean of the symbol samples, and the gain is
+              -- the square root of its reciprocal: on the four training
+              -- states, all at one amplitude, the estimate is exact, and
+              -- on a hundred and twenty-eight points spread over nine
+              -- amplitudes a twenty-symbol mean of them wanders by
+              -- several percent -- which multiplies straight into every
+              -- symbol as a decision error of about 0.05, at any signal
+              -- to noise ratio at all, and nothing downstream can take
+              -- it back out.  Measured on the bench at 45 dB: 0.063 with
+              -- the fast estimate, 0.040 with a slow one.  The fast one
+              -- is still what acquisition needs -- a receiver starting
+              -- cold has to find the level before it can read anything --
+              -- so it runs for 'agcSettleSyms' and the slow one after.
+              -- Elapsed symbols and not "once it has read the line":
+              -- with the fast estimate running, the error at 14400 never
+              -- gets down to where a lock would be declared, because the
+              -- fast estimate is most of the error.
+              pwA = if rxSyms st >= agcSettleSyms then qrAgcSettled cfg else qrAgcRate cfg
+              pw = (1 - pwA) * rxPower_ st + pwA * (yr * yr + yi * yi)
               eRaw = ((yr - pr) * hr + (yi - pim) * hi) / max 1e-9 pw
               e = if pw < 1e-5 then 0 else max (negate (qrClamp cfg)) (min (qrClamp cfg) eRaw)
-              sps' = sps - qrKi cfg * e
-              tau' = tau + max (0.5 * sps) (sps' - qrKp cfg * e)
+              -- Acquiring and tracking, at two bandwidths.
+              --
+              -- The Gardner detector's output is not zero at the right
+              -- sampling instant: it is a difference between symbols
+              -- times a sample between them, so it carries the data as
+              -- well as the timing, and the wider the spread of
+              -- amplitudes in the constellation the more of it is data.
+              -- A proportional gain puts that straight into the sampling
+              -- instant, one symbol at a time, and the interpolator
+              -- turns it back into a decision error that is white,
+              -- isotropic, and the same absolute size whatever
+              -- constellation is being read.
+              --
+              -- Which is why it was invisible.  Measured with no channel
+              -- at all, at this gain: 0.028 at 9600 trellis, where the
+              -- points are 0.22 apart, and 0.053 at 14400, where they
+              -- are 0.11 -- 13 % of the decision margin, and 48 % of
+              -- it.  Adding a telephone line and 34 dB of noise moved
+              -- the second of those to 0.055.  The receiver's own timing
+              -- loop was most of what stood between 14400 and the
+              -- terminal, and no amount of line would have shown it.
+              --
+              -- It cannot simply be turned down: a receiver has to find
+              -- the pulse before it can sit on it, and at a quarter of
+              -- this gain a cold start takes a second where it took a
+              -- quarter of one.  So it is turned down once, when the
+              -- decisions say the loop is on the pulse -- 'qrTrackAt' --
+              -- and turned back up by 'qamRxReset' and nothing else.
+              -- The handover to the data constellation deliberately does
+              -- not re-open it: the constellation changes there, the
+              -- symbol clock does not, and the seam is the last place
+              -- that wants a wide timing loop.
+              (kpNow, kiNow) | rxTiming st = (qrKpTrack cfg, qrKiTrack cfg)
+                             | otherwise = (qrKp cfg, qrKi cfg)
+              -- And steered only by a signal that moves, which is
+              -- 'moving' below.  A steady tone is one point: there is no
+              -- transition in it, so what the detector reports is the
+              -- carrier, and a loop that integrates that walks its clock
+              -- away from the far end's for as long as the tone lasts.
+              -- Measured across the answering ladder, which spends seven
+              -- seconds on tones before it hears TRN: the symbol rate
+              -- estimate had wandered 1400 ppm off by the time there was
+              -- anything to read, and the restarts carry it forward,
+              -- because 'qamRxReset' keeps the timing on purpose.  At
+              -- the acquiring gain that is pulled back inside a second
+              -- and nobody notices; a narrower loop wears it for
+              -- thousands of symbols, which is a cost with nothing
+              -- bought by it -- the wander was never information.
+              steer = if moving then e else 0
+              sps' = sps - kiNow * steer
+              tau' = tau + max (0.5 * sps) (sps' - kpNow * steer)
 
               agc = if pw < 1e-9 then 0 else sqrt (qrPower cfg / pw)
               th = rxTheta st
@@ -360,9 +469,29 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- outright is the tempting mistake: over B1's 128 symbols
               -- a residual 7 Hz -- which 2.1/V.32 obliges us to work
               -- through -- turns the constellation by 134 degrees.
-              freq' = if locked && qrTrack cfg then rxFreq st + qrThKi cfg * phErr else rxFreq st
+              -- A symbol that is nowhere near any point, on a receiver
+              -- that has been reading the line, is not a symbol of this
+              -- constellation, and what it says about the carrier or
+              -- the channel is noise.  Where that matters is the seam at
+              -- the end of the start-up: the far end's E is four points
+              -- and its B1 is the agreed constellation, and the
+              -- four-point receiver reads a block or so of B1 before E
+              -- is recognised as complete.  Forty-eight symbols of phase
+              -- error against the nearest of four states, on a signal
+              -- spread over a hundred and twenty-eight, kicked the
+              -- frequency estimate by over a hertz -- which the rate's
+              -- receiver, arriving to guesswork, could not see to undo.
+              --
+              -- Only once locked: on a channel with real distortion the
+              -- early errors are large because the equaliser has not
+              -- converged yet, and a receiver that refused to learn from
+              -- those would never converge at all.  So the lock has to
+              -- mean converged -- 'qrLockAt', not 'qrEvmFreeze' -- and
+              -- not merely "still adapting".
+              good = not (rxLocked st) || err2 < qrLoopGate cfg
+              freq' = if locked && qrTrack cfg && good then rxFreq st + qrThKi cfg * phErr else rxFreq st
               theta' | not locked = th
-                     | qrTrack cfg = wrapPi (th + freq' + qrThKp cfg * phErr)
+                     | qrTrack cfg && good = wrapPi (th + freq' + qrThKp cfg * phErr)
                      | otherwise = wrapPi (th + freq')
 
               -- The start-up signals are one point, or two alternating:
@@ -372,8 +501,48 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- the equaliser with it and not with S.
               recent = take 8 (idx : rxRecent st)
               varied = length (distinct recent) > 2
+              -- What the timing loop needs to steer on is weaker than
+              -- what the equaliser needs to adapt on, and the difference
+              -- is the conditioning signal.  S is an alternating pair:
+              -- two points, a quarter turn every symbol, which is a
+              -- singular autocorrelation for a least-squares equaliser
+              -- and the easiest thing in the world to recover a symbol
+              -- clock from.  Holding the timing loop to 'varied' as well
+              -- froze it right through S, and the calling ladder then
+              -- failed to recognise the conditioning signal at all.
+              moving = length (distinct recent) > 1
               lineP = max 1e-6 (VS.sum (VS.zipWith (\a b -> a * a + b * b) lineRe lineIm) / fromIntegral taps)
-              mu = if qrAdapt cfg && locked && evm < qrEvmFreeze cfg && varied
+              -- Converged, as against merely adapting.  'qrEvmFreeze'
+              -- is where the decisions stop being worth learning from at
+              -- all; 'qrLockAt' is far tighter -- where the receiver is
+              -- reading the line properly, so that a symbol landing well
+              -- outside means something rather than being one more it
+              -- has not got right yet.  Not in the first symbols either
+              -- way: the error is an exponential mean starting from
+              -- nothing, and a receiver that latched on that would call
+              -- itself converged before it had read a thing.
+              latched = rxLocked st || (evm < qrLockAt cfg && rxSyms st >= 64)
+              -- The same shape of question as 'latched', asked of the
+              -- timing loop and answered once for the call.  A decision
+              -- error this small is only reached by a receiver whose
+              -- sampling instant is right, so it is evidence about the
+              -- timing whichever constellation it was measured on --
+              -- which is what lets the four-point start-up hand the data
+              -- pump a narrow loop it could not have earned for itself.
+              --
+              -- 'varied' for the same reason the equaliser wants it, and
+              -- it matters more here.  A steady tone is one point: every
+              -- decision is right, the error goes to the noise floor,
+              -- and none of it says anything about where in the symbol
+              -- the samples are being taken -- there is no symbol.  The
+              -- calling modem's AA is such a tone, and a loop that
+              -- narrowed on it went into the rest of the start-up four
+              -- times slower at pulling its clock back, which is how an
+              -- answering modem that had been reading the caller
+              -- perfectly failed to find E.
+              timing' = rxTiming st
+                || (qrTrackAt cfg > 0 && evm < qrTrackAt cfg && varied && rxSyms st >= 64)
+              mu = if qrAdapt cfg && locked && evm < qrEvmFreeze cfg && varied && good
                      then qrEqMu cfg / lineP else 0
               eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
               eqIm' = VS.zipWith3 (\w lr li -> w + mu * (errI * lr - errR * li)) (rxEqIm st) lineRe lineIm
@@ -394,7 +563,9 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                        , rxTheta = theta', rxFreq = freq'
                        , rxEqRe = eqRe', rxEqIm = eqIm'
                        , rxLineRe = lineRe, rxLineIm = lineIm
-                       , rxEvm_ = evm, rxBad = bad, rxRecent = recent }
+                       , rxEvm_ = evm, rxBad = bad, rxRecent = recent
+                       , rxLocked = latched, rxSyms = rxSyms st + 1
+                       , rxTiming = timing' }
               st2 = if bad >= qrEvmGiveUp cfg then qamRxReset p cfg st1 else st1
           in go st2 (QamSym (ur, ui) idx err2 (yr, yi) : syms)
 

@@ -371,28 +371,15 @@ v32PumpTests = testGroup "V.32 data pump"
     -- calling to answering and not the other way about.
   , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
                      , ("ans->call", Answering, Calling) ]
-  , (nm, ch) <- conds
-  , (rateName r, way, nm) `notElem` weaker ]
+  , (nm, ch) <- conds ]
   where
-    -- What the answering-to-calling direction cannot yet do, and the
-    -- calling-to-answering direction can.  Listed rather than skipped
-    -- quietly, because the asymmetry is the finding: until this test
-    -- ran both ways round it only ever ran call to answer, and every
-    -- one of these was passing by never being asked.
-    --
-    -- 14400 is the bulk of it and the two directions are not equally
-    -- placed to start with -- Figure 4 gives the calling receiver two
-    -- conditioning signals and the answering receiver one -- but that
-    -- does not account for a rate that survives +/-7 Hz one way round
-    -- and not the other.  Open, and the next thing to chase.
-    weaker =
-      [ ("9600", "ans->call", "SNR 18 dB")
-      , ("14400", "ans->call", "carrier offset +7 Hz")
-      , ("14400", "ans->call", "clock +0.3 %")
-      , ("14400", "ans->call", "clock -0.3 %")
-      , ("14400", "ans->call", "delay distortion 1 ms")
-      , ("14400", "ans->call", "clock +0.5 %")
-      ]
+    -- There used to be a list here of what the answering-to-calling
+    -- direction could not do and the calling-to-answering direction
+    -- could: six cases, five of them 14400, a carrier offset and three
+    -- clock offsets among them.  The asymmetry was never the reason.
+    -- All six were the timing loop tracking at its acquiring gain, and
+    -- all six went when it stopped -- 'Modec.V32Pump.narrowTiming' --
+    -- so the list is empty and the filter is gone with it.
     fs = 8000
     trn = 1400
     payload = prbs (11, 9) 4000
@@ -600,8 +587,17 @@ echoTests = testGroup "echo cancellation"
 -- catches a regression rather than pinning an achievement.  Read them
 -- against the decision half-distance of each constellation, which is
 -- 0.71 at 4800, 0.32 at 16 points, 0.22 at 32, 0.15 at 64 and 0.11 at
--- 128: at 14400 the receiver is eating a large fraction of its own
--- margin before the line has done anything at all.
+-- 128.
+--
+-- They used to sit at 50 to 65 %, and two separate things had to be
+-- fixed before they could come down.  One was the measurement: it read
+-- the receiver's running error estimate at the end of the signal, which
+-- is the truncated tail and nothing else, and it moved between 8 % and
+-- 61 % on the same receiver depending on the payload length -- see
+-- 'Modec.V32Pump.settledEvm'.  The other was real, and is the one worth
+-- remembering: the timing loop was acquiring and tracking at the same
+-- gain, and its own noise was eating a quarter of 14400's margin before
+-- the line had done anything at all.  'Modec.V32Pump.narrowTiming'.
 v32FloorTests :: TestTree
 v32FloorTests = testGroup "what the receiver costs itself"
   [ testCase (rateName r ++ " " ++ way) $ do
@@ -617,15 +613,14 @@ v32FloorTests = testGroup "what the receiver costs itself"
       assertEqual "a clean channel costs no bits" 0 errs
       assertBool ("eats " ++ show (round (100 * eaten) :: Int) ++ "% of its margin, over "
                   ++ show (round (100 * lim) :: Int) ++ "%") (eaten <= lim)
-    -- Measured before any of this was fixed, with a little headroom: a
-    -- ceiling to catch a regression, not a target to congratulate
-    -- ourselves on.  12000 and 14400 arrive having already spent half
-    -- of what they have, which is why they are the two that do not
-    -- survive a real call.  4800 is high and does not matter: its four
-    -- points are all the same magnitude, so its decision is a pure
-    -- phase decision and an amplitude error cannot reach it.
-  | (r, lim) <- [ (V32R4800, 0.50), (V32R7200, 0.22), (V32R9600, 0.30)
-                , (V32R9600T, 0.33), (V32R12000, 0.65), (V32R14400, 0.60) ]
+    -- A ceiling to catch a regression, not a target to congratulate
+    -- ourselves on: measured, with a little headroom.  Every rate is
+    -- now inside a seventh of its own margin, which is the shape to
+    -- expect -- the receiver's noise floor is a property of the
+    -- receiver, so it is much the same absolute number at every rate,
+    -- and the constellations it is divided by are not.
+  | (r, lim) <- [ (V32R4800, 0.06), (V32R7200, 0.14), (V32R9600, 0.14)
+                , (V32R9600T, 0.18), (V32R12000, 0.11), (V32R14400, 0.13) ]
   , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
                      , ("ans->call", Answering, Calling) ]
   ]

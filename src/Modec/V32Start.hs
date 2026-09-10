@@ -46,6 +46,7 @@ module Modec.V32Start
   , v32Bis
   , v32EchoAdapt
   , v32Turns
+  , v32LineError
   , v32StartRx
   , v32StartTx
   , v32StartCoder
@@ -169,6 +170,7 @@ data V32Start = V32Start
   , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
+  , vsLineErr :: !Double         -- ^ the far end's training, as a decision error
   }
 
 data Role' = Calling' | Answering' deriving (Eq, Show)
@@ -188,6 +190,20 @@ v32RoundTrip = vsTrip
 -- | Whether the far end is silent, so the echo canceller may adapt.
 v32EchoAdapt :: V32Start -> Bool
 v32EchoAdapt = vsAdapt
+
+-- | What the far end's training looked like: the decision error the
+-- receiver reached against the four training states, which is the line's
+-- noise measured in the units 'rateDecisionMargin' is written in.  This
+-- is what the rate offer is cut by, and the only look at the line either
+-- end gets before it has to choose a rate.
+v32LineError :: V32Start -> Double
+v32LineError = vsLineErr
+
+-- | The receiver told it has not yet read the line: entering AE
+-- switches it to the agreed rate's configuration, and the lock it has
+-- is on four points.
+unlockRx :: V32Start -> V32Start
+unlockRx s = s { vsRx = qamRxUnlock (vsRx s) }
 
 -- | Recent quadrant changes, newest first (for tests and tracing).
 v32Turns :: V32Start -> [Int]
@@ -360,11 +376,12 @@ v32StartInit fs dir offer = V32Start
   , vsTurns = [], vsPrevSym = (0, 0)
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0 }
+  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0
+  , vsLineErr = 1 }
   where
     role = case dir of { Calling -> Calling'; Answering -> Answering' }
     p = v32Params fs
-    cfg = v32RxCfg V32R4800
+    cfg = v32StartCfg
 
 -- | One block in, one block out.  The block may be any length; every
 -- deadline inside is kept in samples, so nothing depends on where the
@@ -410,6 +427,14 @@ observe st rx = st
   , vs1800Run = if tone1800 then vs1800Run st + VS.length rx else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
   , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsDescr = descr', vsBits = bits'
+  -- The best look at the far end's training, not the last one.  The
+  -- error is an exponential mean, so anything that disturbs it -- the
+  -- receiver still converging when TRN starts, a click, the turn-around
+  -- at either end of the window -- can only push it up.  Its floor over
+  -- the window is the line; its value at whatever instant R1 happens to
+  -- be recognised is the line plus whatever else was going on.
+  , vsLineErr = if vsPhase st == OTrainR1 && qamRxPower rxSt > 1e-5
+                  then min (vsLineErr st) (sqrt (qamRxEvm rxSt)) else vsLineErr st
   , vsQuiet = quiet' }
   where
     acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
@@ -454,9 +479,14 @@ observe st rx = st
     -- saves.  Measured both ways: 12000 stops carrying one direction.
     cfgNow = case (afterFarE (vsPhase st), vsRate st) of
       (True, Just r) -> v32RxCfg r
-      (True, Nothing) -> (v32RxCfg V32R4800) { qrAdapt = False, qrTrack = False }
-      (False, _) -> v32RxCfg V32R4800
+      (True, Nothing) -> v32StartCfg { qrAdapt = False, qrTrack = False }
+      (False, _) | seam (vsPhase st) -> v32SeamCfg
+                 | otherwise -> v32StartCfg
     afterFarE ph = case ph of { AE -> True; V32Up _ -> True; _ -> False }
+    -- The last two phases before the data constellation arrives: see
+    -- 'v32SeamCfg'.  AE is where it matters and AR3 is where the lock
+    -- that arms it is taken, the receiver being settled by then.
+    seam ph = case ph of { AR3 -> True; AE -> True; OB1 -> True; _ -> False }
     (rxSt, syms) = qamRxBlock p cfgNow rx (vsRx st)
     -- Everything the start-up has to recognise is a quadrant change:
     -- the conditioning signal is a quarter turn every symbol, the
@@ -537,6 +567,11 @@ detectRate bits =
 -- has been sending -- so requiring that exact sequence rather than any
 -- well-formed one costs nothing and takes another seven bits out of the
 -- chance of a coincidence.
+--
+-- That anchor is what pays for reading E itself as a nearest-match
+-- rather than an exact one, which 'decodeESeqNear' explains: the rate
+-- signal repeats and E does not, so a bit error in E is a bit error in
+-- the only copy there will ever be.
 -- Returns how many bits have arrived since E ended, along with it.
 detectE :: Maybe RateSeq -> [Bool] -> Maybe (Int, RateSeq)
 detectE peer bits =
@@ -544,7 +579,7 @@ detectE peer bits =
               | (off, w) <- seqWindows bits
               , Just r <- [decodeRateSeq (take 16 w)]
               , maybe True (r ==) peer
-              , Just e <- [decodeESeq (drop 16 w)] ]
+              , Just e <- [decodeESeqNear (drop 16 w)] ]
 
 -- | Points for one of the repeating sources.
 srcPoints :: V32Start -> TxSrc -> Int -> (V32Start, [Point])
@@ -676,7 +711,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
     -- The far end stops and starts several times in Figure 4, and each
     -- time the carrier phase, the equaliser and the descrambler that
     -- were tracking the last signal are worse than nothing for the next.
-    restart s = s { vsRx = qamRxReset (v32Params (vsFs s)) (v32RxCfg V32R4800) (vsRx s)
+    restart s = s { vsRx = qamRxReset (v32Params (vsFs s)) v32StartCfg (vsRx s)
                   , vsTurns = [], vsBits = [], vsPrevSym = (0, 0)
                   , vsDescr = scramblerInit }
     rearm s = s { vsRev1800 = revRearm (vsRev1800 s)
@@ -733,10 +768,14 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         Nothing | tooLong 30000 s -> enter (V32Fail "no second reversal") s
                 | otherwise -> s
       OSilent
-        | isConditioning (vsTurns s) -> enter OTrainR1 s { vsSeenS = True }
+        | isConditioning (vsTurns s) -> enter OTrainR1 s { vsSeenS = True, vsLineErr = 1 }
         | tooLong 60000 s -> enter (V32Fail "no conditioning signal") s
         | otherwise -> s
       OTrainR1 -> case detectRate (vsBits s) of
+        -- R1 arrives at the end of the answering modem's TRN, and this
+        -- is the one moment the caller has heard the far end and
+        -- nothing else: our own conditioning signal has not started, so
+        -- the decision error here is the line and not the turn-around.
         Just r1 -> enter OHoldS s { vsPeer = Just r1, vsSrc = TxAltPair StA StB }
         Nothing | tooLong 80000 s -> enter (V32Fail "no rate signal R1") s
                 | otherwise -> s
@@ -857,6 +896,13 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       AWaitMT
         | vsSince s >= maybe (sym 64) id (vsTrip s) -> enter ATrainR2 (restart s)
         | otherwise -> s
+      -- No 'ratesForError' here, unlike the caller's R2.  The answering
+      -- modem's look at the line is taken where its receiver has just
+      -- been restarted for MT and is still converging on the caller's
+      -- TRN, and a measurement taken there reads several times the
+      -- line: at 45 dB on the bench it still refused 14400.  The
+      -- caller's own offer is the one that bounds the choice, and a
+      -- caller that judges its line cuts R2 before we ever see it.
       ATrainR2 -> case detectRate (vsBits s) of
         Just r2 | Just rate <- bestCommonRate (vsOffer s) r2 ->
           let (ps, sc, q) = conditioningRun dir 1400
@@ -881,12 +927,14 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       AR3 | vsSince s < sym 128 -> s
       AR3 -> case detectE (vsPeer s) (vsBits s) of
         Just (_, _) | Just rate <- vsRate s ->
-          enter AE s { vsSrc = TxCoded (eSeqBits (chosen rate))
+          enter AE (unlockRx s) { vsSrc = TxCoded (eSeqBits (chosen rate))
                      , vsAfterE = Just rate, vsSince = 0 }
         _ | tooLong 80000 s -> enter (V32Fail "no E from the calling modem") s
           | otherwise -> s
       AE
-        -- §5.4.2: scrambled ones for 128 symbols after E, then data
+        -- §5.4.2: scrambled ones for 128 symbols after E, then data --
+        -- and not before the far end's own B1 has been seen to start,
+        -- within reason
         | vsSince s >= sym 128, Just rate <- vsRate s -> enter (V32Up rate) s
         | otherwise -> s
 

@@ -10,6 +10,9 @@ module Modec.V32Pump
   ( -- * Line parameters
     v32Params
   , v32RxCfg
+  , v32AcqCfg
+  , v32SeamCfg
+  , v32StartCfg
   , v32RollOff
     -- * Coding to and from symbols
   , TxCoder
@@ -36,6 +39,7 @@ module Modec.V32Pump
   , v32DataRx
   , v32DataTx
   , v32DataEvm
+  , v32DataSps
   , v32DataPower
     -- * Offline helpers
   , v32Modulate
@@ -83,10 +87,40 @@ v32Params fs = QamParams
 -- runs behind it on the same symbols.
 v32RxCfg :: V32Rate -> QamRxCfg
 v32RxCfg r
-  | rateTrellis r = base { qrThKp = 0.03 }
+  | rateTrellis r = base { qrThKp = 0.03
+                         , qrEvmFreeze = guessing * guessing
+                         , qrEvmGiveUp = maxBound }
   | otherwise = base
   where
-    base = defaultRxCfg (slicePoint r) (constellation r)
+    base = narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r)))
+    -- The equaliser's freeze, in the constellation's own units.
+    --
+    -- 'defaultRxCfg' freezes adaptation at a decision error power of
+    -- 0.4, which is an error of 0.63: past the boundary at 4800, where
+    -- it was set, and where it means "the decisions are noise, stop
+    -- learning from them".  On a hundred and twenty-eight points the
+    -- boundary is 0.11 away, and a receiver whose decisions are pure
+    -- guesswork reads 0.09 -- so the freeze at 0.63 never comes, and a
+    -- decision-directed equaliser goes on adapting to its own wrong
+    -- answers.  What that does is shrink: the mean of a wrong decision
+    -- is the middle of the constellation, so every update pulls the
+    -- output a little further in, which makes the next decision worse.
+    -- Measured on a 44 dB recording that the start-up read perfectly:
+    -- the data receiver's output power fell from 0.98 to 0.69 over
+    -- thirty-five thousand symbols with the error pinned at the
+    -- guessing level throughout.
+    --
+    -- The guessing level is what to freeze short of.  A point landing
+    -- anywhere in a square decision cell of side d is d / sqrt 6 from
+    -- its centre on average, and d is twice 'rateMargin'; four fifths
+    -- of that is close enough to guessing that nothing learned there
+    -- is worth keeping.  The give-up reset goes with it: a receiver in
+    -- data mode that cannot read the line asks for a retrain, which is
+    -- the recovery the Recommendation provides, and a reset in the
+    -- middle of that only throws away taps the retrain would have
+    -- started from.
+    guessing = 0.8 * 2 * rateMargin r / sqrt 6
+
     -- Two carrier loops, one per stage.  The four-point receiver that
     -- runs the start-up acquires with the fast gain, which reaches +/-18
     -- Hz and follows timing wander; the trellis rates then inherit that
@@ -107,8 +141,152 @@ v32RxCfg r
 -- amount of waiting helped.  Acquiring and tracking want different
 -- gains, which the comment above already says; they want them at
 -- different times as well.
+-- | The four-point receiver at the seam, where the far end's E gives
+-- way to its B1.
+--
+-- The two are not separated by any boundary this end can see.  An
+-- answering modem reads E, spends its own 128 symbols of B1 sending E,
+-- and goes on reading all the while -- but what it is reading by then
+-- is the caller's B1, at the agreed rate, spread over as many as a
+-- hundred and twenty-eight points.  A four-point slicer shown that
+-- returns a phase error per symbol that is not a phase error, and the
+-- carrier loop follows it: measured on the bench at 14400, theta walked
+-- 0.65 radians across AE, and the rate's receiver inherited a
+-- constellation turned far enough that every decision was wrong and its
+-- own decision-directed loops could not find the way back.
+--
+-- So from R3 on -- by which point the equaliser is trained and the
+-- receiver is reading the four states at about 0.03 -- a symbol landing
+-- a third of the way or more to the decision boundary is not one of
+-- them, and steers nothing.  Before R3 nothing is gated: a line with
+-- real delay distortion starts far outside that and has to be allowed
+-- to converge the ordinary way.
+v32SeamCfg :: QamRxCfg
+v32SeamCfg = v32StartCfg { qrLockAt = gate, qrLoopGate = gate }
+  where gate = (0.35 * rateMargin V32R4800) ^ (2 :: Int)
+
 v32AcqCfg :: V32Rate -> QamRxCfg
-v32AcqCfg r = defaultRxCfg (slicePoint r) (constellation r)
+v32AcqCfg r = narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r)))
+
+-- | The gain's own noise, taken out for every constellation that has
+-- more than one amplitude.
+--
+-- The power estimate the gain divides by is an exponential mean of the
+-- symbol samples.  On the four training states, all at one amplitude,
+-- a twenty-symbol mean is exact; on sixteen points or more, spread over
+-- several amplitudes, it wanders by some percent from one symbol to the
+-- next, and the gain wanders with it -- which is a decision error of
+-- about 0.05 on every symbol at any signal to noise ratio, and nothing
+-- downstream can take it back out.  Measured on the bench at 45 dB:
+-- 0.063 with the twenty-symbol mean, 0.040 with a five-hundred-symbol
+-- one.  On a hundred and twenty-eight points that 0.05 is more than
+-- half the way to guessing, and a receiver arriving at the handover
+-- with it never converges at all.
+--
+-- Slow once the receiver has read the line, and not before: a receiver
+-- that starts cold, with no training behind it, needs the fast estimate
+-- to find the level at all, and only once it is reading can it afford
+-- to stop chasing its own data.  The four-point receiver that runs the
+-- start-up keeps the fast estimate throughout, because on one amplitude
+-- it costs nothing.
+settledAgc :: V32Rate -> QamRxCfg -> QamRxCfg
+settledAgc r c
+  | r == V32R4800 = c
+  | otherwise = c { qrAgcSettled = 0.002 }
+
+-- | The timing loop's own noise, taken out once the loop no longer
+-- needs the bandwidth it was acquiring with.
+--
+-- The Gardner detector reports the data as well as the timing -- see
+-- 'Modec.QAM.qamRxBlock' -- so the acquiring gain of 0.12 dithers the
+-- sampling instant every symbol, and the interpolator turns that into a
+-- decision error of about 0.03 that no channel puts there and no
+-- equaliser can take out.  It is the same 0.03 at every rate, which is
+-- what makes it a V.32bis problem and not a V.32 one: at 9600 trellis
+-- the points are 0.22 apart and it costs 12 % of the margin; at 14400
+-- they are 0.11 apart and it costs 27 %, so a call connects, sits on
+-- the byte gate, and retrains itself to death.  Measured over a real
+-- 14400 call at 46 dB: 0.072 at the acquiring gain, 0.040 at a quarter
+-- of it, and the difference between four seconds of link and the whole
+-- recording.
+--
+-- A quarter and not a tenth.  The floor keeps falling past that -- 0.007
+-- with no channel at a tenth against 0.009 at a quarter -- but so does
+-- the pull-in range, and the start-up is where this receiver has to
+-- catch a signal it knows nothing about: at a tenth the calling ladder
+-- does not reach the data phase of a real recording at all.  A quarter
+-- holds a 100 ppm clock offset and a 7 Hz carrier offset with three
+-- quarters of the improvement in hand.
+--
+-- And not at every rate, because the bandwidth is not only a cost.  It
+-- is what follows a line whose delay is moving, and the impairment
+-- suite asks 4800 and 9600 to work through half a percent of speed
+-- deviation at 2 Hz -- 3 samples of delay, swinging, which a narrow
+-- loop cannot stay with.  So the trade is made where the margin cannot
+-- pay for the noise and left alone where it can: 4800 spends 4 % of its
+-- margin on the wide loop and 9600 13 %, and both keep it; 12000 and
+-- 14400 would spend a fifth and a quarter, and do not.
+--
+-- 'qrTrackAt' is armed at every rate all the same -- it is only the
+-- gains that differ -- because the latch has to be taken where the
+-- signal is four points and the decisions are certain.  A fifth of the
+-- rate's own decision margin: on the four states that is 0.14, against
+-- the 0.03 the start-up settles at and the 0.3 or more it passes
+-- through on the way, so it latches once, in the start-up, and the data
+-- pump inherits a narrow loop it could not have earned for itself on a
+-- hundred and twenty-eight points.
+narrowTiming :: V32Rate -> QamRxCfg -> QamRxCfg
+narrowTiming r c
+  | selfNoise > rateMargin r / 6 = narrowed armed
+  | otherwise = armed
+  where
+    armed = c { qrTrackAt = (0.2 * rateMargin r) ^ (2 :: Int) }
+    -- What the acquiring loop costs, measured with no channel at all
+    -- and the same at every rate, because it is the receiver's and not
+    -- the line's.  Against 4800's margin of 0.71 it is nothing; against
+    -- 14400's 0.11 it is a quarter of the way to a wrong answer.
+    selfNoise = 0.03
+
+-- | A quarter of the acquiring gains.
+--
+-- The knee, and the whole of the trade.  Measured at 14400 with no
+-- channel: 0.030 at the acquiring gains, 0.0155 at a half, 0.0094 at a
+-- quarter, 0.0069 at a tenth and 0.0063 at a fortieth -- so a quarter
+-- takes three-quarters of what there is to take, and past it the return
+-- goes flat while the cost does not.  The cost is pull-in: at a tenth
+-- the calling ladder does not reach the data phase on a real recording
+-- at all, and a receiver has to catch a signal before it can sit on it.
+--
+-- Both gains, because they are one loop.  The integral term is the
+-- larger share of the noise -- it is a random walk in the symbol rate
+-- driven by the detector, and nothing damps it -- but it is also the
+-- only thing that tracks a clock that is moving, so narrowing it alone
+-- buys 0.058 where both buy 0.040 and gives up delay modulation
+-- entirely.
+narrowed :: QamRxCfg -> QamRxCfg
+narrowed c = c { qrKpTrack = 0.25 * qrKp c, qrKiTrack = 0.25 * qrKi c }
+
+-- | The four-point receiver the start-up runs, which narrows whatever
+-- rate the call is going to end up at.
+--
+-- The start-up is not a data pump that happens to be reading four
+-- points, and this is where they part company.  Its signal is TRN --
+-- the same four states every time, at a level both ends agreed on, for
+-- a few seconds -- and its output is a clock, a carrier and an
+-- equaliser handed to whatever constellation was negotiated.  What it
+-- hands over is only as good as its own timing, and a data pump cannot
+-- make up the difference afterwards: narrowing at the handover and not
+-- before leaves the 14400 receiver holding a clock that was dithered
+-- for the whole of the start-up, which measured worse over a real call
+-- than not narrowing at all -- 0.090 against 0.068, and a retrain three
+-- seconds sooner.
+--
+-- 'v32RxCfg' at 4800 stays wide because it is a different job: a call
+-- that settles on 4800 holds that line for as long as the session
+-- lasts, through whatever the line does to its delay, and 4800's margin
+-- can afford every bit of the noise the bandwidth costs.
+v32StartCfg :: QamRxCfg
+v32StartCfg = narrowed (v32RxCfg V32R4800)
 
 -- | How long that lasts.  §5.4.2's B1 is 128 symbol intervals of
 -- scrambled ones between E and the data, put there so a receiver can
@@ -314,28 +492,72 @@ v32DemodulateTrainedWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32
 v32DemodulateTrainedWith tune fs dir r preSyms sig =
   fst (v32DemodulateTrainedEvmWith tune fs dir r preSyms sig)
 
--- | The same, and the receiver's decision error where it finished.
+-- | The same, and the receiver's decision error over the settled part of
+-- the run.
 --
 -- On a clean channel that error is the implementation noise and nothing
 -- else, which is the only way to see a floor that costs no bit errors at
 -- all until it costs every one of them: a receiver can be eating four
 -- tenths of its own decision margin and still decode a noiseless signal
 -- perfectly.
+--
+-- A mean square over the run, and not the receiver's own running
+-- estimate where it stopped -- which is what this used to return, and
+-- which measured the wrong thing twice over.  That estimate is
+-- exponential with a fifty-symbol memory, so reading it at the end reads
+-- the last fifty symbols; and the last symbols of an offline signal are
+-- the ones whose root raised cosine tail was never transmitted, because
+-- the vector ends.  Truncation noise, sampled once: the same receiver on
+-- the same signal read 8 % of its margin at one payload length and 61 %
+-- at another, which is why the ceilings hanging off it had to be set at
+-- 60 % before they were quiet.  The head goes too -- 'settleSyms' of it
+-- -- because a receiver acquiring is not a receiver's floor.
 v32DemodulateTrainedEvm :: Double -> Direction -> V32Rate -> Int -> Signal -> ([Bool], Double)
 v32DemodulateTrainedEvm = v32DemodulateTrainedEvmWith id
 
 v32DemodulateTrainedEvmWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal
                             -> ([Bool], Double)
 v32DemodulateTrainedEvmWith tune fs dir r preSyms sig =
-  (snd (decodeSymbols dir r syms rxCoderInit), qamRxEvm stEnd)
+  (snd (decodeSymbols dir r syms rxCoderInit), settledEvm syms)
   where
     p = v32Params fs
+    -- The 4800 receiver and not 'v32StartCfg', although the prefix is
+    -- the start-up's own signal.  This harness exists to measure a data
+    -- pump on a stated channel, and handing it a prefix read at the
+    -- start-up's narrower timing bandwidth measures the start-up's
+    -- tracking instead: on a line whose delay moves half a percent the
+    -- prefix arrives out of step and 4800 and 9600 lose bits they hold
+    -- comfortably on a real call, where the start-up has Figure 4's
+    -- seconds rather than 1400 symbols to work with.
     trainCfg = tune (v32RxCfg V32R4800)
     dataCfg = tune (v32RxCfg r)
     preN = ceiling (fromIntegral preSyms * samplesPerSymbol p)
     (pre, dat) = VS.splitAt preN sig
     stAfter = snd (runBlocks p trainCfg pre (qamRxInit p trainCfg))
-    (syms, stEnd) = runBlocks p dataCfg dat stAfter
+    (syms, _) = runBlocks p dataCfg dat stAfter
+
+-- | Mean square decision error over the middle of a run: past the
+-- acquisition, short of the truncated tail.
+settledEvm :: [QamSym] -> Double
+settledEvm syms
+  | null keep = 0
+  | otherwise = sum keep / fromIntegral (length keep)
+  where
+    n = length syms
+    keep = map qsError (take (max 0 (n - settleSyms - tailSyms)) (drop settleSyms syms))
+
+-- | How much of the head belongs to acquisition rather than to the
+-- floor.  A receiver handed a trained equaliser and a settled clock is
+-- reading properly well inside this; one that is not does not belong in
+-- this measurement either way.
+settleSyms :: Int
+settleSyms = 400
+
+-- | And how much of the tail is the signal running out.  The pulse spans
+-- 12 symbols each side, so the last dozen symbols of any finite signal
+-- are missing half their energy; a couple of times that is clear of it.
+tailSyms :: Int
+tailSyms = 32
 
 -- | Drive the receiver over a whole signal, returning the state it ends
 -- in as well as the symbols.  The trained start-up needs that state to
@@ -372,7 +594,7 @@ v32DataInit fs r = V32Data
 -- | A data pump that inherits a receiver and transmitter the start-up
 -- has already brought into lock.
 v32DataFrom :: QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
-v32DataFrom rx tx code st = st { vdRx = rx, vdTx = tx, vdCode = code }
+v32DataFrom rx tx code st = st { vdRx = qamRxUnlock rx, vdTx = tx, vdCode = code }
 
 -- | The receiver and transmitter a retrain has to carry back into the
 -- start-up, so the symbol clock and carrier phase do not restart in the
@@ -394,10 +616,15 @@ v32DataTxState = vdTx
 -- of a symbol the coder had left over.
 v32DataResume :: Double -> V32Rate -> QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
 v32DataResume fs r rx tx code old =
-  (v32DataInit fs r) { vdRx = rx, vdTx = tx, vdCode = code, vdBits = vdBits old }
+  (v32DataInit fs r) { vdRx = qamRxUnlock rx, vdTx = tx, vdCode = code, vdBits = vdBits old }
 
 v32DataEvm :: V32Data -> Double
 v32DataEvm = qamRxEvm . vdRx
+
+-- | The receiver's samples per symbol, as its timing recovery has it.
+-- 8000/2400 is 3.3333 when the two clocks agree.
+v32DataSps :: V32Data -> Double
+v32DataSps = qamRxSps . vdRx
 
 -- | The received signal power the receiver is working from: an average
 -- of the raw symbol magnitude before the AGC touches it, so it goes to
