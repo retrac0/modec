@@ -34,7 +34,7 @@ main = do
     , channelSimTests
     , specs
     , testGroup "frequency shift"
-        [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests]
+        [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, resampleTests]
     , testGroup "bringing a call up"
         [handshakeTests, modemTests, v8Tests, telnetTests]
     -- Recorded calls, replayed through the whole modem: the only tests

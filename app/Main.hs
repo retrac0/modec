@@ -44,14 +44,14 @@ data Band = BandLow | BandHigh | BandAuto deriving (Eq, Show)
 data Tones = TBell103 | TV21 | TV23 | TTty45 | TTty50 deriving (Eq, Show)
 
 data Cmd
-  = Decode Tones Band Double FilePath
+  = Decode Tones Band Double Input
   | Encode Tones Band Int Double SampleFormat FilePath
-  | Probe FilePath
-  | Detect FilePath
-  | V32Trace Bool FilePath   -- ^ True = we were the answering modem
+  | Probe Input
+  | Detect Input
+  | V32Trace Bool Input      -- ^ True = we were the answering modem
   | Replay ReplayOpts
-  | ProgressOf FilePath
-  | DtmfOf FilePath
+  | ProgressOf Input
+  | DtmfOf Input
   | RunModem ModemOpts
   | DialOut DialOpts
   | AnswerIn AnswerOpts
@@ -73,8 +73,42 @@ data ReplayOpts = ReplayOpts
   , roChannel :: Maybe String
   , roMint    :: Maybe String
   , roDir     :: FilePath
-  , roPath    :: FilePath
+  , roInput   :: Input
   }
+
+-- | A recording for the offline tools: a WAV, or a headerless file in
+-- a named format, and optionally brought to another sample rate before
+-- anything looks at it.
+data Input = Input
+  { inPath    :: FilePath
+  , inRate    :: Maybe Int          -- ^ resample to this; the file's own rate otherwise
+  , inRaw     :: Maybe SampleFormat -- ^ no header, mono samples in this format
+  , inRawRate :: Int                -- ^ and at this rate
+  }
+
+inputP :: Parser Input
+inputP = Input
+  <$> argument str (metavar "FILE")
+  <*> optional (option auto (long "rate" <> metavar "HZ"
+        <> help "resample the recording to this rate before the modem sees it (default: run at the file's own rate)"))
+  <*> optional (option (maybeReader formatNamed) (long "raw" <> metavar "FMT"
+        <> help ("the file has no header and holds mono samples in this format: " ++ unwords formatNames)))
+  <*> option auto (long "raw-rate" <> value 8000 <> showDefault <> metavar "HZ" <> help "the sample rate of a --raw file")
+
+-- | The samples, their rate, and a description for the log.
+readInput :: Input -> IO (Double, Signal, String)
+readInput inp = do
+  (fs0, x0, what) <- case inRaw inp of
+    Just fmt -> do
+      bs <- B.readFile (inPath inp)
+      return (fromIntegral (inRawRate inp), decodeSamples fmt bs, "raw " ++ describeFormat fmt)
+    Nothing -> do
+      w <- readWav (inPath inp)
+      return (fromIntegral (wavRate w), wavSamples w, show (wavChannels w) ++ " channels, " ++ describeFormat (wavFormat w))
+  return $ case inRate inp of
+    Just r | fromIntegral r /= fs0 ->
+      (fromIntegral r, resampleTo fs0 (fromIntegral r) x0, what ++ ", resampled from " ++ show (round fs0 :: Int) ++ " Hz")
+    _ -> (fs0, x0, what)
 
 channelP :: Parser Band
 channelP =
@@ -109,17 +143,17 @@ cmdP = hsubparser
   where
     decodeP = Decode <$> stdP <*> channelP
       <*> option auto (long "squelch" <> value 0.01 <> showDefault <> help "min tone amplitude, full scale = 1")
-      <*> argument str (metavar "FILE.wav")
+      <*> inputP
     encodeP = Encode <$> stdP <*> channelP
       <*> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "amplitude")
       <*> option (maybeReader formatNamed) (long "format" <> value S16 <> metavar "FMT"
              <> help ("sample format, default s16: " ++ unwords formatNames))
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
-    probeP = Probe <$> argument str (metavar "FILE.wav")
-    detectP = Detect <$> argument str (metavar "FILE.wav")
+    probeP = Probe <$> inputP
+    detectP = Detect <$> inputP
     v32traceP = V32Trace <$> switch (long "answer" <> help "we were the answering modem (default: calling)")
-                         <*> argument str (metavar "FILE.wav")
+                         <*> inputP
     replayP = Replay <$> (ReplayOpts
       <$> modesP
       <*> switch (long "answer" <> help "we were the answering modem (default: calling)")
@@ -140,9 +174,9 @@ cmdP = hsubparser
       <*> optional (strOption (long "mint" <> metavar "NAME"
              <> help "write NAME.wav (trimmed to --seconds), NAME.txt (this decode) and NAME.call into the fixture directory"))
       <*> strOption (long "fixture-dir" <> value "test/fixtures/live" <> showDefault <> metavar "DIR")
-      <*> argument str (metavar "FILE.wav"))
-    progressP = ProgressOf <$> argument str (metavar "FILE.wav")
-    dtmfP = DtmfOf <$> argument str (metavar "FILE.wav")
+      <*> inputP)
+    progressP = ProgressOf <$> inputP
+    dtmfP = DtmfOf <$> inputP
     fakeP = FakeDongleCmd <$> (FakeOpts
       <$> option (maybeReader formatNamed) (long "format" <> value Pcm14 <> metavar "FMT"
              <> help "the +VSM format the dongle streams in: pcm14, ulaw, alaw, u8 or s8 (default pcm14)")
@@ -332,11 +366,9 @@ main :: IO ()
 main = do
   cmd <- execParser (info (cmdP <**> helper) (fullDesc <> progDesc "modec: software audio modem"))
   case cmd of
-    Decode std ch squelch path -> do
-      w <- readWav path
-      let fs = fromIntegral (wavRate w)
-          x = wavSamples w
-          spec = case ch of
+    Decode std ch squelch inp -> do
+      (fs, x, _) <- readInput inp
+      let spec = case ch of
             _ | isTty std -> specFor std BandLow     -- one pair, both directions
             BandAuto ->
               let o = specFor std BandLow
@@ -372,42 +404,37 @@ main = do
     RunModem mo -> runModem mo
     DialOut d -> runDial d
     AnswerIn a -> runAnswer a
-    V32Trace answered path -> do
-      w <- readWav path
-      let fs = fromIntegral (wavRate w)
-          dir = if answered then Answer else Originate
-      forM_ (v32Timeline fs dir (wavSamples w)) $ \(t, what) ->
+    V32Trace answered inp -> do
+      (fs, x, _) <- readInput inp
+      let dir = if answered then Answer else Originate
+      forM_ (v32Timeline fs dir x) $ \(t, what) ->
         printf "%8.3f  %s\n" t what
     Replay ro -> runReplay ro
-    Detect path -> do
-      w <- readWav path
-      let fs = fromIntegral (wavRate w)
-          x = wavSamples w
+    Detect inp -> do
+      (fs, x, _) <- readInput inp
       putStrLn "FSK channel scores (fraction of frames dominated by the channel's tones):"
       forM_ (detectFsk fs x) $ \(s, sc) -> printf "  %-18s %.3f\n" (fskName s) sc
       putStrLn "Tone runs longer than 100 ms:"
       forM_ [ r | r <- toneRunsWith diagnosticToneBank fs x, trEnd r - trStart r >= 0.1 ] $ \r ->
         printf "  %7.3f - %7.3f s  %s\n" (trStart r) (trEnd r) (maybe "silence / no dominant tone" (\f -> printf "%.0f Hz" f) (trTone r) :: String)
-    ProgressOf path -> do
-      w <- readWav path
-      let evs = callProgress (fromIntegral (wavRate w)) (wavSamples w)
+    ProgressOf inp -> do
+      (fs, x, _) <- readInput inp
+      let evs = callProgress fs x
       if null evs
         then putStrLn "no call progress tone recognised"
         else mapM_ (putStrLn . describeProgress) evs
-    DtmfOf path -> do
-      w <- readWav path
-      let ds = dtmfDecode (fromIntegral (wavRate w)) defaultDtmfParams (wavSamples w)
+    DtmfOf inp -> do
+      (fs, x, _) <- readInput inp
+      let ds = dtmfDecode fs defaultDtmfParams x
       if null ds
         then putStrLn "no DTMF digits"
         else do
           forM_ ds $ \d ->
             printf "%7.3f s  %c  %4.0f ms  amplitude %.3f\n" (ddStart d) (ddChar d) (ddDuration d * 1000) (ddLevel d)
           putStrLn ("dialled: " ++ map ddChar ds)
-    Probe path -> do
-      w <- readWav path
-      let fs = fromIntegral (wavRate w)
-          x = wavSamples w
-          n = VS.length x
+    Probe inp -> do
+      (fs, x, what) <- readInput inp
+      let n = VS.length x
           len = round (fs * 0.02) :: Int
           tones = [ ("bell103 orig space", 1070), ("bell103 orig mark", 1270)
                   , ("bell103 ans space", 2025), ("bell103 ans mark", 2225)
@@ -416,7 +443,7 @@ main = do
                   , ("v23 back mark", 390), ("v23 back space", 450), ("v23 fwd mark", 1300)
                   , ("tty mark", 1400), ("tty space", 1800)
                   , ("v25 answer tone", 2100), ("v22 low carrier", 1200), ("v22 high carrier", 2400) ]
-      printf "%s: %d Hz, %d channels, %s, %.2f s, rms %.4f\n" path (wavRate w) (wavChannels w) (describeFormat (wavFormat w))
+      printf "%s: %d Hz, %s, %.2f s, rms %.4f\n" (inPath inp) (round fs :: Int) what
         (fromIntegral n / fs :: Double) (rms x)
       forM_ tones $ \(name, f) -> do
         let e = toneEnergy fs f len x
@@ -431,16 +458,16 @@ main = do
 -- corpus fixture is made of.
 runReplay :: ReplayOpts -> IO ()
 runReplay ro = do
-  w <- readWav (roPath ro)
-  let fs = fromIntegral (wavRate w) :: Double
+  (fs, samples, _) <- readInput (roInput ro)
+  let
       -- The same assembly the corpus uses, so a replay from the command
       -- line and the test that replays the fixture it mints are the same
       -- modem.  Only the two decision-error gates are the command's own.
       cfg = (callSpecConfig fs (replaySpec ro))
               { mcMaxEvm = roMaxEvm ro, mcMaxEvmV32 = roMaxEvmV32 ro }
       trimmed = case roSeconds ro of
-        Nothing -> wavSamples w
-        Just s -> VS.take (round (s * fs)) (wavSamples w)
+        Nothing -> samples
+        Just s -> VS.take (round (s * fs)) samples
       x = Ch.applyChannel fs (impairments (roChannel ro) (roImpair ro)) trimmed
       rc = (defaultReplayConfig cfg)
              { rcEvery = if roLine ro then Just 0.5 else Nothing }
@@ -454,7 +481,7 @@ runReplay ro = do
   B.hPut stdout (B.pack (rrBytes r))
   case roMint ro of
     Nothing -> return ()
-    Just name -> mint ro r name (wavRate w) trimmed
+    Just name -> mint ro r name (round fs) trimmed
 
 describeEvent :: ModemEvent -> String
 describeEvent e = case e of
@@ -558,7 +585,7 @@ mint ro r name rate trimmed = do
     dir = roDir ro
     conn = connectLine (rrEvents r)
     spec = (replaySpec ro)
-      { csComment   = [takeFileName (roPath ro)]
+      { csComment   = [takeFileName (inPath (roInput ro))]
       , csConnect   = conn
       , csRetrains  = [retrainCount (rrEvents r) | conn /= "none"]
       , csTolerance = 0

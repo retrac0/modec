@@ -47,6 +47,7 @@ module Modec.DSP
   , sampleAtFast
   , cubicAt
   , resampleBy
+  , resampleTo
   , variableDelay
   , frequencyShift
   ) where
@@ -420,6 +421,25 @@ cubicAt v t =
 resampleBy :: Double -> Signal -> Signal
 resampleBy ratio x = VS.generate m (\i -> sampleAt x (fromIntegral i * ratio))
   where m = max 0 (floor (fromIntegral (VS.length x - 1) / ratio) + 1)
+
+-- | The signal at another sample rate.
+--
+-- The modem runs at whatever rate its input has, and nothing here
+-- needs this to decode a 48 kHz recording.  What it buys is running
+-- one at the rate everything else here is measured at, and at a
+-- thirty-fifth of the cost, since the FSK front end is O(fs^2).
+-- Going down, the band above the new Nyquist would fold back in, so
+-- it is removed first: a low-pass at 0.45 of the new rate, its
+-- transition a tenth of that, and its delay taken back out so the
+-- result lines up with the original in time.
+resampleTo :: Double -> Double -> Signal -> Signal
+resampleTo from to x
+  | from == to = x
+  | to > from = resampleBy (from / to) x
+  | otherwise = resampleBy (from / to) (VS.drop half (fir h (x VS.++ VS.replicate half 0)))
+  where
+    h = firLowpass from (0.45 * to) (round (55 * from / to))
+    half = VS.length h `div` 2
 
 -- | Time-varying delay: @out[i] = x(i - d i)@ with @d@ in samples.
 variableDelay :: (Int -> Double) -> Signal -> Signal

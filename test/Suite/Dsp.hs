@@ -75,6 +75,26 @@ dspTests = testGroup "shared DSP primitives"
           assertBool ("unit energy: " ++ show e) (abs (e - 1) < 1e-9)
           assertBool "symmetric" (VS.toList k == reverse (VS.toList k))
 
+  , testCase "resampling keeps a tone, drops what would alias, and lines up in time" $ do
+      let tone fs hz n = VS.generate n (\i -> 0.5 * sin (2 * pi * hz * fromIntegral i / fs)) :: Signal
+          -- the middle of a signal, clear of the filter's ends
+          middle y = VS.slice 500 (VS.length y - 1000) y
+          at fs hz y = toneAmplitude (VS.length (middle y)) (goertzel fs hz (middle y))
+          down = resampleTo 48000 8000 (tone 48000 1000 48000)
+          up = resampleTo 8000 48000 (tone 8000 1000 8000)
+          folded = resampleTo 48000 8000 (tone 48000 5000 48000)
+          close name tol want got = assertBool (name ++ ": " ++ show got) (abs (got - want) < tol)
+      assertBool ("length down " ++ show (VS.length down)) (abs (VS.length down - 8000) <= 2)
+      assertBool ("length up " ++ show (VS.length up)) (abs (VS.length up - 48000) <= 8)
+      close "1 kHz survives going down" 0.01 0.5 (at 8000 1000 down)
+      close "and going up" 0.01 0.5 (at 48000 1000 up)
+      -- 5 kHz would fold to 3 kHz at 8 kHz; the low-pass is what keeps it out
+      assertBool ("5 kHz folded to " ++ show (at 8000 3000 folded)) (at 8000 3000 folded < 0.005)
+      -- the filter's delay is taken back out: sample k of the result is
+      -- sample 6k of the input, not 6k minus half a kernel
+      let x = tone 48000 1000 48000
+      close "aligned" 0.02 (x VS.! 6000) (down VS.! 1000)
+
   , testCase "root raised cosine squares up to a Nyquist pulse" $ do
       -- RRC convolved with itself is a raised cosine, which is zero at
       -- every non-zero multiple of the symbol period.  That is the

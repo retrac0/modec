@@ -1,5 +1,5 @@
 -- | Bell 103, V.21 and V.23: the frequency-shift modems.
-module Suite.Fsk (roundTrip, Payload (..), ShortPayload (..), propertyTests, errorRateTests, channelTests, chunkTests, detectTests) where
+module Suite.Fsk (roundTrip, Payload (..), ShortPayload (..), propertyTests, errorRateTests, channelTests, chunkTests, detectTests, resampleTests) where
 
 import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
@@ -96,6 +96,22 @@ chunkTests = testGroup "chunk invariance"
           streamed = concatStage (fskReceiver fs bell103Answer framing8N1 defaultDemodParams) chunks
       assertEqual "bytes" whole streamed
   | c <- [7, 160, 1000, 4096] ]
+
+-- | The two fixtures recorded at sound-card rates decode the same
+-- brought to 8 kHz as they do natively -- which is what makes --rate a
+-- way to run any recording through the path everything else is
+-- measured at.
+resampleTests :: TestTree
+resampleTests = testGroup "recordings at other rates, brought to 8 kHz"
+  [ testCase name $ do
+      w <- readWav (fixtureDir </> name)
+      let fs = fromIntegral (wavRate w)
+          x = wavSamples w
+          native = demodulate fs spec framing8N1 defaultDemodParams x
+          at8k = demodulate 8000 spec framing8N1 defaultDemodParams (resampleTo fs 8000 x)
+      assertBool "decodes at all" (not (null native))
+      assertEqual "the same bytes" native at8k
+  | (name, spec) <- [("bell103_ans_48k.wav", bell103Answer), ("bell103_orig_44k1_long.wav", bell103Originate)] ]
 
 -- | Conditions the Bell 103 receiver must survive without a single error.
 channelTests :: TestTree
