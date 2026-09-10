@@ -13,6 +13,7 @@ import Suite.Dsp
 import Suite.Fsk
 import Suite.Link
 import Suite.Mnp
+import Suite.Session
 import Suite.Tones
 import Suite.Tools
 import Suite.V22
@@ -42,7 +43,7 @@ main = do
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"
-        [hayesTests, baresipTests, pipewireTests, hermeticTests]
+        [hayesTests, baresipTests, pipewireTests, sessionTests, hermeticTests]
     , testGroup "tones as meaning"
         [ttyTests, dtmfTests, progressTests]
     ]

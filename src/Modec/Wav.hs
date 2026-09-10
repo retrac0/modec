@@ -8,6 +8,9 @@ module Modec.Wav
   , encodeWav16Mono
   , readWav
   , writeWav16Mono
+    -- * Raw 16-bit little-endian mono
+  , decodeS16
+  , encodeS16
     -- * Streaming writer
   , WavWriter
   , openWav16Mono
@@ -99,12 +102,27 @@ encodeWav16Mono :: Int -> Signal -> BL.ByteString
 encodeWav16Mono rate x = BB.toLazyByteString $
      BB.byteString "RIFF" <> w32 (36 + dataLen) <> BB.byteString "WAVE"
   <> BB.byteString "fmt " <> w32 16 <> w16 1 <> w16 1 <> w32 rate <> w32 (rate * 2) <> w16 2 <> w16 16
-  <> BB.byteString "data" <> w32 dataLen <> VS.foldr (\v acc -> BB.int16LE (toI16 v) <> acc) mempty x
+  <> BB.byteString "data" <> w32 dataLen <> BB.byteString (encodeS16 x)
   where
     dataLen = VS.length x * 2
     w32, w16 :: Int -> BB.Builder
     w32 = BB.word32LE . fromIntegral
     w16 = BB.word16LE . fromIntegral
+
+-- | Samples exactly as they come off a sound card or go down a pipe:
+-- 16-bit little-endian, one channel, no header.
+--
+-- The same arithmetic the PCM 16 case of 'decodeWav' and the body of
+-- 'encodeWav16Mono' do, and it had been written out a third time in the
+-- executable for the audio device -- which is the one copy no test could
+-- reach.
+decodeS16 :: B.ByteString -> Signal
+decodeS16 bs = VS.generate (B.length bs `div` 2) $ \i ->
+  fromIntegral (fromIntegral (le16 bs (2 * i)) :: Int16) / 32768
+
+encodeS16 :: Signal -> B.ByteString
+encodeS16 x = BL.toStrict (BB.toLazyByteString (VS.foldr (\v acc -> BB.int16LE (toI16 v) <> acc) mempty x))
+  where
     toI16 :: Double -> Int16
     toI16 v = round (max (-1) (min 1 v) * 32767)
 

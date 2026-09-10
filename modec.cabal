@@ -26,6 +26,7 @@ library
                       Modec.Replay
                       Modec.Fixture
                       Modec.Loopback
+                      Modec.Session
                       Modec.Telnet
                       Modec.Async
                       Modec.Baudot
@@ -104,6 +105,7 @@ test-suite modec-test
                       Suite.Fsk
                       Suite.Link
                       Suite.Mnp
+                      Suite.Session
                       Suite.Tones
                       Suite.Tools
                       Suite.V22
