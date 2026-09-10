@@ -46,6 +46,7 @@ data Cmd
   | DtmfOf FilePath
   | RunModem ModemOpts
   | DialOut DialOpts
+  | AnswerIn AnswerOpts
   | ListDevices
 
 -- | Reading a recording back through the whole modem, and optionally
@@ -56,6 +57,7 @@ data ReplayOpts = ReplayOpts
   , roV8      :: Bool
   , roMnp     :: Maybe Int
   , roMaxEvm  :: Double
+  , roMaxEvmV32 :: Double
   , roSeconds :: Maybe Double
   , roLine    :: Bool
   , roImpair  :: [String]
@@ -90,6 +92,7 @@ cmdP = hsubparser
   <> command "progress" (info progressP (progDesc "Report the call progress tones in a WAV file: dial tone, ringing, busy, congestion, special information tone"))
   <> command "dtmf"  (info dtmfP   (progDesc "Report the DTMF digits in a WAV file"))
   <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
+  <> command "answer" (info answerP (progDesc "Register over SIP and answer incoming calls, greeting the caller"))
   <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
   <> command "devices" (info (pure ListDevices) (progDesc "List the PipeWire audio devices usable with --pw-in / --pw-out"))
   )
@@ -113,7 +116,9 @@ cmdP = hsubparser
            <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, offering only up to class N")
            <|> pure Nothing)
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
-             <> help "stop passing bytes to the DTE above this decision error")
+             <> help "stop passing bytes to the DTE above this decision error (V.22 family)")
+      <*> option auto (long "max-evm-v32" <> value 0.5 <> showDefault <> metavar "E"
+             <> help "the same gate for V.32, as a fraction of the constellation's own margin")
       <*> optional (option auto (long "seconds" <> metavar "S" <> help "stop after this much of the recording"))
       <*> switch (long "line" <> help "report the receiver's decision error and symbol timing twice a second")
       <*> many (strOption (long "impair" <> metavar "K=V"
@@ -161,8 +166,10 @@ cmdP = hsubparser
       <*> optional (strOption (long "record-rx" <> metavar "FILE.wav" <> help "also record the whole session's received audio to one WAV, start to finish"))
       <*> optional (strOption (long "record-tx" <> metavar "FILE.wav" <> help "as --record-rx, for transmitted audio"))
       <*> recordDirP
-      <*> pure Nothing
-      <*> pure False
+      <*> pure Nothing      -- moAutoType: `modem` types nothing on your behalf
+      <*> switch (long "banner"
+                  <> help "on connecting, send the far end a line or two about what was negotiated. `modec answer` sets this")
+      <*> pure False        -- moHangupExits
       <*> ignoreBusyP)
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
@@ -189,6 +196,17 @@ cmdP = hsubparser
                                  <> help "put the modem on a telnet port instead of this terminal"))
       <*> flag True False (long "no-launch" <> help "expect baresip to be running already")
       <*> switch (long "stay" <> help "keep the AT prompt when the call ends, instead of exiting")
+      <*> modemP')
+    answerP = AnswerIn <$> (AnswerOpts
+      <$> strOption (long "sip" <> metavar "HOST:PORT" <> value "127.0.0.1:4444" <> showDefault
+                     <> help "baresip's ctrl_tcp address")
+      <*> optional (strOption (long "sip-domain" <> metavar "DOMAIN"
+                               <> help "domain we answer for (default: the one in ~/.baresip/accounts)"))
+      <*> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> showDefault
+                     <> help "PipeWire loopback pair shared with the softphone")
+      <*> optional (option auto (long "listen" <> metavar "PORT"
+                                 <> help "put the modem on a telnet port instead of this terminal"))
+      <*> flag True False (long "no-launch" <> help "expect baresip to be running already")
       <*> modemP')
     -- The modem's own settings, shared with `modec modem`: how to
     -- negotiate, whether to error-correct, what to record.  Everything
@@ -333,6 +351,7 @@ main = do
         else putStr (describeNodes ns)
     RunModem mo -> runModem mo
     DialOut d -> runDial d
+    AnswerIn a -> runAnswer a
     V32Trace answered path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)
@@ -397,6 +416,7 @@ runReplay ro = do
       role = if roAnswer ro then H.Answer else H.Originate
       cfg0 = defaultModemConfig fs role (roModes ro)
       cfg = cfg0 { mcMaxEvm = roMaxEvm ro
+                 , mcMaxEvmV32 = roMaxEvmV32 ro
                  , mcMnp = fmap (\c -> (defaultMnpConfig 2400 (not (roAnswer ro))) { mnClass = c })
                                 (roMnp ro)
                  , mcHandshake = (mcHandshake cfg0) { H.hcV8 = roV8 ro } }
@@ -425,6 +445,11 @@ describeEvent e = case e of
   EvFailed why -> "failed: " ++ why
   EvV8Menu _ -> "V.8 menu"
   EvMnp m -> "MNP " ++ show m
+  -- A replayed V.32 recording can retrain, and this case falling through
+  -- crashed the replay rather than printing a line about it.  Every
+  -- renderer of this type must be total; there is more than one of them.
+  EvRetrain _ -> "retraining"
+  EvRate r -> "now " ++ show (V32.rateBitRate r) ++ " bit/s"
 
 -- | The channel simulator, driven from a named profile and repeated
 -- @--impair K=V@ options, so a fixture can be asked what it survives
@@ -510,10 +535,12 @@ mint ro r name rate trimmed = do
       ] ++
       [ "mnp:       " ++ show c | Just c <- [roMnp ro] ] ++
       [ "seconds:   " ++ show s | Just s <- [roSeconds ro] ] ++
-      [ "connect:   " ++ conn
-      , "expect:    "
+      [ "connect:   " ++ conn ] ++
+      [ "retrains:  " ++ show retrains | conn /= "none" ] ++
+      [ "expect:    "
       , "tolerance: 0"
       ]
+    retrains = length [ () | (_, EvRetrain _) <- rrEvents r ]
     conn = case [ (s, l) | (_, EvConnected s l) <- rrEvents r ] of
       ((s, l) : _) -> show s ++ " " ++ show (round (linkBitRate l) :: Int)
       [] -> "none"

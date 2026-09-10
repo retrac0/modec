@@ -147,6 +147,7 @@ replayCase f sp expected w = do
                   | (_, EvConnected s l) <- rrEvents r ]
       want = fromMaybe "none" (key sp "connect")
       tol = maybe 0 read (key sp "tolerance") :: Int
+      retrains = length [ () | (_, EvRetrain _) <- rrEvents r ]
 
   -- what the call reached, which is the first thing a live fixture is for
   case (want, connected) of
@@ -156,6 +157,17 @@ replayCase f sp expected w = do
        ++ show (length got) ++ " bytes came back")
     (_, []) -> assertFailure ("never connected; wanted " ++ want ++ trace r)
     (_, (c : _)) -> assertEqual ("connect" ++ trace r) want c
+
+  -- 5.5, and whether the link held.  Optional, because most fixtures
+  -- are below V.32 and cannot retrain at all; where it is stated it is
+  -- the only thing that separates a rate that connects from a rate that
+  -- works.  A V.32bis call at 14400 connected and delivered nothing
+  -- either side of the receiver fix that made it usable -- what changed
+  -- was that it stopped asking for a retrain four seconds in.
+  mapM_ (\n -> assertBool
+           ("retrained " ++ show retrains ++ " times, over " ++ show n ++ trace r)
+           (retrains <= n))
+        (map read (keys sp "retrains") :: [Int])
 
   -- the hand-verified truth: what the far end really sent
   mapM_ (\e -> assertBool ("missing from the decode: " ++ show e ++ "\n" ++ show text)

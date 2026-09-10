@@ -1,0 +1,31 @@
+# V.32bis at 14400 bit/s -- the top of the Recommendation, and the only
+# fixture here that nobody at this end recorded.
+#
+# A Banksia MyModem 144 (Rockwell) calling out, published with the audio
+# by Gough Lui and split into one file per direction; this is the
+# answering modem's half, so modec places the call.  Nothing in it came
+# out of this code, which is the point: a fixture minted from our own
+# recording can pass by agreeing with a mistake we make twice, and this
+# one cannot.
+#
+# There is no text.  The two modems trained, connected and idled, so the
+# reference is empty and stays empty -- which is an assertion in its own
+# right at 14400, where a receiver that has lost the line hands the
+# terminal a page of noise rather than nothing.
+#
+# What this fixture is really for is the retrain count.  Before the
+# timing loop was given a tracking gain of its own, this same recording
+# connected at 14400 -- the negotiation was never the problem -- and
+# then asked for a retrain four seconds later, and again ten seconds
+# after that, with the decision error sitting at 0.068 against a margin
+# of 0.11.  It now runs at 0.040 and asks for nothing.  Connecting is
+# what 'connect:' pins; holding the line is what 'retrains:' pins, and
+# only the second of them ever moved.
+source:    recordings/third-party/banksia-mymodem144-answer.wav
+seconds:   32.0
+role:      originate
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+tolerance: 0

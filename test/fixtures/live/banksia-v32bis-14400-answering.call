@@ -1,0 +1,24 @@
+# The other direction of the same 14400 call, with modec answering.
+#
+# The far end of this one is the Banksia itself, calling; it is the only
+# recording in the corpus that speaks first, and therefore the only one
+# modec can answer.  Every other live fixture is role: originate because
+# a recording cannot answer a modem that speaks first.
+#
+# Worth having separately from its twin.  Figure 4 is not symmetric --
+# the calling receiver gets two conditioning signals and the answering
+# receiver one -- and the answering ladder was where the timing work
+# went wrong twice: once by narrowing the loop on the caller's AA, which
+# is a steady tone and says nothing about symbol timing, and once by
+# missing the caller's E by a single bit, E being sent once where a rate
+# signal repeats.  Neither showed up calling out.
+#
+# Empty reference and retrains: 0, for the reasons in the other file.
+source:    recordings/third-party/banksia-mymodem144-call.wav
+seconds:   32.0
+role:      answer
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+tolerance: 0

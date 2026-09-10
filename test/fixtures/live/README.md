@@ -1,8 +1,10 @@
 # Recorded calls, as fixtures
 
-Twelve calls placed over the voip.ms trunk in September 2026, trimmed to
-the window that carries the answer, and replayed through the whole modem
-by `Corpus.liveTests`. Every one of them had a real modem at the far end.
+Calls trimmed to the window that carries the answer and replayed through
+the whole modem by `Corpus.liveTests`. Every one of them had a real modem
+at the far end: twelve placed over the voip.ms trunk in September 2026,
+and two that are the same V.32bis call at 14400 recorded by somebody
+else -- see `recordings/third-party/README.md` -- one direction each.
 
 Each fixture is three files with one name:
 
@@ -29,6 +31,12 @@ for a recording that must not connect at all. `expect:` lines -- there
 may be several -- are the hand-verified truth: text the far end really
 sent, read off the service's own documentation or off the board by eye.
 Those are what must never break.
+
+`retrains:` is a ceiling on how many times 5.5 was asked for, and it is
+optional because most of these are below V.32 and cannot retrain at all.
+Where it appears it is doing work `connect:` cannot: a rate that
+negotiates and then cannot hold the line connects exactly like one that
+works, and at 14400 that was the whole of the difference for months.
 
 `tolerance:` is weaker and does different work. The reference is not
 truth, it is a record of one decode, junk included; the tolerance says
