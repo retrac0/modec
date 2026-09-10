@@ -17,17 +17,24 @@
 -- pattern, scrambled binary 1) and scrambled data with an idle-mark byte
 -- queue.
 --
--- Receiver: complex downconversion at the nominal carrier, matched RRC
--- filter, Gardner symbol timing recovery with cubic interpolation, and
--- then two decision paths on the same samples:
+-- Receiver: "Modec.QAM", wired for 600 baud and this constellation.
+-- Everything from the downconversion to the equaliser is that module --
+-- it was a byte-for-byte copy of it -- and what is left here is the two
+-- decision paths on the symbols it returns:
 --
 -- * differential phase steps (no carrier lock needed; used for the
 --   1200 bit/s data and for the handshake signal detectors), and
--- * a coherent path: automatic gain, decision-directed carrier phase
---   and frequency tracking, a T/2-spaced complex LMS equaliser, and
---   16-way decisions in a frame rotated into the current quadrant.  The
---   quadrant coding is differential, so the four-fold phase ambiguity of
---   the carrier lock does not matter.
+-- * a coherent path: 16-way decisions in a frame rotated into the
+--   current quadrant.  The quadrant coding is differential, so the
+--   four-fold phase ambiguity of the carrier lock does not matter.
+--
+-- The differential path is the reason this receiver needed anything of
+-- QAM that V.32 did not.  It is not a second reading of the line but a
+-- second use of the same one, and three of its consequences act inside
+-- the symbol loop rather than after it: the carrier offset it measures
+-- directly steers the frequency estimate, a constant phase step stops
+-- the equaliser adapting, and 93 of them restart the coherent path
+-- mid-block.
 module Modec.V22
   ( TxMode (..)
   , V22TxState
@@ -71,6 +78,7 @@ import Data.Word (Word8)
 import Modec.DSP
 import Modec.FSK (frameBits)
 import Modec.Link
+import Modec.QAM
 import Modec.Standards (Framing)
 import Modec.Hdlc (hdlcFlagBits)
 import Modec.Scrambler
@@ -264,41 +272,122 @@ withBits st bs = st { txBits = txBits st ++ bs }
 eqTaps :: Int
 eqTaps = 15
 
+-- | The V.22 receiver: a QAM receiver, plus what only V.22 counts.
+--
+-- Everything from the matched filter to the equaliser is "Modec.QAM" --
+-- the AGC, Gardner timing, the decision-directed carrier loop and the
+-- T\/2 LMS were byte-identical between the two pumps.  What is left here
+-- is what V.22 alone has: which rate it is deciding at, the
+-- descrambler, and the run lengths the handshake's timings are measured
+-- against.
 data V22RxState = V22RxState
-  { rxN        :: !Int               -- ^ global index of the next input sample (for the mixer phase)
-  , rxHistRe   :: !Signal
-  , rxHistIm   :: !Signal
-  , rxPrevRe   :: !Signal            -- ^ last few matched-filter outputs carried across blocks
-  , rxPrevIm   :: !Signal
-  , rxTau      :: !Double            -- ^ next symbol sampling position in the carried+block coordinates
-  , rxSps      :: !Double
-  , rxPrevSym  :: !(Double, Double)  -- ^ previous raw on-time sample (differential path)
-  , rxPower    :: !Double            -- ^ tracked raw symbol power (timing normalisation and AGC)
+  { rxQam      :: !QamRxState
+  , rxRate     :: !Rate
+  , rxTune     :: !V22Tune           -- ^ loop gains, which a caller may change mid-call
   , rxDescr    :: !Int
+  , rxQuadrant :: !Int               -- ^ quadrant of the previous coherent decision
   , rxOnesRun  :: !Int
   , rxU11Run   :: !Int
   , rxS1Run    :: !Int
-  , rxLastStep :: !Int
-  , rxKp       :: !Double
-  , rxKi       :: !Double
-  , rxClamp    :: !Double
-    -- coherent path
-  , rxRate     :: !Rate
-  , rxTheta    :: !Double            -- ^ carrier phase estimate (radians)
-  , rxFreq     :: !Double            -- ^ carrier frequency estimate (radians per symbol)
-  , rxEqRe     :: !Signal            -- ^ equaliser taps
-  , rxEqIm     :: !Signal
-  , rxLineRe   :: !Signal            -- ^ equaliser delay line (T/2 spaced, newest first)
-  , rxLineIm   :: !Signal
-  , rxQuadrant :: !Int               -- ^ quadrant of the previous coherent decision
-  , rxEvm      :: !Double            -- ^ tracked decision error power (coherent path quality)
   , rxOnes2400 :: !Int               -- ^ consecutive descrambled ones decided 16-way
-  , rxThKp     :: !Double            -- ^ carrier loop proportional gain
-  , rxThKi     :: !Double            -- ^ carrier loop integral gain
-  , rxEqMu     :: !Double            -- ^ equaliser step size
-  , rxConstRun :: !Int               -- ^ consecutive identical phase steps (a pure tone or unscrambled ones)
-  , rxBadEvm   :: !Int               -- ^ consecutive symbols with a large decision error
+  , rxLastStep :: !Int
   }
+
+-- | The loop gains, which 'v22RxSetCoherentGains' and 'v22RxInitWith'
+-- can change during a call.  "Modec.QAM" takes its configuration per
+-- block rather than storing it, so a receiver whose gains move rebuilds
+-- one each block and a receiver whose gains are fixed builds it once.
+data V22Tune = V22Tune
+  { tuKp    :: !Double
+  , tuKi    :: !Double
+  , tuClamp :: !Double
+  , tuThKp  :: !Double
+  , tuThKi  :: !Double
+  , tuEqMu  :: !Double
+  } deriving (Eq, Show)
+
+defaultTune :: V22Tune
+defaultTune = V22Tune 0.16 0.002 2 0.15 0.01 0.004
+
+-- | The line, as "Modec.QAM" describes one.
+v22Params :: Double -> V22Channel -> QamParams
+v22Params fs ch = QamParams
+  { qpFs = fs, qpBaud = baud, qpCarrier = carrierOf ch
+  , qpRollOff = rollOff, qpSpan = pulseSpan }
+
+-- | V.22's receiver as a QAM configuration.
+--
+-- Every field that differs from 'defaultRxCfg' is a measured V.22
+-- number that used to be written into the loop or carried in the state
+-- record.  The ones worth naming:
+--
+-- * @qrPower = 10@ -- V.22 works in grid units, where the sixteen
+--   points sit on the odd lattice and average a squared magnitude of
+--   10.  V.32 pre-scales its constellation to unit power instead.  Both
+--   are exact; each matches the figure in its own Recommendation.
+-- * @qrAgcRate = qrAgcSettled@ -- V.22 picks the gain's speed by rate
+--   rather than by elapsed symbols, so both are the same number and
+--   'agcSettleSyms' cannot bite.  No acquisition problem comes with the
+--   slow rate at 2400, because the rate only becomes 'R2400' after S1,
+--   by which point the estimate has spent the whole handshake
+--   converging on a constant-amplitude signal.
+-- * @qrTrackAt = 0@, with @qrLockAt@ and @qrLoopGate@ infinite -- V.22
+--   has one timing bandwidth and no lock gate.
+-- * @qrRestartOn@ -- the 93rd consecutive symbol of the answerer's
+--   unscrambled ones restarts the coherent path, mid-block, because it
+--   has to take effect for the rest of that block.  Note the
+--   off-by-one: V.22 counted the current symbol, so its 93 is 92
+--   further repeats.
+v22RxCfg :: Rate -> V22Tune -> QamRxCfg
+v22RxCfg rate tu = (defaultRxCfg (sliceGrid rate) pointOfIndex)
+  { qrKp = tuKp tu, qrKi = tuKi tu
+  , qrKpTrack = tuKp tu, qrKiTrack = tuKi tu, qrTrackAt = 0
+  , qrClamp = tuClamp tu
+  , qrThKp = tuThKp tu, qrThKi = tuThKi tu
+  , qrEqMu = tuEqMu tu, qrEqTaps = eqTaps
+  , qrAgcRate = agc, qrAgcSettled = agc
+  , qrLockAt = 1 / 0, qrLoopGate = 1 / 0
+  , qrEvmFreeze = 4, qrEvmGiveUp = 50, qrEvmBad = Just 2
+  , qrAdapt = True, qrTrack = True, qrPower = 10
+  , qrSteerAt = 1, qrAdaptAt = 1, qrAdaptRun = 16
+  , qrFreqFf = ff, qrFreqFfRun = 16
+  , qrRestartOn = \t -> qtStep t == 3 && qtStepRun t == 92
+  , qrResetLine = False
+  }
+  where
+    agc = case rate of { R1200 -> 0.05; R2400 -> 0.005 }
+    -- Only while training at 1200: the differential path sees the
+    -- carrier offset directly and pulls the estimate in, so the
+    -- decision-directed loop has only the residual to track.
+    ff = case rate of { R1200 -> 0.03; R2400 -> 0 }
+
+-- | The sixteen odd-grid points, indexed.  Both rates decide into this
+-- space: the four points used at 1200 bit\/s are the \"01\" point of each
+-- quadrant, which are four of these sixteen.
+pointOfIndex :: Int -> (Double, Double)
+pointOfIndex i = (coord (i `div` 4), coord (i `mod` 4))
+  where coord k = 2 * fromIntegral k - 3
+
+indexOfPoint :: (Double, Double) -> Int
+indexOfPoint (x, y) = slot x * 4 + slot y
+  where slot v = round ((v + 3) / 2) :: Int
+
+-- | The slicer, at the rate being decided.
+sliceGrid :: Rate -> (Double, Double) -> Int
+sliceGrid R2400 (x, y) = indexOfPoint (sliceOdd x, sliceOdd y)
+sliceGrid R1200 (x, y) = indexOfPoint (decide4 x y)
+
+-- | The last two quadbit bits of a decided point, read in the frame
+-- rotated into the first quadrant.  At 1200 bit\/s this is (False, True)
+-- for all four points, which is what the \"01\" in their name means.
+bitsOfPoint :: (Double, Double) -> (Bool, Bool)
+bitsOfPoint (px, py) =
+  let (rx, ry) = case quadrantOf px py of
+        0 -> (px, py)
+        1 -> (py, -px)
+        2 -> (-px, -py)
+        _ -> (-py, px)
+  in (ry > 2, rx > 2)
 
 v22RxInit :: Double -> V22RxState
 v22RxInit fs = v22RxInitWith fs 0 (0.16, 0.002, 2)
@@ -307,31 +396,27 @@ v22RxInit fs = v22RxInitWith fs 0 (0.16, 0.002, 2)
 -- parameters (proportional gain, integral gain, error clamp); for
 -- experiments.
 v22RxInitWith :: Double -> Double -> (Double, Double, Double) -> V22RxState
-v22RxInitWith fs tauOff (kp, ki, cl) =
-  V22RxState 0 (VS.replicate (taps - 1) 0) (VS.replicate (taps - 1) 0) (VS.replicate carry 0) (VS.replicate carry 0)
-             (fromIntegral carry + sps + tauOff) sps (1, 0) 1e-6 0 0 0 0 0 kp ki cl
-             R1200 0 0 eq0Re eq0Im (VS.replicate eqTaps 0) (VS.replicate eqTaps 0) 0 1 0 0.15 0.01 0.004 0 0
+v22RxInitWith fs tauOff (kp, ki, cl) = V22RxState
+  { rxQam = qamRxInitWith (v22Params fs LowChannel) (v22RxCfg R1200 tune) seed
+  , rxRate = R1200, rxTune = tune
+  , rxDescr = 0, rxQuadrant = 0
+  , rxOnesRun = 0, rxU11Run = 0, rxS1Run = 0, rxOnes2400 = 0, rxLastStep = 0
+  }
   where
-    taps = VS.length (rrcTaps fs)
-    sps = fs / baud
-    carry = 4 + ceiling sps
-    -- even indices of the delay line are on-time samples; start on the middle one
-    eq0Re = VS.generate eqTaps (\i -> if i == 2 * (eqTaps `div` 4) then 1 else 0)
-    eq0Im = VS.replicate eqTaps 0
+    tune = defaultTune { tuKp = kp, tuKi = ki, tuClamp = cl }
+    -- Where V.22 starts, which is not where V.32 does: a symbol later,
+    -- with the previous symbol at (1, 0) and the error estimate at 1.
+    -- The first Gardner error and the first differential step both
+    -- follow from those, so they are part of the receiver's behaviour
+    -- rather than an arbitrary zero.
+    seed = QamRxSeed { srTau0 = fs / baud + tauOff, srPower0 = 1e-6
+                     , srEvm0 = 1, srPrev0 = (1, 0) }
 
 -- | Set the coherent loop gains (carrier proportional, carrier integral,
 -- equaliser step); for experiments.
 v22RxSetCoherentGains :: (Double, Double, Double) -> V22RxState -> V22RxState
-v22RxSetCoherentGains (a, b, c) st = st { rxThKp = a, rxThKi = b, rxEqMu = c }
-
--- | Fresh coherent state: centre-tap equaliser, zero carrier phase and
--- frequency.  Used when a V.22 signal starts after silence or a tone,
--- and by the decision-error watchdog.
-resetCoherent :: V22RxState -> V22RxState
-resetCoherent st = st
-  { rxTheta = 0, rxFreq = 0, rxEvm = 1, rxBadEvm = 0
-  , rxEqRe = VS.generate eqTaps (\i -> if i == 2 * (eqTaps `div` 4) then 1 else 0)
-  , rxEqIm = VS.replicate eqTaps 0 }
+v22RxSetCoherentGains (a, b, c) st =
+  st { rxTune = (rxTune st) { tuThKp = a, tuThKi = b, tuEqMu = c } }
 
 -- | Switch the decision rate (the handshake does this after S1).
 v22RxSetRate :: Rate -> V22RxState -> V22RxState
@@ -339,7 +424,7 @@ v22RxSetRate r st = st { rxRate = r, rxOnes2400 = 0 }
 
 -- | Tracked coherent decision error power (for tracing).
 rxEvmEstimate :: V22RxState -> Double
-rxEvmEstimate = rxEvm
+rxEvmEstimate = qamRxEvm . rxQam
 
 -- | Half the distance to the nearest wrong answer, in the grid units the
 -- AGC normalises to and 'rxEvmEstimate' is squared in.
@@ -364,7 +449,7 @@ rxRateOf = rxRate
 
 -- | Current samples-per-symbol estimate of the timing loop.
 rxSpsEstimate :: V22RxState -> Double
-rxSpsEstimate = rxSps
+rxSpsEstimate = qamRxSps . rxQam
 
 -- | What a V.22 receiver listening to the remote channel currently sees,
 -- as the handshake needs it: the run lengths its timings are measured
@@ -408,20 +493,6 @@ quadrantOf x y
 sliceOdd :: Double -> Double
 sliceOdd v = max (-3) (min 3 (2 * fromIntegral (round ((v - 1) / 2) :: Int) + 1))
 
--- | Decision on the coherent sample: the decided point and the last two
--- quadbit bits, read in the frame rotated into the first quadrant.
-decide16 :: Double -> Double -> ((Double, Double), Bool, Bool)
-decide16 x y =
-  let px = sliceOdd x
-      py = sliceOdd y
-      q = quadrantOf px py
-      (rx, ry) = case q of
-        0 -> (px, py)
-        1 -> (py, -px)
-        2 -> (-px, -py)
-        _ -> (-py, px)
-  in ((px, py), ry > 2, rx > 2)
-
 -- | Decision at 1200 bit/s: the "01" point of the quadrant, with sectors
 -- centred on those points (18.4 degrees into each quadrant).
 decide4 :: Double -> Double -> (Double, Double)
@@ -443,149 +514,67 @@ v22ReceiverFrom fs ch st0 = Stage st0 (\st chunk -> v22RxBlock fs ch chunk st)
 v22RxBlock :: Double -> V22Channel -> Signal -> V22RxState -> (V22RxState, RxOut)
 v22RxBlock fs ch chunk st0 = (st', out)
   where
-    n = VS.length chunk
-    wc = 2 * pi * carrierOf ch / fs
-    n0 = rxN st0
-    (mixRe, mixIm) = mixDownAt wc n0 chunk
-    hrev = VS.reverse (rrcTaps fs)
-    (mfRe, histRe') = firStream hrev (rxHistRe st0) mixRe
-    (mfIm, histIm') = firStream hrev (rxHistIm st0) mixIm
-    extRe = rxPrevRe st0 VS.++ mfRe
-    extIm = rxPrevIm st0 VS.++ mfIm
-    len = VS.length extRe
-    energy = if n == 0 then 0 else (VS.sum (VS.map (\v -> v * v) mfRe) + VS.sum (VS.map (\v -> v * v) mfIm)) / fromIntegral n
-    kp = rxKp st0
-    ki = rxKi st0
-    -- coherent loop gains (per symbol)
-    thetaKp = rxThKp st0
-    thetaKi = rxThKi st0
-    eqMu = rxEqMu st0
-    -- per-symbol loop; accumulates symbols, steps, bits and angle errors
-    go st syms dibits bits aerrs
-      | floor (rxTau st) + 2 >= len = (st, reverse syms, reverse dibits, reverse bits, aerrs)
-      | rxTau st - rxSps st / 2 < 1 = go st { rxTau = rxTau st + rxSps st } syms dibits bits aerrs
-      | otherwise =
-          let tau = rxTau st
-              sps = rxSps st
-              yr = cubicAt extRe tau; yi = cubicAt extIm tau
-              hr = cubicAt extRe (tau - sps / 2); hi = cubicAt extIm (tau - sps / 2)
-              (pr, pim) = rxPrevSym st
-              -- Gardner timing error, normalised by signal power, clamped,
-              -- and ignored while there is no signal
-              --
-              -- The same estimate serves the timing loop's normalisation
-              -- and the AGC, and how fast it should follow the line
-              -- depends on what is on it.  At 1200 bit/s every point is
-              -- the same distance from the origin, so a twenty-symbol
-              -- mean of the symbol power is the signal power exactly and
-              -- there is nothing to gain by averaging longer.  V.22bis
-              -- spreads sixteen points over three amplitudes with a
-              -- squared magnitude of 2, 10 or 18, and a twenty-symbol
-              -- mean of that wanders 4.5 % from one symbol to the next
-              -- -- which the gain multiplies into every symbol, as a
-              -- decision error of 0.13 grid units on a constellation
-              -- whose points are 2 apart.  Measured with no channel at
-              -- all: 0.135 at 0.05, 0.055 at 0.01, 0.037 at 0.005, and
-              -- rising again below that as the gain starts to lag the
-              -- line rather than its own data.  A 30 dB telephone
-              -- channel moved the first of those to 0.141, which is the
-              -- shape of a receiver whose own noise is the whole of its
-              -- error.
-              --
-              -- No acquisition problem comes with it, because the rate
-              -- only becomes R2400 after S1 -- by which point the
-              -- estimate has spent the whole handshake converging at the
-              -- fast rate on a constant-amplitude signal, and the level
-              -- is already known.
-              agcRate = case rxRate st of { R1200 -> 0.05; R2400 -> 0.005 }
-              pw = (1 - agcRate) * rxPower st + agcRate * (yr * yr + yi * yi)
-              eRaw = ((yr - pr) * hr + (yi - pim) * hi) / max 1e-9 pw
-              e = if pw < 1e-5 then 0 else max (negate (rxClamp st)) (min (rxClamp st) eRaw)
-              sps' = sps - ki * e
-              tau' = tau + max (0.5 * sps) (sps' - kp * e)
-              -- differential path
-              dr = yr * pr + yi * pim
-              di = yi * pr - yr * pim
-              ang = atan2 di dr
-              stepQ = (round (ang / (pi / 2)) :: Int) `mod` 4
-              aerr = let d = ang * 180 / pi; qd = fromIntegral (round (d / 90) :: Int) * 90 in abs (d - qd)
-              (d1, d2) = stepToDibit stepQ
-              -- coherent path: AGC to grid units, derotate, equalise
-              agc = if pw < 1e-9 then 0 else sqrt (10 / pw)
-              th = rxTheta st
-              c = cos th; s = sin th
-              rot a b = (agc * (a * c + b * s), agc * (b * c - a * s))
-              (zmr, zmi) = rot hr hi
-              (zr, zi) = rot yr yi
-              lineRe = VS.cons zr (VS.cons zmr (VS.take (eqTaps - 2) (rxLineRe st)))
-              lineIm = VS.cons zi (VS.cons zmi (VS.take (eqTaps - 2) (rxLineIm st)))
-              ur = VS.sum (VS.zipWith (-) (VS.zipWith (*) (rxEqRe st) lineRe) (VS.zipWith (*) (rxEqIm st) lineIm))
-              ui = VS.sum (VS.zipWith (+) (VS.zipWith (*) (rxEqRe st) lineIm) (VS.zipWith (*) (rxEqIm st) lineRe))
-              -- decisions
-              ((px, py), b3, b4) = case rxRate st of
-                R2400 -> decide16 ur ui
-                R1200 -> (decide4 ur ui, False, True)
-              q = quadrantOf px py
-              stepC = (q - rxQuadrant st) `mod` 4
-              (c1, c2) = stepToDibit stepC
-              -- carrier phase error and equaliser error from the decided point
-              phErr = atan2 (ui * px - ur * py) (ur * px + ui * py)
-              errR = px - ur; errI = py - ui
-              evm = 0.98 * rxEvm st + 0.02 * (errR * errR + errI * errI)
-              locked = pw > 1e-5
-              -- the differential path measures the carrier offset directly
-              -- (signed deviation of the phase step from the nearest quadrant);
-              -- during 1200 bit/s training it steers the frequency estimate so
-              -- the decision-directed loop only has to track the residual
-              devRad = ang - fromIntegral (round (ang / (pi / 2)) :: Int) * (pi / 2)
-              freqFf = case rxRate st of
-                R1200 | locked && constRun < 16 -> 0.97 * rxFreq st + 0.03 * devRad
-                _ -> rxFreq st
-              freq' = if locked then freqFf + thetaKi * phErr else rxFreq st
-              theta' = if locked then wrapPi (th + freq' + thetaKp * phErr) else th
-              -- LMS: w += mu * err * conj(line), normalised by the line power.
-              -- Do not adapt on a pure tone or unscrambled ones (constant
-              -- phase steps): their autocorrelation is singular and the taps
-              -- run away.
-              constRun = if stepQ == rxLastStep st then rxConstRun st + 1 else 0
-              lineP = max 1e-6 (VS.sum (VS.zipWith (\a b -> a * a + b * b) lineRe lineIm) / fromIntegral eqTaps)
-              mu = if locked && evm < 4 && constRun < 16 then eqMu / lineP else 0
-              badEvm = if locked && evm > 2 then rxBadEvm st + 1 else 0
-              eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
-              eqIm' = VS.zipWith3 (\w lr li -> w + mu * (errI * lr - errR * li)) (rxEqIm st) lineRe lineIm
-              -- bits out, according to the rate
-              bitsIn = case rxRate st of
-                R1200 -> [d1, d2]
-                R2400 -> [c1, c2, b3, b4]
-              (reg', descBits) = descrambleRun v22Lfsr (rxDescr st) bitsIn
-              ones = foldl (\acc b -> if b then acc + 1 else 0) (rxOnesRun st) descBits
-              ones2400 = case rxRate st of
-                R2400 -> ones
-                R1200 -> 0
-              u11 = if stepQ == 3 then rxU11Run st + 1 else 0
-              s1 = if (stepQ == 1 || stepQ == 3) && stepQ /= rxLastStep st && (rxLastStep st == 1 || rxLastStep st == 3)
-                     then rxS1Run st + 1 else (if stepQ == 1 || stepQ == 3 then 1 else 0)
-              st1 = st { rxTau = tau', rxSps = max (0.9 * (fs / baud)) (min (1.1 * (fs / baud)) sps')
-                       , rxPrevSym = (yr, yi), rxPower = pw, rxDescr = reg'
-                       , rxOnesRun = ones, rxU11Run = u11, rxS1Run = s1, rxLastStep = stepQ
-                       , rxTheta = theta', rxFreq = freq', rxEqRe = eqRe', rxEqIm = eqIm'
-                       , rxLineRe = lineRe, rxLineIm = lineIm, rxQuadrant = q, rxEvm = evm
-                       , rxOnes2400 = ones2400, rxConstRun = constRun, rxBadEvm = badEvm }
-              -- a V.22 signal has just started (unscrambled ones recognised), or the
-              -- coherent path has been lost for 50 symbols: start the coherent path over
-              st2 = if u11 == 93 || badEvm >= 50 then resetCoherent st1 else st1
-          in go st2 ((ur, ui) : syms) (stepQ : dibits) (reverse descBits ++ bits) (aerr : aerrs)
-    (stSym, symsOut, dibitsOut, bitsOut, aerrs) = go st0 [] [] [] []
-    angleErr = if null aerrs then 0 else sum aerrs / fromIntegral (length aerrs)
-    carry = VS.length (rxPrevRe st0)
-    keepFrom = max 0 (len - carry)
-    st' = stSym
-      { rxN = n0 + n
-      , rxHistRe = histRe', rxHistIm = histIm'
-      , rxPrevRe = VS.drop keepFrom extRe, rxPrevIm = VS.drop keepFrom extIm
-      , rxTau = rxTau stSym - fromIntegral keepFrom
-      }
-    out = RxOut symsOut dibitsOut bitsOut energy angleErr (rxEvm stSym) (rxOnesRun stSym) (rxU11Run stSym) (rxS1Run stSym) (rxOnes2400 stSym)
+    cfg = v22RxCfg (rxRate st0) (rxTune st0)
+    (qam', syms) = qamRxBlock (v22Params fs ch) cfg chunk (rxQam st0)
+
+    -- The differential path, folded over the symbols in the order they
+    -- were decided.  It is recomputed here rather than read off 'qsStep'
+    -- and 'qsDev' so that the angle -- and the mean error in degrees
+    -- that the handshake reads -- is the same expression it always was,
+    -- to the last bit.  The loop keeps its own copy because three things
+    -- inside it act on the difference for the next symbol.
+    steps = differential (qamRxPrevSym (rxQam st0)) syms
+    differential _ [] = []
+    differential (pr, pim) (sy : rest) =
+      let (yr, yi) = qsRaw sy
+          dr = yr * pr + yi * pim
+          di = yi * pr - yr * pim
+          ang = atan2 di dr
+          stepQ = (round (ang / (pi / 2)) :: Int) `mod` 4
+          aerr = let d = ang * 180 / pi
+                     qd = fromIntegral (round (d / 90) :: Int) * 90
+                 in abs (d - qd)
+      in (stepQ, aerr) : differential (yr, yi) rest
+
+    -- Everything V.22 counts, in one pass: the descrambler and the four
+    -- run lengths the handshake's timings are measured against.  These
+    -- were inside the symbol loop, where they had no business being --
+    -- they read the decisions and never feed them.
+    tally = foldl one (rxDescr st0, rxQuadrant st0, rxLastStep st0,
+                       rxOnesRun st0, rxU11Run st0, rxS1Run st0, rxOnes2400 st0,
+                       [], [], []) (zip syms steps)
+    one (reg, q0, lastStep, ones0, u110, s10, _, dbs, bits, aerrs) (sy, (stepQ, aerr)) =
+      let point = pointOfIndex (qsIndex sy)
+          (b3, b4) = bitsOfPoint point
+          q = quadrantOf (fst point) (snd point)
+          bitsIn = case rxRate st0 of
+            R1200 -> let (d1, d2) = stepToDibit stepQ in [d1, d2]
+            R2400 -> let (c1, c2) = stepToDibit ((q - q0) `mod` 4) in [c1, c2, b3, b4]
+          (reg', descBits) = descrambleRun v22Lfsr reg bitsIn
+          ones = foldl (\acc b -> if b then acc + 1 else 0) ones0 descBits
+          u11 = if stepQ == 3 then u110 + 1 else 0
+          s1 | (stepQ == 1 || stepQ == 3) && stepQ /= lastStep
+               && (lastStep == 1 || lastStep == 3) = s10 + 1
+             | stepQ == 1 || stepQ == 3 = 1
+             | otherwise = 0
+          ones2400 = case rxRate st0 of { R2400 -> ones; R1200 -> 0 }
+      in (reg', q, stepQ, ones, u11, s1, ones2400,
+          stepQ : dbs, reverse descBits ++ bits, aerr : aerrs)
+    (descr', quad', lastStep', ones', u11', s1', ones2400', dibitsR, bitsR, aerrsR) = tally
+
+    -- Summed newest-first, which is the order the loop accumulated them
+    -- in and never reversed.  Floating-point addition is not
+    -- associative, so this is not a matter of taste: summing the other
+    -- way changes the mean in the last bits, and the handshake compares
+    -- it against 8 degrees.
+    angleErr = if null aerrsR then 0 else sum aerrsR / fromIntegral (length aerrsR)
+
+    st' = st0
+      { rxQam = qam', rxDescr = descr', rxQuadrant = quad', rxLastStep = lastStep'
+      , rxOnesRun = ones', rxU11Run = u11', rxS1Run = s1', rxOnes2400 = ones2400' }
+    out = RxOut (map qsPoint syms) (reverse dibitsR) (reverse bitsR)
+                (qamRxEnergy qam') angleErr (qamRxEvm qam')
+                ones' u11' s1' ones2400'
 
 -- | Offline: scrambled data bits to a signal at 1200 bit/s.
 v22Modulate :: Double -> V22Channel -> Double -> [Bool] -> Signal

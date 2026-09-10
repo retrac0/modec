@@ -1,12 +1,29 @@
 {-# LANGUAGE BangPatterns #-}
 -- | A quadrature amplitude modulation pump with nothing baked in: the
 -- baud rate, carrier, pulse shaping and constellation all arrive as
--- parameters.  "Modec.V22" is the same machine wired for 600 baud and
--- one constellation, and is deliberately left alone -- its loop gains,
--- roll-off and tap count are measured numbers for five modes that work,
--- and none of them is right at 2400 baud.  What is shared between the
--- two is the shape, not the constants, so this is a sibling rather than
--- a refactor.
+-- parameters.  Both of this modem's passband receivers are this one --
+-- V.32 and V.32bis at 2400 baud through "Modec.V32Pump", V.22 and
+-- V.22bis at 600 through "Modec.V22".
+--
+-- This module's header used to argue the other way: that V.22 was a
+-- sibling rather than a refactor, because its loop gains, roll-off and
+-- tap count are measured numbers for five working modes and none of
+-- them is right at 2400 baud.  Every word of that is still true, and
+-- none of it was ever an argument for a second copy of the machine --
+-- the constants are exactly what 'QamParams' and 'QamRxCfg' are for.
+-- What the fork actually cost was that the AGC, the Gardner update, the
+-- carrier loop and the T\/2 LMS existed twice, byte for byte, so a fix
+-- to one receiver did not reach the other.
+--
+-- Merging them turned up four differences that nobody had chosen: the
+-- two receivers started from different initial conditions, counted a
+-- symbol as bad at a different error from the one they froze the
+-- equaliser at, gated the timing loop on different evidence, and
+-- disagreed about whether a restart empties the equaliser's delay line.
+-- Each is a field now ('QamRxSeed', 'qrEvmBad', 'qrSteerAt', 
+-- 'qrResetLine'), each defaulting to what V.32 always did, and each
+-- carrying what it is for -- which is more than any of them had while
+-- there were two loops for a reader to notice the difference between.
 --
 -- The receiver is a chain of: complex downconversion at the nominal
 -- carrier, a matched root-raised-cosine filter, Gardner symbol timing
@@ -45,6 +62,7 @@ module Modec.QAM
   , qamRxUnlock
   , quarterTurns
   , qamRxEnergy
+  , qamRxPrevSym
     -- * Starting a receiver somewhere other than at rest
   , QamRxSeed (..)
   , defaultSeed
@@ -124,6 +142,14 @@ data QamRxCfg = QamRxCfg
     -- give-up count.  Mid-block, because it has to take effect for the
     -- rest of the block: V.22 restarts on the 93rd symbol of the
     -- answerer's unscrambled ones.
+  , qrResetLine :: !Bool
+    -- ^ whether a restart also empties the equaliser's delay line.  It
+    -- holds recent input, so keeping it means the first outputs after a
+    -- restart mix the old signal with the new, and clearing it means the
+    -- equaliser spends its span with nothing behind it.  V.32 clears;
+    -- V.22 keeps.  Both were the unexamined consequence of where each
+    -- fork happened to write its reset, and each is what its own
+    -- measurements were taken against.
   }
 
 -- | What 'qrRestartOn' is shown, per symbol.
@@ -167,7 +193,7 @@ defaultRxCfg slice point = QamRxCfg
   , qrSlice = slice, qrPoint = point
   , qrSteerAt = 2, qrAdaptAt = 3, qrAdaptRun = maxBound
   , qrFreqFf = 0, qrFreqFfRun = maxBound
-  , qrEvmBad = Nothing, qrRestartOn = const False }
+  , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -350,7 +376,8 @@ qamRxReset _ cfg st = st
   { rxTheta = 0, rxFreq = 0
   , rxEqRe = VS.generate taps (\i -> if i == 2 * (taps `div` 4) then 1 else 0)
   , rxEqIm = VS.replicate taps 0
-  , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
+  , rxLineRe = if qrResetLine cfg then VS.replicate taps 0 else rxLineRe st
+  , rxLineIm = if qrResetLine cfg then VS.replicate taps 0 else rxLineIm st
   , rxEvm_ = srEvm0 (rxSeed st), rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
   , rxTiming = False }
   where taps = qrEqTaps cfg
@@ -373,6 +400,12 @@ qamRxEvm = rxEvm_
 -- | Mean matched-filter power over the last block.
 qamRxEnergy :: QamRxState -> Double
 qamRxEnergy = rxEnergy
+
+-- | The last raw symbol, before gain, carrier or equaliser.  What a
+-- differential decision on the next block's first symbol is measured
+-- against.
+qamRxPrevSym :: QamRxState -> (Double, Double)
+qamRxPrevSym = rxPrevSym
 
 -- | How long the gain chases its own input before settling down.  A
 -- fifth of a second at 2400 baud: long enough for a receiver starting
