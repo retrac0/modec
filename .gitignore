@@ -10,4 +10,5 @@ pw
 # recordings that are not in the repository either.
 recordings/*.wav
 recordings/*.log
+recordings/third-party/**/*.wav
 recordings/third-party/*.wav
