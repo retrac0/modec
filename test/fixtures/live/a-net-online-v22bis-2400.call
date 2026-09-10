@@ -14,6 +14,23 @@
 # above still holds, but the far end hangs up part way through repeating
 # it and what the receiver makes of the silence afterwards is different
 # rubbish from the rubbish it made before.  Fourteen bytes more of it.
+#
+# Re-minted again when the calling side stopped being told to make
+# sixteen-way decisions for one block at the moment circuit 112 went ON
+# (see Modec.Handshake.rxRateFor).  This fixture is the only one of the
+# twenty that noticed, and what it noticed was not the fix: the first
+# 107 bytes -- the whole banner, and the second copy up to where the far
+# end hangs up -- are identical, and the six bytes are all in the tail.
+#
+# Which is worth writing down, because the tail is what this fixture
+# pins.  It is chaotic, and now measured: adding noise 60 to 100 dB
+# below the signal -- below this recording's own quantisation floor, and
+# far smaller than any code change -- moves the byte count over a range
+# of fifteen, on the code that produced the previous reference.  So a
+# tolerance of 0 here is pinning one draw from that distribution.  Keep
+# it, because it is an alarm worth having and a change worth looking at
+# every time; but a byte count that moves is a reason to go and read the
+# decode, not a verdict on its own.
 source:    recordings/20260906T004535-a-net-online-v22bis.wav
 seconds:   22
 role:      originate

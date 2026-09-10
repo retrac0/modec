@@ -133,6 +133,13 @@ Effect on the recordings, delivered bytes before and after:
 | C64 Pub | 3253 | 3204 |
 | Kludge BBS | 664 | 664 |
 
+How to read that column, measured afterwards: where a call ends with a
+dying carrier, the tail is the receiver framing its own decisions on
+noise, and its length is chaotic. On A-Net Online, adding noise 60 to
+100 dB below the signal -- below the recording's own quantisation floor
+-- moves the byte count over a range of fifteen. So the 80 bytes that
+went here are a result, and a handful of bytes either way is not.
+
 Nothing readable was lost: Kludge is untouched, and C64 Pub's banner and
 menu survive intact. What went is the noise. Similarity at 20 dB rose
 from 97% to 100% for C64 Pub and from 93% to 100% for Sursum Corda,

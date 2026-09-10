@@ -714,13 +714,36 @@ v8ListenFor st = case hsPhase st of
     AV8JM -> Just v21Channel1
     _ -> Nothing
 
--- | The decision rate the V.22 receiver should run at.  Sixteen-way from
--- 450 ms after circuit 112 went ON.
+-- | The decision rate the V.22 receiver should run at.
+--
+-- §6.3.1.2 puts sixteen-way decisions at 450 ms after circuit 112 went
+-- ON, and only the answering side reaches that inside a phase: it holds
+-- 'AV22Ones1200' from 556 ms to 600 ms after its own 112, so the rule
+-- governs there.
+--
+-- The calling side never does.  It leaves 'OV22Ones1200' at 270 ms
+-- (§6.3.1.3 -- see the note on that arm) and goes sixteen-way through
+-- the phase instead, which is earlier on purpose: the answering modem
+-- starts sending at 2400 roughly 500 ms after the caller's 112, and a
+-- receiver that arrives late has missed the 200 ms of ones it is
+-- waiting for.  Decoding the far end's four points sixteen ways in the
+-- meantime costs nothing -- they are four of the sixteen, so the
+-- quadrant is still right -- and it is @ones2400Seen@ that actually
+-- decides when the far end has switched, not the rate.
+--
+-- So an @OV22Ones1200 | since112 >= 0.45@ arm belongs here in symmetry
+-- and cannot ever fire, and it used to be here.  It fired exactly once
+-- per call, wrongly: this is passed the time since 112 measured against
+-- the state the hop /ends/ in, and it used to be measured against the
+-- state it began in.  On the one hop that turns 112 on, that stamp is
+-- still the initial zero, so @since112@ was the whole call so far, the
+-- guard passed, and the receiver was told to decide sixteen ways for
+-- one block at the exact moment the far end was furthest from sending
+-- sixteen points.
 rxRateFor :: Double -> HsState -> Rate
 rxRateFor since112 st = case hsPhase st of
     AV22Ones1200 | since112 >= 0.45 -> R2400
     AV22Ones2400 -> R2400
-    OV22Ones1200 | since112 >= 0.45 -> R2400
     OV22Ones2400 -> R2400
     Connected _ R2400 -> R2400
     _ -> R1200
@@ -764,15 +787,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     st'' = advance cfg lad cu v8 st'
     tx = txFor lad v8 t st''
     status = statusFor st st''
-    -- Measured from the state this hop *began* in, not the one it ends
-    -- in.  On the hop that turns circuit 112 on, hs112At has not been
-    -- stamped yet, so the receiver is told R2400 for that one hop and
-    -- then R1200 until 450 ms have really passed.  That is the behaviour
-    -- every live fixture was minted against, and reading the fresh stamp
-    -- instead changes the decode of a-net-online-v22bis-2400 by six
-    -- bytes.  Whether the one-hop blip is right is a separate question;
-    -- this is where it lives, in one line, so that it can be asked.
-    rxRate = rxRateFor (t - hs112At st) st''
+    rxRate = rxRateFor (t - hs112At st'') st''
     v8Listen = v8ListenFor st''
     v8MenuOut = if hsV8Peer st'' /= hsV8Peer st then hsV8Peer st'' else Nothing
 
