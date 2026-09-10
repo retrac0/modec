@@ -7,16 +7,15 @@ import Options.Applicative
 import System.IO
 import Text.Printf (printf, hPrintf)
 
-import Data.List (intercalate)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeFileName, (</>))
 
 import Dial
 import qualified Modec.Channel as Ch
 import Modec.Link
-import Modec.Mnp (defaultMnpConfig, MnpConfig (..))
 import Modec.Modem
 import Modec.Replay
+import Modec.Fixture
 import Modec.Detect
 import Modec.V32Start (v32Timeline)
 import Modec.Dtmf
@@ -24,7 +23,6 @@ import Modec.Progress
 import Modec.Pipewire (describeNodes)
 import PipewireIO (pwAudioNodes)
 import Modec.DSP
-import qualified Modec.Handshake as H
 import Modem
 import Modec.FSK
 import Modec.Standards
@@ -411,13 +409,11 @@ runReplay :: ReplayOpts -> IO ()
 runReplay ro = do
   w <- readWav (roPath ro)
   let fs = fromIntegral (wavRate w) :: Double
-      role = if roAnswer ro then Answer else Originate
-      cfg0 = defaultModemConfig fs role (roModes ro)
-      cfg = cfg0 { mcMaxEvm = roMaxEvm ro
-                 , mcMaxEvmV32 = roMaxEvmV32 ro
-                 , mcMnp = fmap (\c -> (defaultMnpConfig 2400 (not (roAnswer ro))) { mnClass = c })
-                                (roMnp ro)
-                 , mcHandshake = (mcHandshake cfg0) { H.hcV8 = roV8 ro } }
+      -- The same assembly the corpus uses, so a replay from the command
+      -- line and the test that replays the fixture it mints are the same
+      -- modem.  Only the two decision-error gates are the command's own.
+      cfg = (callSpecConfig fs (replaySpec ro))
+              { mcMaxEvm = roMaxEvm ro, mcMaxEvmV32 = roMaxEvmV32 ro }
       trimmed = case roSeconds ro of
         Nothing -> wavSamples w
         Just s -> VS.take (round (s * fs)) (wavSamples w)
@@ -511,6 +507,17 @@ impairments name = foldl one base
       Just l -> l
       Nothing -> Ch.Loss 0.02 0.0005 0.5 Ch.RepeatFrame
 
+-- | The fixture spec a replay is running under.  'mint' fills in what
+-- the run turned out to do; this is what it was asked to do.
+replaySpec :: ReplayOpts -> CallSpec
+replaySpec ro = emptyCallSpec
+  { csSeconds = roSeconds ro
+  , csRole    = if roAnswer ro then Answer else Originate
+  , csModes   = roModes ro
+  , csV8      = roV8 ro
+  , csMnp     = roMnp ro
+  }
+
 -- | Write the three files a corpus fixture is made of: the recording
 -- trimmed to what the test needs, this decode as the reference, and a
 -- spec saying how to replay it.  The spec's @expect:@ line is left for a
@@ -521,26 +528,16 @@ mint ro r name rate trimmed = do
   createDirectoryIfMissing True dir
   writeWav16Mono (dir </> name ++ ".wav") rate trimmed
   B.writeFile (dir </> name ++ ".txt") (B.pack (rrBytes r))
-  writeFile (dir </> name ++ ".call") (unlines spec)
+  writeFile (dir </> name ++ ".call") (renderCallSpec spec)
   hPutStrLn stderr ("minted " ++ dir </> name ++ ".{wav,txt,call} -- now write its expect: line by hand")
   where
     dir = roDir ro
-    spec =
-      [ "# " ++ takeFileName (roPath ro)
-      , "role:      " ++ (if roAnswer ro then "answer" else "originate")
-      , "modes:     " ++ intercalate "," (map standardName (roModes ro))
-      , "v8:        " ++ (if roV8 ro then "yes" else "no")
-      ] ++
-      [ "mnp:       " ++ show c | Just c <- [roMnp ro] ] ++
-      [ "seconds:   " ++ show s | Just s <- [roSeconds ro] ] ++
-      [ "connect:   " ++ conn ] ++
-      [ "retrains:  " ++ show retrains | conn /= "none" ] ++
-      [ "expect:    "
-      , "tolerance: 0"
-      ]
-    retrains = length [ () | (_, EvRetrain _) <- rrEvents r ]
-    conn = case [ (s, l) | (_, EvConnected s l) <- rrEvents r ] of
-      ((s, l) : _) -> show s ++ " " ++ show (round (linkBitRate l) :: Int)
-      [] -> "none"
+    conn = connectLine (rrEvents r)
+    spec = (replaySpec ro)
+      { csComment   = [takeFileName (roPath ro)]
+      , csConnect   = conn
+      , csRetrains  = [retrainCount (rrEvents r) | conn /= "none"]
+      , csTolerance = 0
+      }
 
 

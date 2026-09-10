@@ -32,9 +32,9 @@
 --
 -- The @source:@ and @seconds:@ keys are there so that command can be
 -- reconstructed from the fixture.
-module Corpus (fixtureDir, liveDir, fixtureTests, liveTests) where
+module Corpus (fixtureDir, liveDir, fixtureTests, liveTests, specTests) where
 
-import Control.Monad (forM)
+import Control.Monad (forM, forM_)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isSpace)
@@ -48,9 +48,8 @@ import Test.Tasty.HUnit
 import Modec.Link
 import Modec.DSP (Signal)
 import Modec.FSK
-import Modec.Handshake (hcV8)
+import Modec.Fixture
 import Modec.Metrics (editDistance)
-import Modec.Mnp (MnpConfig (..), defaultMnpConfig)
 import Modec.Modem
 import Modec.Replay
 import Modec.Standards
@@ -62,36 +61,6 @@ fixtureDir = "test/fixtures"
 liveDir :: FilePath
 liveDir = fixtureDir </> "live"
 
--- | A @.call@ file: comment lines, then @key: value@ lines.  Keys may
--- repeat, which is how a fixture asks for more than one @expect:@.
-type Spec = [(String, String)]
-
-parseSpec :: String -> Spec
-parseSpec = mapMaybe entry . lines
-  where
-    entry l
-      | (c : _) <- dropWhile isSpace l, c == '#' = Nothing
-      | (k, ':' : v) <- break (== ':') l, not (null k) = Just (trim k, trim v)
-      | otherwise = Nothing
-    trim = dropWhile isSpace . reverse . dropWhile isSpace . reverse
-
-key :: Spec -> String -> Maybe String
-key sp k = lookup k sp
-
-keys :: Spec -> String -> [String]
-keys sp k = [ v | (k', v) <- sp, k' == k, not (null v) ]
-
-flagOf :: Spec -> String -> Bool
-flagOf sp k = key sp k `elem` [Just "yes", Just "true", Just "on"]
-
-splitOn :: Char -> String -> [String]
-splitOn c s = case break (== c) s of
-  (a, [])      -> [a]
-  (a, _ : b)   -> a : splitOn c b
-
-standardOf :: String -> Standard
-standardOf m = fromMaybe (error ("unknown mode " ++ m)) (standardNamed m)
-
 -- | The synthesised fixtures: audio that is nothing but the modulation,
 -- so a demodulator can be pointed at the head of the file.
 fixtureTests :: IO TestTree
@@ -101,21 +70,64 @@ fixtureTests = corpusGroup "minimodem fixtures" fixtureDir fskCase
 liveTests :: IO TestTree
 liveTests = corpusGroup "live calls" liveDir replayCase
 
-corpusGroup :: String -> FilePath -> (FilePath -> Spec -> B.ByteString -> Wav -> Assertion)
+-- | The @.call@ format itself, against every fixture checked in.
+--
+-- Until Modec.Fixture there was no such thing to assert: the minter and
+-- this corpus each had their own idea of the format, and the only place
+-- they met was a file on disk.  Rendering a parsed spec and parsing it
+-- again has to give the same spec back, and every key a fixture actually
+-- uses has to survive the trip -- which is what would have caught a
+-- reader and a writer drifting apart.
+specTests :: IO TestTree
+specTests = do
+  fx <- specsIn fixtureDir
+  lv <- specsIn liveDir
+  return $ testGroup "the .call format"
+    [ testCase "every fixture parses" $
+        forM_ (fx ++ lv) $ \(f, src) ->
+          case parseCallSpec src of
+            Left e -> assertFailure (f ++ ": " ++ e)
+            Right _ -> return ()
+    , testCase "rendering a spec and reading it back is a fixed point" $
+        forM_ (fx ++ lv) $ \(f, src) -> do
+          sp <- either (assertFailure . ((f ++ ": ") ++)) return (parseCallSpec src)
+          sp' <- either (assertFailure . ((f ++ ", re-read: ") ++)) return
+                        (parseCallSpec (renderCallSpec sp))
+          assertEqual (f ++ ": survived a round trip") sp sp'
+    , testCase "what a fixture asserts survives being written out" $
+        forM_ (fx ++ lv) $ \(f, src) -> do
+          sp <- either (assertFailure . ((f ++ ": ") ++)) return (parseCallSpec src)
+          let back = renderCallSpec sp
+              stated k = [ trim v | l <- lines src, (k', ':' : v) <- [break (== ':') l], k' == k ]
+              rendered k = [ trim v | l <- lines back, (k', ':' : v) <- [break (== ':') l], k' == k ]
+              trim = dropWhile isSpace . reverse . dropWhile isSpace . reverse
+          -- Every key the corpus reads, so a key that stopped being
+          -- rendered would fail here rather than silently stop asserting.
+          forM_ ["role", "modes", "v8", "mnp", "standard", "connect", "retrains", "tolerance"] $ \k ->
+            assertEqual (f ++ ": " ++ k) (filter (not . null) (stated k))
+                                         (filter (not . null) (rendered k))
+    ]
+  where
+    specsIn dir = do
+      files <- sort . filter (".call" `isSuffixOf`) <$> listDirectory dir
+      mapM (\f -> (,) f <$> readFile (dir </> f)) files
+
+corpusGroup :: String -> FilePath -> (FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion)
             -> IO TestTree
 corpusGroup label dir run = do
   files <- sort . filter (".wav" `isSuffixOf`) <$> listDirectory dir
   cases <- forM files $ \f -> do
-    sp <- parseSpec <$> readFile (dir </> replaceExtension f "call")
+    src <- readFile (dir </> replaceExtension f "call")
+    sp <- either (fail . ((f ++ ": ") ++)) return (parseCallSpec src)
     return $ testCase (dropExtension f) $ do
       w <- readWav (dir </> f)
       expected <- B.readFile (dir </> replaceExtension f "txt")
       run f sp expected w
   return (testGroup label cases)
 
-fskCase :: FilePath -> Spec -> B.ByteString -> Wav -> Assertion
+fskCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion
 fskCase f sp expected w = do
-  let spec = specOf (fromMaybe (error (f ++ ": no standard:")) (key sp "standard"))
+  let spec = specOf (fromMaybe (error (f ++ ": no standard:")) (csStandard sp))
       fs = fromIntegral (wavRate w)
       got = B.pack (demodulate fs spec framing8N1 defaultDemodParams (wavSamples w))
   assertEqual "decoded bytes" (BC.unpack expected) (BC.unpack got)
@@ -127,34 +139,26 @@ fskCase f sp expected w = do
       "v21-ch2"           -> v21Channel2
       _                   -> error (f ++ ": unknown standard " ++ n)
 
-replayCase :: FilePath -> Spec -> B.ByteString -> Wav -> Assertion
-replayCase f sp expected w = do
+replayCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion
+replayCase _ sp expected w = do
   let fs = fromIntegral (wavRate w) :: Double
-      role = if key sp "role" == Just "answer" then Answer else Originate
-      modes = map standardOf (splitOn ',' (fromMaybe (error (f ++ ": no modes:")) (key sp "modes")))
-      cfg0 = defaultModemConfig fs role modes
-      cfg = cfg0
-        { mcHandshake = (mcHandshake cfg0) { hcV8 = flagOf sp "v8" }
-        , mcMnp = fmap (\c -> (defaultMnpConfig 2400 (role == Originate)) { mnClass = read c })
-                       (key sp "mnp")
-        }
+      cfg = callSpecConfig fs sp
       r = replay (defaultReplayConfig cfg) (wavSamples w :: Signal)
       got = rrBytes r
       text = map (toEnum . fromIntegral) got :: String
-      connected = [ show s ++ " " ++ show (round (linkBitRate l) :: Int)
-                  | (_, EvConnected s l) <- rrEvents r ]
-      want = fromMaybe "none" (key sp "connect")
-      tol = maybe 0 read (key sp "tolerance") :: Int
-      retrains = length [ () | (_, EvRetrain _) <- rrEvents r ]
+      connected = connectLine (rrEvents r)
+      want = csConnect sp
+      tol = csTolerance sp
+      retrains = retrainCount (rrEvents r)
 
   -- what the call reached, which is the first thing a live fixture is for
   case (want, connected) of
-    ("none", []) -> return ()
-    ("none", (c : _)) -> assertFailure
+    ("none", "none") -> return ()
+    ("none", c) -> assertFailure
       ("connected " ++ c ++ ", and this recording has no far end that can: "
        ++ show (length got) ++ " bytes came back")
-    (_, []) -> assertFailure ("never connected; wanted " ++ want ++ trace r)
-    (_, (c : _)) -> assertEqual ("connect" ++ trace r) want c
+    (_, "none") -> assertFailure ("never connected; wanted " ++ want ++ trace r)
+    (_, c) -> assertEqual ("connect" ++ trace r) want c
 
   -- 5.5, and whether the link held.  Optional, because most fixtures
   -- are below V.32 and cannot retrain at all; where it is stated it is
@@ -165,12 +169,12 @@ replayCase f sp expected w = do
   mapM_ (\n -> assertBool
            ("retrained " ++ show retrains ++ " times, over " ++ show n ++ trace r)
            (retrains <= n))
-        (map read (keys sp "retrains") :: [Int])
+        (csRetrains sp)
 
   -- the hand-verified truth: what the far end really sent
   mapM_ (\e -> assertBool ("missing from the decode: " ++ show e ++ "\n" ++ show text)
                           (e `isInfixOf` text))
-        (keys sp "expect")
+        (csExpect sp)
 
   -- and the drift alarm against the day this was minted
   let d = editDistance (B.unpack expected) got

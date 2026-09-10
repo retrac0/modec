@@ -22,12 +22,14 @@ main :: IO ()
 main = do
   fx <- fixtureTests
   live <- liveTests
+  specs <- specTests
   defaultMain $ testGroup "modec"
     [ testGroup "primitives"
         [wavTests, dspTests, scramblerTests, stageTests, toneFrameTests]
     -- What the simulator every other measurement here leans on actually
     -- does, as against what it says it does.
     , channelSimTests
+    , specs
     , testGroup "frequency shift"
         [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests]
     , testGroup "bringing a call up"
