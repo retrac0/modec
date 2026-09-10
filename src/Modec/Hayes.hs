@@ -150,7 +150,7 @@ commands st cmds acts out = case cmds of
   ('L' : rest) -> let (_, rest') = digits rest in commands st rest' acts out
   ('M' : rest) -> let (_, rest') = digits rest in commands st rest' acts out
   ('I' : rest) -> let (_, rest') = digits rest
-                  in commands st rest' acts (out <> crlf <> BC.pack "modec software modem: Bell 103, V.21, V.22, V.22bis, V.32, V.32bis, V.8bis" <> crlf)
+                  in commands st rest' acts (out <> crlf <> BC.pack "modec software modem: Bell 103, V.21, V.23, Bell 212A, V.22, V.22bis, V.32, V.32bis" <> crlf)
   ('S' : rest) ->
     let (reg, rest1) = digits rest
     in case rest1 of

@@ -94,6 +94,9 @@ SIP user agent on the PC, and the audio arrives as 8 kHz G.711. Set the
 codec to PCMU/PCMA, disable silence suppression, VAD, comfort noise and
 echo cancellation on the ATA, and use a fixed jitter buffer.
 
+The per-port settings that matter, and the Asterisk that goes between
+an ATA, a real modem and modec, are in [asterisk.md](asterisk.md).
+
 ## Option D: a commercial line simulator
 
 Viking DLE-200B and Teltone TLS-3/TLS-5 give two RJ11 ports with battery,

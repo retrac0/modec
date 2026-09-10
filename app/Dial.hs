@@ -14,9 +14,15 @@
 -- * the terminal is the DTE, in raw mode so what you type reaches the
 --   far end a character at a time and is echoed once rather than twice;
 -- * the number is dialled for you, and the call is recorded.
+--
+-- @modec answer@ is the same session with the last step turned around:
+-- nothing is dialled, S0 is set so an incoming call answers itself, and
+-- the modem goes back to waiting when the caller hangs up.
 module Dial
   ( DialOpts (..)
   , runDial
+  , AnswerOpts (..)
+  , runAnswer
   ) where
 
 import Control.Concurrent (threadDelay)
@@ -46,28 +52,44 @@ data DialOpts = DialOpts
   , dModem  :: ModemOpts         -- ^ the modem's own settings, from the shared options
   }
 
+-- | The same session, waiting instead of dialling.  There is no number
+-- and no @--stay@: a modem that answers is by definition still there
+-- afterwards, ready for the next call.
+data AnswerOpts = AnswerOpts
+  { aCtrl   :: String            -- ^ baresip ctrl_tcp address, host:port
+  , aDomain :: Maybe String      -- ^ SIP domain; taken from the account when absent
+  , aLoop   :: String            -- ^ PipeWire loopback prefix
+  , aListen :: Maybe Int         -- ^ put the DTE on this telnet port instead of the terminal
+  , aLaunch :: Bool              -- ^ start baresip if the control port does not answer
+  , aModem  :: ModemOpts         -- ^ the modem's own settings, from the shared options
+  }
+
 say :: String -> IO ()
 say s = hPutStrLn stderr ("modec: " ++ s)
 
+-- | The domain to hand the modem: what was asked for, else whatever
+-- account baresip is registered with.
+resolveDomain :: Maybe String -> IO String
+resolveDomain (Just d) = return d
+resolveDomain Nothing = do
+  d <- accountDomain
+  case d of
+    Just d' -> say ("SIP domain " ++ d' ++ " (from ~/.baresip/accounts)") >> return d'
+    Nothing -> do
+      say "no SIP domain: pass --sip-domain, or put an account in ~/.baresip/accounts"
+      return ""
+
 runDial :: DialOpts -> IO ()
 runDial o = do
-  domain <- case dDomain o of
-    Just d -> return d
-    Nothing -> do
-      d <- accountDomain
-      case d of
-        Just d' -> say ("SIP domain " ++ d' ++ " (from ~/.baresip/accounts)") >> return d'
-        Nothing -> do
-          say "no SIP domain: pass --sip-domain, or put an account in ~/.baresip/accounts"
-          return ""
-  withBaresip o $ do
+  domain <- resolveDomain (dDomain o)
+  withBaresip (dCtrl o) (dLaunch o) (moRecordDir (dModem o)) $ do
     let mo = (dModem o)
           { moHayes = True
           , moSip = Just (dCtrl o)
           , moSipDomain = domain
           , moAudio = AudioSipLoop (dLoop o)
           , moData = maybe DataStdio DataListen (dListen o)
-          , moDial = Just (dNumber o)
+          , moAutoType = Just ("DT" ++ dNumber o)
           , moHangupExits = not (dStay o)
           }
     case dListen o of
@@ -75,36 +97,59 @@ runDial o = do
       Nothing -> say ("dialling " ++ dNumber o ++ " -- +++ATH hangs up, ctrl-C leaves")
     (if dListen o == Nothing then withRawTty else id) (runModem mo)
 
+-- | Register, then sit on the line until somebody calls.
+runAnswer :: AnswerOpts -> IO ()
+runAnswer o = do
+  domain <- resolveDomain (aDomain o)
+  withBaresip (aCtrl o) (aLaunch o) (moRecordDir (aModem o)) $ do
+    let mo = (aModem o)
+          { moHayes = True
+          , moSip = Just (aCtrl o)
+          , moSipDomain = domain
+          , moAudio = AudioSipLoop (aLoop o)
+          , moData = maybe DataStdio DataListen (aListen o)
+          -- S0 rather than a flag of our own: the register already means
+          -- "answer without being asked", and going through it makes it
+          -- work for anyone who sets it by hand as well
+          , moAutoType = Just "S0=1"
+          , moBanner = True
+          , moHangupExits = False
+          }
+    case aListen o of
+      Just p -> say ("the modem is on telnet port " ++ show p ++ "; waiting for a call")
+      Nothing -> say "waiting for a call -- ATH hangs up, ctrl-C leaves"
+    (if aListen o == Nothing then withRawTty else id) (runModem mo)
+
 -- | Run the body with baresip up, starting one if the control port does
 -- not already answer.  A baresip we started is stopped again; one that
 -- was already there is left alone, since it is not ours to close.
-withBaresip :: DialOpts -> IO a -> IO a
-withBaresip o body = do
-  up <- ctrlPortOpen (dCtrl o)
+withBaresip :: String -> Bool -> Maybe FilePath -> IO a -> IO a
+withBaresip ctrl launch recDir body = do
+  up <- ctrlPortOpen ctrl
   if up
-    then say ("using the baresip already listening on " ++ dCtrl o) >> body
-    else if not (dLaunch o)
+    then say ("using the baresip already listening on " ++ ctrl) >> body
+    else if not launch
       then do
-        say ("nothing is listening on " ++ dCtrl o ++ " and --no-launch was given")
+        say ("nothing is listening on " ++ ctrl ++ " and --no-launch was given")
         body
       else bracket start stop (const body)
   where
     start = do
-      let logPath = maybe "baresip.log" (</> "baresip.log") (moRecordDir (dModem o))
-      mapM_ (createDirectoryIfMissing True) (moRecordDir (dModem o))
+      let logPath = maybe "baresip.log" (</> "baresip.log") recDir
+      mapM_ (createDirectoryIfMissing True) recDir
       from <- fileSizeOr0 logPath
       h <- openFile logPath AppendMode
       say ("starting baresip (its output goes to " ++ logPath ++ ")")
       ph <- (\(_, _, _, p) -> p) <$>
               createProcess (proc "baresip" []) { std_in = NoStream, std_out = UseHandle h
                                                 , std_err = UseHandle h }
-      ready <- waitForCtrl (dCtrl o) 15
-      unless ready $ say ("baresip did not open " ++ dCtrl o ++ " within 15 s")
+      ready <- waitForCtrl ctrl 15
+      unless ready $ say ("baresip did not open " ++ ctrl ++ " within 15 s")
       registered <- waitForRegistration logPath from 25
       if registered
         then say "SIP account registered"
         else do
-          say "baresip did not report a registration within 25 s; dialling anyway"
+          say "baresip did not report a registration within 25 s; carrying on anyway"
           say ("the last of " ++ logPath ++ " says:")
           tailOf logPath from 6 >>= mapM_ (\l -> say ("  " ++ l))
       return ph

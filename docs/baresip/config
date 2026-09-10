@@ -39,7 +39,7 @@ module                  account.so
 module                  contact.so
 module                  menu.so
 module_app              ctrl_tcp.so
-module_app              stdio.so
+# module_app            stdio.so   # interactive console; needs a terminal
 
 # Control
 ctrl_tcp_listen         127.0.0.1:4444

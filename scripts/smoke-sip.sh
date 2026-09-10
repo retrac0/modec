@@ -3,8 +3,8 @@
 # a Python script plays the role of two baresip ctrl_tcp servers (one per
 # modem) whose calls are joined to each other, while the audio runs
 # through FIFOs as in smoke-loopback.sh.  Flow: B dials, A gets RING,
-# A answers (ATA), both get CONNECT 2400, text passes both ways, B hangs
-# up, A gets NO CARRIER.
+# A answers itself (S0=1, no ATA typed), both get CONNECT 2400, A greets
+# B with its banner, text passes both ways, B hangs up, A gets NO CARRIER.
 set -euo pipefail
 BIN=${BIN:-$(cabal list-bin modec)}
 W=$(mktemp -d)
@@ -90,19 +90,24 @@ def waitfor(which, token, limit, hook=None):
     return False
 res = []
 def cmd_seen(fake, name): return any(c.get("command") == name for c in fake.commands)
+# A is set to answer by itself, the way `modec answer` sets it
+TA.sendall(b"ATS0=1\r")
+res.append(("A took S0", waitfor("A", b"OK", 10)))
 # B dials
 TB.sendall(b"ATDT5551234\r")
 res.append(("B dial command reached baresip", waitfor("B", b"\x00NEVER", 3, hook=lambda: None) or cmd_seen(B, "dial")))
 if cmd_seen(B, "dial"):
     A.event("CALL_INCOMING", direction="incoming", peeruri="sip:5551234@test")
 res.append(("A RING", waitfor("A", b"RING", 5)))
-TA.sendall(b"ATA\r")
-res.append(("A accept command reached baresip", waitfor("A", b"\x00NEVER", 3) or cmd_seen(A, "accept")))
+# nothing types ATA: S0 must turn the ring into an accept on its own
+res.append(("A accepted on S0 alone", waitfor("A", b"\x00NEVER", 5) or cmd_seen(A, "accept")))
 if cmd_seen(A, "accept"):
     A.event("CALL_ESTABLISHED", direction="incoming", peeruri="sip:5551234@test")
     B.event("CALL_ESTABLISHED", direction="outgoing", peeruri="sip:5551234@test")
 res.append(("B CONNECT", waitfor("B", b"CONNECT", 90)))
 res.append(("A CONNECT", waitfor("A", b"CONNECT", 90)))
+# the answering side greets the caller with what it just agreed to
+res.append(("B got A's banner", waitfor("B", b"software modem", 60)))
 dta = b""; dtb = b""
 time.sleep(1.5)
 TB.sendall(b"hello from B\r\n")
@@ -125,7 +130,7 @@ EOF
 sleep 0.5
 # --answer/--originate only fix the FIFO open order here; in SIP mode the
 # role of each call comes from who dialled
-"$BIN" modem --sip "127.0.0.1:$CA" --sip-domain test --answer --no-record --audio-in "$W/b2a" --audio-out "$W/a2b" --listen "$PA" 2> "$W/a.log" &
+"$BIN" modem --sip "127.0.0.1:$CA" --sip-domain test --answer --banner --no-record --audio-in "$W/b2a" --audio-out "$W/a2b" --listen "$PA" 2> "$W/a.log" &
 "$BIN" modem --sip "127.0.0.1:$CB" --sip-domain test --originate --no-record --audio-in "$W/a2b" --audio-out "$W/b2a" --listen "$PB" 2> "$W/o.log" &
 wait %1 || echo "driver failed"
 echo "--- results"; cat "$W/result.txt" 2>/dev/null || echo "(no results)"

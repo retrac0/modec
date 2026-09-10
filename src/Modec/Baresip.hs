@@ -20,6 +20,8 @@ module Modec.Baresip
   , sipLineEvent
   , sipLineTick
   , sipLineInCall
+  , sipLineSetAuto
+  , sipLinePeer
   ) where
 
 import qualified Data.ByteString as B
@@ -84,10 +86,12 @@ data SipLine = SipLine
   , slIncoming :: Bool            -- ^ an unanswered incoming call is ringing
   , slInCall   :: Maybe Role      -- ^ established call and the modem role we take
   , slLastRing :: Double
+  , slAuto     :: !Bool          -- ^ answer without waiting to be told (Hayes S0)
+  , slPeer     :: String         -- ^ who is calling, from the INVITE
   }
 
 sipLineInit :: String -> SipLine
-sipLineInit domain = SipLine domain False False Nothing (-10)
+sipLineInit domain = SipLine domain False False Nothing (-10) False ""
 
 -- | What the modem should do.
 data SipAction
@@ -119,7 +123,14 @@ sipLineHayes st a = case a of
 -- | baresip call events.
 sipLineEvent :: Double -> SipLine -> BsMessage -> (SipLine, [SipAction])
 sipLineEvent t st msg = case msg of
-  BsEvent "call" "CALL_INCOMING" _ _ -> (st { slIncoming = True, slLastRing = t }, [SipToDte EvRing])
+  -- S0 is answered here rather than in the modem's idle loop, which only
+  -- sees ringing as sustained line energy and so is switched off in SIP
+  -- mode.  Ring the DTE either way: a watching terminal should see the
+  -- call arrive, not just the CONNECT that follows it.
+  BsEvent "call" "CALL_INCOMING" _ fields ->
+    ( st { slIncoming = True, slLastRing = t
+         , slPeer = maybe (slPeer st) id (lookup "peeruri" fields) }
+    , SipToDte EvRing : [ SipCommand "accept" "" | slAuto st ] )
   BsEvent "call" "CALL_ESTABLISHED" _ _ ->
     let role = if slDialing st then Originate else Answer
     in (st { slInCall = Just role, slIncoming = False }, [SipStartModem role])
@@ -137,3 +148,12 @@ sipLineTick t st
 
 sipLineInCall :: SipLine -> Maybe Role
 sipLineInCall = slInCall
+
+-- | Track Hayes S0.  The register lives in the Hayes state, which this
+-- module does not see, so the modem loop pushes it in each block.
+sipLineSetAuto :: Bool -> SipLine -> SipLine
+sipLineSetAuto a st = st { slAuto = a }
+
+-- | Who called, as baresip reported it; empty for a call we placed.
+sipLinePeer :: SipLine -> String
+sipLinePeer = slPeer

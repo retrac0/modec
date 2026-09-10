@@ -95,6 +95,21 @@ baresipTests = testGroup "baresip control protocol and SIP line"
       assertEqual "start as answerer" [SipStartModem Answer] a3
       let (_, a4) = sipLineHayes l3 ActHangup
       assertEqual "hangup" [SipStopModem, SipCommand "hangup" ""] a4
+      assertEqual "caller" "sip:bbs@example.org" (sipLinePeer l1)
+  , testCase "SIP line: S0 answers without being told" $ do
+      -- The modem's own idle loop answers on sustained line energy, which
+      -- is switched off in SIP mode because baresip does the ringing; so
+      -- S0 has to be honoured here or `modec answer` waits forever.
+      let l0 = sipLineSetAuto True (sipLineInit "sip.example.org")
+          (l1, a1) = sipLineEvent 0 l0 (BsEvent "call" "CALL_INCOMING" "" [("peeruri", "sip:1234@example.org")])
+      assertEqual "ring then accept" [SipToDte EvRing, SipCommand "accept" ""] a1
+      assertEqual "caller" "sip:1234@example.org" (sipLinePeer l1)
+      let (l2, a2) = sipLineEvent 1 l1 (BsEvent "call" "CALL_ESTABLISHED" "" [])
+      assertEqual "answered" [SipStartModem Answer] a2
+      assertEqual "in call" (Just Answer) (sipLineInCall l2)
+      -- and with S0 clear it still only rings, as it always did
+      let (_, a3) = sipLineEvent 0 (sipLineSetAuto False l0) (BsEvent "call" "CALL_INCOMING" "" [])
+      assertEqual "ring only" [SipToDte EvRing] a3
   , testCase "SIP line: full URI and no answer" $ do
       let (l1, a1) = sipLineHayes (sipLineInit "d") (ActDial "sip:bbs@example.org")
       assertEqual "uri passes" [SipCommand "dial" "sip:bbs@example.org"] a1

@@ -59,7 +59,8 @@ buffer, 8 kHz in and out, no `webrtc_aec`, no `augain` -- is in
   The right answer once several devices are involved, since it can hold
   the USR modem behind an ATA as another extension and run the whole
   bench in one box. It still needs a SIP endpoint for modec, so it is
-  option 1 plus a PBX, not instead of it.
+  option 1 plus a PBX, not instead of it.  Since built, once the USR
+  and an ATA joined the bench: [asterisk.md](asterisk.md).
 - **A hardware ATA** (Grandstream HT801-class: PCMU, echo cancellation
   off, jitter buffer maximum, silence suppression off, 0 dB gain). This
   is the right tool for the *hardware* modem and for reference

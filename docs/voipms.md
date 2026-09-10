@@ -80,8 +80,48 @@ line feed, ^S and ^Q go down the line instead of freezing the screen,
 and the high bit survives. ctrl-C is the one key the terminal keeps, and
 it leaves.
 
+## 3b. Answering
+
+`modec answer` is the same session turned around: it starts baresip the
+same way, waits for the registration, and then sits on the line.
+
+```
+cabal run modec -- answer
+```
+
+An incoming call answers itself -- the command sets `ATS0=1`, and S0 is
+honoured over SIP as well as on a sound card -- and the caller is greeted
+with a few lines saying what was negotiated: the modulation, the rate,
+which way the channels run, the error-correcting protocol, and the URI
+they called from. There is no service behind the modem yet; the banner
+is the placeholder for one, and `--listen PORT` is where a real one would
+attach.
+
+The default mode list leaves V.32 out, as it does everywhere. Ask for it
+explicitly when the caller is a modem that can use it:
+
+```
+cabal run modec -- answer --mode v32bis,v32,v22bis,v22,v21,bell103
+```
+
+Two things have to be true before a call can arrive at all, and neither
+is modec's doing:
+
+- **A DID pointed at this sub-account.** A sub-account registers and can
+  place calls without one, but nothing routes an INVITE to it until a
+  number is bought and its routing set to that sub-account. Its POP must
+  match the one in `~/.baresip/accounts`.
+- **The INVITE has to reach baresip.** Registration keeps a NAT binding
+  open, which is usually enough; `sip_listen` in `~/.baresip/config` is
+  `0.0.0.0:5060`, so a forwarded port works too.
+
+Recordings of answered calls are named after the caller rather than the
+literal `incoming`, so `recordings/calls.log` reads the same for calls
+that arrived as for calls that were placed.
+
 The long form is still there when you need to place the pieces yourself
--- an existing baresip, a different audio path, the answering side:
+-- an existing baresip, a different audio path, a hand-built answering
+side:
 
 ```
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain toronto.voip.ms \

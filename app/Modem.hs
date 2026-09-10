@@ -28,6 +28,9 @@ import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import Text.Printf (printf)
 import Data.List (intercalate)
+import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
+import Data.Version (showVersion)
+import Paths_modec (version)
 import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
@@ -99,7 +102,8 @@ data ModemOpts = ModemOpts
   , moRecordRx :: Maybe FilePath   -- ^ write everything received to this WAV
   , moRecordTx :: Maybe FilePath   -- ^ write everything transmitted to this WAV
   , moRecordDir :: Maybe FilePath  -- ^ record each call separately here (see "CallLog")
-  , moDial     :: Maybe String     -- ^ dial this as soon as the line is ready
+  , moAutoType :: Maybe String     -- ^ typed on the DTE's behalf once the line is ready
+  , moBanner   :: Bool             -- ^ greet the far end with what we connected at
   , moHangupExits :: Bool          -- ^ leave when the call does, rather than back to AT
   , moIgnoreBusy :: Bool          -- ^ stay on the line through busy, congestion and SIT
   }
@@ -115,7 +119,7 @@ defaultModemOpts = ModemOpts
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
-  , moDial = Nothing, moHangupExits = False, moIgnoreBusy = False }
+  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -204,6 +208,11 @@ runModem o = do
       -- per call, named for when it was placed and what it dialled.
       callRef <- newIORef (Nothing :: Maybe CallRec)
       outcomeRef <- newIORef "no answer"
+      -- The greeting the answering side sends, and the two things it is
+      -- composed from that are known before the link can carry it.
+      bannerRef <- newIORef B.empty
+      connRef <- newIORef ([] :: [String])
+      peerRef <- newIORef ""
       let say msg = do
             logMsg msg
             mc <- readIORef callRef
@@ -300,17 +309,42 @@ runModem o = do
                                          || modemEchoDelay st' /= Nothing)) $
               say ("line: " ++ line)
 
+          -- An answering modem with no service behind it still owes the
+          -- caller a word about what it just agreed to.  Held until the
+          -- link can carry it: with MNP that means waiting for the
+          -- protocol, because its class is part of the answer.
+          sendBanner ec = when (moBanner o) $ do
+            conn <- readIORef connRef
+            peer <- readIORef peerRef
+            now <- getCurrentTime
+            let ls = [ "", "modec " ++ showVersion version ++ " -- software modem", "" ]
+                     ++ conn
+                     ++ [ "error correction: " ++ ec ]
+                     ++ [ "caller: " ++ peer | not (null peer) ]
+                     ++ [ formatTime defaultTimeLocale "%Y-%m-%d %H:%M:%S UTC" now
+                        , "", "Nothing is listening behind this modem yet.", "" ]
+            writeIORef bannerRef (BC.pack (concatMap (++ "\r\n") ls))
           report ev = case ev of
             EvConnected st link -> do
               writeIORef outcomeRef ("connected " ++ show st ++ " " ++ describeRate link)
               say ("CONNECT " ++ show st ++ " " ++ describeRate link ++ ", " ++ describeChannels link)
+              -- "this end" because the banner is read at the other one,
+              -- where "sending HighChannel" would otherwise look like a
+              -- description of the reader's own side
+              writeIORef connRef [ "CONNECT " ++ show st ++ " " ++ describeRate link
+                                 , "this end: " ++ describeChannels link ]
+              -- with no protocol to wait for, the carrier is the boundary
+              when (moMnp o == Nothing) (sendBanner "none")
               when trace (logMsg (show link))
             EvDropped -> writeIORef outcomeRef "carrier lost" >> say "NO CARRIER"
             EvFailed why -> writeIORef outcomeRef ("failed: " ++ why) >> say ("connection failed: " ++ why)
             EvV8Menu m -> say ("V.8 far end offers: " ++ describeMenu m)
-            EvMnp (MnpUp cls k n401) ->
+            EvMnp (MnpUp cls k n401) -> do
               say ("MNP class " ++ show cls ++ ", " ++ show k ++ " outstanding frames, N401 " ++ show n401)
-            EvMnp MnpTransparentFallback -> say "no error correction: the far end did not answer"
+              sendBanner ("MNP class " ++ show cls)
+            EvMnp MnpTransparentFallback -> do
+              say "no error correction: the far end did not answer"
+              sendBanner "none (the far end did not answer)"
             EvMnp (MnpDown why) -> say ("MNP link down: " ++ why)
             -- 5.5 is invisible from the terminal by design -- nothing has
             -- ended and the DTE is not told -- so the call log is the
@@ -332,9 +366,13 @@ runModem o = do
                   then audioLost >>= \ok -> when ok loop
                   else do
                     pending <- recvBytes
+                    -- The greeting is drained here as well as in the Hayes
+                    -- loop.  A flag that quietly does nothing in one of two
+                    -- copies of the same loop is this file's oldest bug.
+                    greet <- atomicModifyIORef' bannerRef (\b -> (B.empty, b))
                     st <- readIORef stRef
                     let rx = decodeS16 raw
-                        (st', audio, rxBytes, events) = modemStep cfg st rx (B.unpack pending)
+                        (st', audio, rxBytes, events) = modemStep cfg st rx (B.unpack (greet <> pending))
                     writeIORef stRef st'
                     traceStep st st'
                     telemetry st'
@@ -361,10 +399,11 @@ runModem o = do
           -- Hayes mode: an AT command interpreter controls calls on the line
           hayesRef <- newIORef hayesInit
           lineRef <- newIORef LineIdle
-          -- A number given on the command line is typed in for the user,
-          -- once the line has had a moment to settle; from there on it is
-          -- an ordinary Hayes call and everything else behaves the same.
-          dialRef <- newIORef (moDial o)
+          -- A command the invocation implies is typed in for the user once
+          -- the line has had a moment to settle -- DT<number> for `dial`,
+          -- S0=1 for `answer`.  From there on it is an ordinary Hayes
+          -- session and everything else behaves the same.
+          autoTypeRef <- newIORef (moAutoType o)
           -- commands the modem types on the DTE's behalf, in the same
           -- stream as anything the DTE types itself
           injectRef <- newIORef B.empty
@@ -414,12 +453,12 @@ runModem o = do
                   else do
                     t <- tNow
                     typed <- recvBytes
-                    toDial <- readIORef dialRef
+                    toType <- readIORef autoTypeRef
                     injected <- atomicModifyIORef' injectRef (\b -> (B.empty, b))
-                    pending <- case toDial of
-                      Just n | t >= 1.0 -> do
-                        writeIORef dialRef Nothing
-                        return (injected <> BC.pack ("ATDT" ++ n ++ "\r") <> typed)
+                    pending <- case toType of
+                      Just cmd | t >= 1.0 -> do
+                        writeIORef autoTypeRef Nothing
+                        return (injected <> BC.pack ("AT" ++ cmd ++ "\r") <> typed)
                       _ -> return (injected <> typed)
                     hs0 <- readIORef hayesRef
                     let (hs1, back, fwd, acts) = hayesInput t hs0 pending
@@ -432,7 +471,10 @@ runModem o = do
                     -- it goes out over SIP or over the audio device.
                     forM_ acts $ \a -> case a of
                       ActDial n -> beginCall (dialledNumber n)
-                      ActAnswer -> beginCall "incoming"
+                      -- over SIP the answer is begun on CALL_ESTABLISHED
+                      -- instead, which is also where the caller's name is
+                      -- known and where an auto-answer arrives at all
+                      ActAnswer | sip == Nothing -> beginCall "incoming"
                       _ -> return ()
                     -- SIP: Hayes actions and baresip events go through the line controller
                     sipActs <- case sip of
@@ -440,7 +482,11 @@ runModem o = do
                       Just cl -> do
                         evs <- sipDrain cl
                         sl0 <- readIORef sipLineRef
-                        let (sl1, as1) = foldl (\(s, acc) a -> let (s', xs) = sipLineHayes s a in (s', acc ++ xs)) (sl0, []) acts
+                        -- S0 lives in the Hayes state, which the line
+                        -- controller cannot see; push it in each block so
+                        -- an incoming call can answer itself
+                        let sl0' = sipLineSetAuto (hayesAutoAnswer hs2) sl0
+                            (sl1, as1) = foldl (\(s, acc) a -> let (s', xs) = sipLineHayes s a in (s', acc ++ xs)) (sl0', []) acts
                             (sl2, as2) = foldl (\(s, acc) e -> let (s', xs) = sipLineEvent t s e in (s', acc ++ xs)) (sl1, []) evs
                             (sl3, as3) = sipLineTick t sl2
                         writeIORef sipLineRef sl3
@@ -449,6 +495,11 @@ runModem o = do
                       SipCommand c params -> maybe (return ()) (\cl -> sipSend cl c params) sip
                       SipStartModem role -> do
                         say ("SIP call up, modem role " ++ show role)
+                        peer <- sipLinePeer <$> readIORef sipLineRef
+                        -- cleared on a call we placed, or a banner sent on
+                        -- the next one would name whoever rang before it
+                        writeIORef peerRef (if role == Answer then peer else "")
+                        when (role == Answer) (beginCall (callerName peer))
                         -- PipeWire may have linked the default microphone into
                         -- the softphone's capture alongside our line, which
                         -- would put room noise on the wire; take it out now and
@@ -518,7 +569,11 @@ runModem o = do
                         writeBlock (encodeS16 block)
                         writeIORef lineRef (if VS.null rest then startCall Originate else LineDialing rest)
                       LineCall st c watch -> do
-                        let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack fwd else [])
+                        -- Only once the DTE side is online, or the greeting
+                        -- would be drained into a modem that is still
+                        -- holding its transmit queue for the settle window.
+                        greet <- if online then atomicModifyIORef' bannerRef (\b -> (B.empty, b)) else return B.empty
+                        let (st', audio, rxBytes, events) = modemStep c st rxBlock (if online then B.unpack (greet <> fwd) else [])
                         traceStep st st'
                         telemetry st'
                         writeBlock (encodeS16 audio)
@@ -607,6 +662,11 @@ runModem o = do
     isFinal (EvFailed _) = True
     isFinal _ = False
     toUpperC ch = if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch
+    -- A recording is named after who called, not after the whole URI:
+    -- the host is the same on every call and only makes the stem longer.
+    callerName u = case break (== '@') (drop 1 (dropWhile (/= ':') u)) of
+      (user, _) | not (null user) -> user
+      _ -> "incoming"
     -- ATDT4695551212 reaches here as "T4695551212": the dial string keeps
     -- the tone/pulse/wait modifiers, and a recording should be named
     -- after the number, not after how the dialler was told to send it

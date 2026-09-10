@@ -175,9 +175,10 @@ current.
   continuous-phase carrier to add up over it.
 
 Not yet: V.34 or anything else above 14400; SIP/RTP spoken directly
-rather than through baresip; ring detection (a sound card carries no
-ringing, so ATS0 answers on sustained line energy instead); a native
-PipeWire node (pw-cat child processes are used instead); V.22bis guard
+rather than through baresip; ring detection on the audio path (a sound
+card carries no ringing, so ATS0 answers on sustained line energy
+instead; over SIP baresip reports the ring and ATS0 works properly);
+a native PipeWire node (pw-cat child processes are used instead); V.22bis guard
 tone by default; V.8bis MR/ESi-initiated transactions and the V.8
 start-up variants beyond CM/JM/CJ. [SURVEY.md](SURVEY.md) §7 has these
 in the order they cost least.
@@ -222,7 +223,10 @@ scripts/smoke-hayes.sh
 # SIP: install baresip and copy docs/baresip to ~/.baresip, edit accounts, then just
 cabal run modec -- dial +14042820600                              # starts baresip, dials, records
 cabal run modec -- dial +14042820600 --mode v21 --listen 2323    # on telnet instead of this terminal
-# the long form, for an existing baresip or the answering side
+# the other direction: register, wait, answer, and tell the caller what we agreed on
+cabal run modec -- answer
+cabal run modec -- answer --mode v32bis,v32,v22bis,v22,v21,bell103   # offer V.32 too
+# the long form, for an existing baresip or a hand-built answering side
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example --audio-sip-loop modec --listen 2323
 # and from a terminal program: ATDT<number> dials the BBS, ATA answers an incoming SIP call
 scripts/smoke-sip.sh
