@@ -1,0 +1,16 @@
+# The same modem asked for Bell 202, which is not permitted on
+# Australian lines, and refused.  So the recording is a modem calling
+# and nothing ever answering it in a mode either end can hold.
+#
+# It earns its place as the second `connect: none` in the corpus, and
+# a different kind from the first: `no-v32-answerer` is a far end that
+# will not go to V.32, and this is a far end that will not go anywhere.
+# What must not happen is a connect -- an automode start-up that ends in
+# CONNECT here has locked to something that is not a data signal.
+source:    recordings/third-party/netcomm-2400sa-bell202.wav, left channel
+seconds:   9.0
+role:      originate
+modes:     bell103,v21,v22,v22bis
+v8:        no
+connect:   none
+tolerance: 0

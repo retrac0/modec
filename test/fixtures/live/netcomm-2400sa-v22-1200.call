@@ -1,0 +1,21 @@
+# The same modem and the same Cisco at 1200 bit/s, so the pair of them
+# say something the boards cannot: what changes across a rate is the
+# modulation and not the far end.  The banner is the same text through
+# 300 baud FSK and through 600 baud DPSK.
+#
+# That is also all the checking this one has had, and it is worth being
+# plain about the difference.  The 300 bit/s fixture beside it is
+# confirmed byte for byte by minimodem; there is no second V.22 receiver
+# to hand, so what stands behind these expect: lines is that a different
+# modulation, a different receiver in this same program, and a
+# separately recorded call return the text minimodem confirmed on the
+# other one.  Strong, and not independent.
+source:    recordings/third-party/netcomm-2400sa-1200bps.wav, left channel
+seconds:   27.0
+role:      originate
+modes:     v22,v22bis
+v8:        no
+connect:   V22 1200
+expect:    User Access Verification
+expect:    Username:
+tolerance: 0

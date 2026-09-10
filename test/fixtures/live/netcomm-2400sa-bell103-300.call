@@ -1,0 +1,32 @@
+# A NetComm SmartModem 2400SA calling a Cisco at 300 bit/s, recorded by
+# somebody else in 2013 and published with the audio.  Nothing in it came
+# out of this code, which is the whole reason it is here: the twelve
+# fixtures beside it were all minted from calls modec placed, so any of
+# them could in principle pass by agreeing with a mistake modec makes at
+# both ends.  This one cannot.
+#
+# The recording is stereo with one direction per channel, and on this
+# page the *answering* modem is on the left -- the opposite of the V.34
+# collection the Banksia file comes from.  See
+# recordings/third-party/README.md.
+#
+# The reference below is not modec reading itself back.  minimodem 0.24,
+# pointed at this same file, returns the identical 122 bytes:
+#
+#     minimodem --rx -f netcomm-2400sa-bell103-300.wav \
+#               --mark 2225 --space 2025 300
+#
+# It adds three 0xff bytes of its own at the carrier edges, which the
+# byte gate here suppresses; every other byte agrees, including the
+# strange ` Username: username: login: ' the far end really does send
+# three times over.  So the expect: lines below are checked against an
+# implementation that shares nothing with this one.
+source:    recordings/third-party/netcomm-2400sa-300bps.wav, left channel
+seconds:   38.0
+role:      originate
+modes:     bell103,v21
+v8:        no
+connect:   Bell103 300
+expect:    User Access Verification
+expect:    Username:
+tolerance: 0
