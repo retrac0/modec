@@ -32,12 +32,20 @@ import Modec.Baudot
 import Modec.Stream
 import Modec.Wav
 
-data Channel = Originate | Answer | Auto deriving (Eq, Show)
-data Std = Bell103 | V21 | V23 | Tty45 | Tty50 deriving (Eq, Show)
+-- | Which band the offline @decode@/@encode@ tools work in.  This is not
+-- 'Role': it has an 'BandAuto' that picks by measuring the file, and the
+-- text-telephone tone pairs it selects among are shared by both
+-- directions, so there is no calling end to be.
+data Band = BandLow | BandHigh | BandAuto deriving (Eq, Show)
+
+-- | Which tone pair those tools use.  This is not 'Standard' either: the
+-- 5-bit text telephone modes are not modes the modem can negotiate, and
+-- nothing here is a mode -- it is a pair of frequencies and a baud rate.
+data Tones = TBell103 | TV21 | TV23 | TTty45 | TTty50 deriving (Eq, Show)
 
 data Cmd
-  = Decode Std Channel Double FilePath
-  | Encode Std Channel Int Double FilePath
+  = Decode Tones Band Double FilePath
+  | Encode Tones Band Int Double FilePath
   | Probe FilePath
   | Detect FilePath
   | V32Trace Bool FilePath   -- ^ True = we were the answering modem
@@ -52,7 +60,7 @@ data Cmd
 -- | Reading a recording back through the whole modem, and optionally
 -- minting a test fixture out of what came back.
 data ReplayOpts = ReplayOpts
-  { roModes   :: [H.Standard]
+  { roModes   :: [Standard]
   , roAnswer  :: Bool
   , roV8      :: Bool
   , roMnp     :: Maybe Int
@@ -67,19 +75,19 @@ data ReplayOpts = ReplayOpts
   , roPath    :: FilePath
   }
 
-channelP :: Parser Channel
+channelP :: Parser Band
 channelP =
-      flag' Originate (long "originate" <> help "low band (calling modem transmits)")
-  <|> flag' Answer (long "answer" <> help "high band (answering modem transmits)")
-  <|> pure Auto
+      flag' BandLow (long "originate" <> help "low band (calling modem transmits)")
+  <|> flag' BandHigh (long "answer" <> help "high band (answering modem transmits)")
+  <|> pure BandAuto
 
-stdP :: Parser Std
+stdP :: Parser Tones
 stdP =
-      flag' V21 (long "v21" <> help "use V.21 tones instead of Bell 103")
-  <|> flag' V23 (long "v23" <> help "V.23 duplex: --answer is the 1200 bit/s forward channel, --originate the 75 bit/s backward one")
-  <|> flag' Tty45 (long "tty45" <> help "5-bit text telephone (TTY/TDD), 1400/1800 Hz at 45.45 baud: Baudot text, not bytes. --originate and --answer do not apply, the two directions share one tone pair")
-  <|> flag' Tty50 (long "tty50" <> help "the same at 50 baud, as sold outside North America")
-  <|> pure Bell103
+      flag' TV21 (long "v21" <> help "use V.21 tones instead of Bell 103")
+  <|> flag' TV23 (long "v23" <> help "V.23 duplex: --answer is the 1200 bit/s forward channel, --originate the 75 bit/s backward one")
+  <|> flag' TTty45 (long "tty45" <> help "5-bit text telephone (TTY/TDD), 1400/1800 Hz at 45.45 baud: Baudot text, not bytes. --originate and --answer do not apply, the two directions share one tone pair")
+  <|> flag' TTty50 (long "tty50" <> help "the same at 50 baud, as sold outside North America")
+  <|> pure TBell103
 
 cmdP :: Parser Cmd
 cmdP = hsubparser
@@ -134,11 +142,11 @@ cmdP = hsubparser
     modemP = RunModem <$> (ModemOpts
       <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
-      <*> (flag' H.Answer (long "answer" <> help "answering side") <|> flag H.Originate H.Originate (long "originate" <> help "calling side (default)"))
+      <*> (flag' Answer (long "answer" <> help "answering side") <|> flag Originate Originate (long "originate" <> help "calling side (default)"))
       <*> (option (maybeReader modesReader)
              (long "mode" <> metavar "LIST"
               <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32,v32bis (default: all but v32 and v32bis)")
-                <|> pure H.allStandards)
+                <|> pure allStandards)
       <*> switch (long "no-handshake" <> help "go straight to data mode with the given standard")
       <*> switch (long "v8" <> help "V.8: answer with ANSam and exchange CM/JM capability menus")
       <*> switch (long "probe" <> help "do not place a call: hold a V.32 carrier and measure the echo path of whatever is on the line")
@@ -233,7 +241,7 @@ cmdP = hsubparser
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"
              <> help "comma-separated modes to negotiate, best first: bell103,v21,v23,bell212a,v22,v22bis,v32,v32bis (default: all but v32 and v32bis)")
-      <|> pure H.allStandards
+      <|> pure allStandards
     -- Dialling asks for error correction the way a modem with its
     -- factory settings does.  An unprotected call over a VoIP trunk
     -- delivers the odd corrupt character in the direction it transmits,
@@ -245,8 +253,8 @@ cmdP = hsubparser
       <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "offer only up to class N: 2 start-stop framing, 3 synchronous framing, 4 adds adaptive frame sizing")
       <|> pure (Just 4)
     modesReader s = case s of
-      "auto" -> Just H.allStandards
-      "all" -> Just H.allStandards
+      "auto" -> Just allStandards
+      "all" -> Just allStandards
       _ -> mapM modeReader (splitOn ',' s)
     v32RateReader m = case m of
       "4800" -> Just V32.V32R4800
@@ -256,17 +264,7 @@ cmdP = hsubparser
       "12000" -> Just V32.V32R12000
       "14400" -> Just V32.V32R14400
       _ -> Nothing
-    modeReader m = case m of
-      "bell103" -> Just H.Bell103
-      "v21" -> Just H.V21
-      "v23" -> Just H.V23
-      "bell212a" -> Just H.Bell212A
-      "bell212" -> Just H.Bell212A
-      "v22" -> Just H.V22
-      "v22bis" -> Just H.V22bis
-      "v32" -> Just H.V32
-      "v32bis" -> Just H.V32bis
-      _ -> Nothing
+    modeReader = standardNamed
     splitOn c s = case break (== c) s of
       (a, []) -> [a]
       (a, _ : rest) -> a : splitOn c rest
@@ -286,21 +284,21 @@ cmdP = hsubparser
       <|> (DataConnect <$> strOption (long "connect" <> metavar "HOST") <*> option auto (long "port" <> metavar "PORT" <> value 23))
       <|> flag' DataStdio (long "data-stdio" <> help "raw bytes on stdin/stdout")
 
-specFor :: Std -> Channel -> FskSpec
-specFor Bell103 Originate = bell103Originate
-specFor Bell103 _        = bell103Answer
-specFor V21 Originate    = v21Channel1
-specFor V21 _            = v21Channel2
-specFor V23 Originate    = v23Backward
-specFor V23 _            = v23Forward
-specFor Tty45 _          = tdd45
-specFor Tty50 _          = tdd50
+specFor :: Tones -> Band -> FskSpec
+specFor TBell103 BandLow = bell103Originate
+specFor TBell103 _       = bell103Answer
+specFor TV21 BandLow     = v21Channel1
+specFor TV21 _           = v21Channel2
+specFor TV23 BandLow     = v23Backward
+specFor TV23 _           = v23Forward
+specFor TTty45 _         = tdd45
+specFor TTty50 _         = tdd50
 
 -- | The 5-bit text telephone modes, which are a different pipeline and
 -- not merely different tones: a carrierless line, a 5-bit character at
 -- 1.5 stop bits, and Baudot text rather than transparent bytes.
-isTty :: Std -> Bool
-isTty s = s == Tty45 || s == Tty50
+isTty :: Tones -> Bool
+isTty s = s == TTty45 || s == TTty50
 
 
 -- | Mean tone energy for a spec over the whole file, used to pick a channel.
@@ -318,13 +316,13 @@ main = do
       let fs = fromIntegral (wavRate w)
           x = wavSamples w
           spec = case ch of
-            _ | isTty std -> specFor std Originate     -- one pair, both directions
-            Auto ->
-              let o = specFor std Originate
-                  a = specFor std Answer
+            _ | isTty std -> specFor std BandLow     -- one pair, both directions
+            BandAuto ->
+              let o = specFor std BandLow
+                  a = specFor std BandHigh
               in if bandEnergy fs o x >= bandEnergy fs a x then o else a
             _ -> specFor std ch
-      when (ch == Auto && not (isTty std)) $ hPutStrLn stderr ("auto-selected " ++ fskName spec)
+      when (ch == BandAuto && not (isTty std)) $ hPutStrLn stderr ("auto-selected " ++ fskName spec)
       hSetBinaryMode stdout True
       if isTty std
         then do
@@ -337,7 +335,7 @@ main = do
     Encode std ch rate amp out -> do
       hSetBinaryMode stdin True
       bytes <- B.getContents
-      let spec = specFor std (if ch == Auto then Originate else ch)
+      let spec = specFor std (if ch == BandAuto then BandLow else ch)
           fs = fromIntegral rate
           codes = snd (baudotEncode baudotTxInit (B.unpack bytes))
           burst = (Off, 0.2) : keyedBurst tddFraming (fskBaud spec) defaultBurst codes ++ [(Off, 0.3)]
@@ -413,7 +411,7 @@ runReplay :: ReplayOpts -> IO ()
 runReplay ro = do
   w <- readWav (roPath ro)
   let fs = fromIntegral (wavRate w) :: Double
-      role = if roAnswer ro then H.Answer else H.Originate
+      role = if roAnswer ro then Answer else Originate
       cfg0 = defaultModemConfig fs role (roModes ro)
       cfg = cfg0 { mcMaxEvm = roMaxEvm ro
                  , mcMaxEvmV32 = roMaxEvmV32 ro
@@ -530,7 +528,7 @@ mint ro r name rate trimmed = do
     spec =
       [ "# " ++ takeFileName (roPath ro)
       , "role:      " ++ (if roAnswer ro then "answer" else "originate")
-      , "modes:     " ++ intercalate "," (map modeName (roModes ro))
+      , "modes:     " ++ intercalate "," (map standardName (roModes ro))
       , "v8:        " ++ (if roV8 ro then "yes" else "no")
       ] ++
       [ "mnp:       " ++ show c | Just c <- [roMnp ro] ] ++
@@ -545,7 +543,4 @@ mint ro r name rate trimmed = do
       ((s, l) : _) -> show s ++ " " ++ show (round (linkBitRate l) :: Int)
       [] -> "none"
 
-modeName :: H.Standard -> String
-modeName s = case s of
-  H.Bell103 -> "bell103"; H.V21 -> "v21"; H.V23 -> "v23"; H.Bell212A -> "bell212a"
-  H.V22 -> "v22"; H.V22bis -> "v22bis"; H.V32 -> "v32"; H.V32bis -> "v32bis"
+

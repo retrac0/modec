@@ -22,11 +22,9 @@ import Modec.QAM
 import Modec.Standards
 import Modec.Async
 import Modec.V22
-import Modec.Handshake (Standard (..))
 import Modec.Loopback
 import Modec.Modem (ModemConfig (..), ModemEvent (..))
 import Modec.Echo (EchoConfig (..))
-import Modec.Channel (Channel (..))
 import Modec.V32
 import Modec.V32Pump
 

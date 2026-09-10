@@ -147,7 +147,7 @@ txBlock fs amp fr guard cmd n st = case cmd of
   -- echo cancellers, and the Recommendation says not to send them when
   -- that is not wanted.
   TxAnsam ->
-    let w = 2 * pi * 2100 / fs
+    let w = 2 * pi * answerToneItu / fs
         wm = 2 * pi * 15 / fs
         sig = VS.generate n (\i ->
           let k = fromIntegral i

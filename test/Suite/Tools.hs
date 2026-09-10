@@ -8,6 +8,7 @@ import Data.Char (isSpace)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
+import Modec.Standards
 import Modec.Handshake
 import Modec.Hayes
 import Modec.Dtmf

@@ -11,7 +11,7 @@ module Modec.Async
 import Data.Bits (setBit)
 import Data.Word (Word8)
 
-import Modec.FSK (Framing (..))
+import Modec.Standards (Framing (..))
 import Modec.Stream
 
 -- | Idle (waiting for a start bit after mark), or inside a character

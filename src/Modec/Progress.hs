@@ -65,10 +65,17 @@ import Text.Printf (printf)
 import qualified Data.Vector.Unboxed as VU
 
 import Modec.DSP (Signal)
+import Modec.Standards (answerToneItu, answerToneBell)
 import Modec.Detect
 import Modec.Stream
 
 -- | Every frequency the classifier measures.
+-- | The two answer tones, which are one signature to a tone bank: a
+-- 40 ms window cannot tell an ITU answer tone from a Bell one, and for
+-- call progress it does not need to -- either means a modem picked up.
+answerTones :: [Double]
+answerTones = [answerToneItu, answerToneBell]
+
 progressFreqs :: [Double]
 progressFreqs =
   [ 350, 400, 425, 440, 450, 480, 620   -- dial tone, ringing, busy and congestion
@@ -76,7 +83,7 @@ progressFreqs =
   , 1100                                -- fax calling tone (CNG)
   , 1370.6, 1400, 1428.5                -- special information tone, second segment
   , 1776.7, 1800                        -- special information tone, third segment
-  , 2100, 2225                          -- answer tones
+  , answerToneItu, answerToneBell       -- answer tones
   ]
 
 -- | The bank the classifier reads.  See the module header for why the
@@ -219,7 +226,7 @@ sigOfFrame pp fr
       , ( SigRing,   [440, 480],                  [350, 620],      [] )
       , ( SigSingle, [loudestOf band],            [350, 480, 620], band )
       , ( SigCng,    [1100],                      [],              [] )
-      , ( SigAnswer, [loudestOf [2100, 2225]],    [],              [2100, 2225] )
+      , ( SigAnswer, [loudestOf answerTones],     [],              answerTones )
       , ( SigSit 1,  [loudestOf (sitBand 1)],     [],              sitBand 1 )
       , ( SigSit 2,  [loudestOf (sitBand 2)],     [],              sitBand 2 )
       , ( SigSit 3,  [loudestOf (sitBand 3)],     [],              sitBand 3 )

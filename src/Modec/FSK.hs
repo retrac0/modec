@@ -22,10 +22,7 @@
 -- samples per bit.  The transmitter is continuous-phase FSK from a phase
 -- accumulator.
 module Modec.FSK
-  ( Framing (..)
-  , framing8N1
-  , tddFraming
-  , Level (..)
+  ( Level (..)
   , Keying
   , frameKeyed
   , modulateKeyed
@@ -63,43 +60,6 @@ import Data.Word (Word8)
 import Modec.DSP
 import Modec.Standards
 import Modec.Stream
-
--- | Asynchronous character framing.  Start bit is always one space;
--- data bits are sent LSB first; no parity support yet.
---
--- The stop period is measured in bit times and need not be whole: the
--- 5-bit text telephone code specifies a minimum of one and a half.
--- "Minimum" is load bearing -- after the stop bits the line simply
--- idles in mark until the next start bit, for anything from nothing to
--- a second, so a receiver must resynchronise on every start edge rather
--- than assume a fixed character period.  Only 'frameKeyed' can express
--- the fraction; 'frameBits', which frames whole bits for the
--- continuous-carrier modes, rounds up.
-data Framing = Framing
-  { frDataBits :: !Int
-  , frStopBits :: !Double
-  } deriving (Eq, Show)
-
-framing8N1 :: Framing
-framing8N1 = Framing 8 1
-
--- | The 5-bit text telephone character (V.18 A.4 / ANSI TIA-825).
---
--- Two stop bits, where the Recommendation asks for a minimum of one and
--- a half.  The minimum is what a receiver may require; it is not what a
--- transmitter should send.  Asterisk sends exactly 1.5 and minimodem's
--- @tdd@ preset requires 2.0, so 1.5 on the line loses characters to
--- minimodem -- 32 of 35, with the clock read 3.9 % fast -- while 2.0 is
--- decoded perfectly by both it and us.  Ultratec's Turbo Code uses two
--- stop bits for the same reason, to give a tone detector enough mark to
--- lock to.  The cost is 11 ms a character, six per cent of a line that
--- is slow anyway.
---
--- The receiver deliberately does not enforce this: it wants a mark stop
--- bit and nothing more, because the stop period is idle mark of
--- unbounded length and a far end sending the 1.5 minimum is correct.
-tddFraming :: Framing
-tddFraming = Framing 5 2
 
 -- | A line level.  'Off' is no carrier at all, which is where a
 -- carrierless mode -- the 5-bit text telephone code -- spends the time

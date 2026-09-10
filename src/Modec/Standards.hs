@@ -1,6 +1,28 @@
--- | Tone tables for the FSK standards.  Frequencies in Hz, rates in baud.
+-- | The vocabulary the whole modem is written in: which modulations
+-- exist, which end of the call we are, how a character is framed, and
+-- the tone tables for the FSK standards.  Frequencies in Hz, rates in
+-- baud.
+--
+-- The rule that keeps this module a leaf, and worth keeping: only types
+-- with nothing underneath them live here.  'Link' does not -- it names a
+-- V.22 channel and a V.32 rate -- so it lives in "Modec.Link", one layer
+-- up.  Anything that needs a sample rate is further up still.
 module Modec.Standards
-  ( FskSpec (..)
+  ( -- * Modulations
+    Standard (..)
+  , allStandards
+  , isV22Family
+  , isV32
+  , standardName
+  , standardNamed
+    -- * Which end of the call
+  , Role (..)
+    -- * Character framing
+  , Framing (..)
+  , framing8N1
+  , tddFraming
+    -- * FSK tone tables
+  , FskSpec (..)
   , bell103Originate
   , bell103Answer
   , v21Channel1
@@ -13,6 +35,93 @@ module Modec.Standards
   , answerToneItu
   , answerToneBell
   ) where
+
+-- | A modulation the modem can negotiate.  'Bell212A' is the North
+-- American 1200 bit/s DPSK standard: the same 600 baud data pump and
+-- handshake timings as V.22, but announced with the 2225 Hz Bell answer
+-- tone instead of unscrambled binary 1, without guard tones, and with no
+-- 2400 bit/s rate.  'V22bis' is V.22 that negotiated 2400 bit/s.
+-- 'V23' is V.23 duplex: 1200 bit/s from the answering modem, 75 bit/s
+-- back from the calling one.  It is the only asymmetric mode here, and
+-- the only one whose two directions run at different rates.
+data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis | V32 | V32bis deriving (Eq, Show, Enum, Bounded)
+
+-- | Every mode, best first; the default configuration.  V.23 is not in
+-- it: 75 bit/s upstream is worse than V.21 for anything but viewdata, so
+-- it is a mode to ask for rather than one to fall into.
+allStandards :: [Standard]
+allStandards = [V22bis, V22, Bell212A, V21, Bell103]
+
+-- | Modes that use the V.22 data pump.
+isV22Family :: Standard -> Bool
+isV22Family s = s `elem` [Bell212A, V22, V22bis]
+
+-- | V.32 is the one mode here that does not take turns by frequency.
+-- Both directions share the whole band on an 1800 Hz carrier, its
+-- start-up is the sample-accurate exchange of "Modec.V32Start" rather
+-- than anything this tick-driven machine can drive, and it is the only
+-- mode that needs an echo canceller.
+isV32 :: Standard -> Bool
+isV32 s = s == V32 || s == V32bis
+
+-- | Which end of the call we are.  The calling modem originates; the
+-- answering modem answers.  Every asymmetry in the whole modem -- which
+-- FSK band we transmit in, which V.22 channel we own, which V.32
+-- scrambler polynomial whitens our data -- comes back to this one bit.
+data Role = Originate | Answer deriving (Eq, Show)
+
+-- | The spelling a mode goes by on the command line, in a @.call@
+-- fixture and in the call log.  One table, because the three that used
+-- to do this -- the @--mode@ reader, the fixture minter and the corpus
+-- parser -- could drift apart without anything failing to compile, and
+-- the corpus would then break at test time rather than at build time.
+standardName :: Standard -> String
+standardName s = case s of
+  Bell103 -> "bell103"; V21 -> "v21"; V23 -> "v23"; Bell212A -> "bell212a"
+  V22 -> "v22"; V22bis -> "v22bis"; V32 -> "v32"; V32bis -> "v32bis"
+
+-- | The inverse.  @bell212@ is accepted for 'Bell212A' because the
+-- command line has always taken it.
+standardNamed :: String -> Maybe Standard
+standardNamed "bell212" = Just Bell212A
+standardNamed n = lookup n [(standardName s, s) | s <- [minBound .. maxBound]]
+
+-- | Asynchronous character framing.  Start bit is always one space;
+-- data bits are sent LSB first; no parity support yet.
+--
+-- The stop period is measured in bit times and need not be whole: the
+-- 5-bit text telephone code specifies a minimum of one and a half.
+-- "Minimum" is load bearing -- after the stop bits the line simply
+-- idles in mark until the next start bit, for anything from nothing to
+-- a second, so a receiver must resynchronise on every start edge rather
+-- than assume a fixed character period.  Only 'frameKeyed' can express
+-- the fraction; 'frameBits', which frames whole bits for the
+-- continuous-carrier modes, rounds up.
+data Framing = Framing
+  { frDataBits :: !Int
+  , frStopBits :: !Double
+  } deriving (Eq, Show)
+
+framing8N1 :: Framing
+framing8N1 = Framing 8 1
+
+-- | The 5-bit text telephone character (V.18 A.4 / ANSI TIA-825).
+--
+-- Two stop bits, where the Recommendation asks for a minimum of one and
+-- a half.  The minimum is what a receiver may require; it is not what a
+-- transmitter should send.  Asterisk sends exactly 1.5 and minimodem's
+-- @tdd@ preset requires 2.0, so 1.5 on the line loses characters to
+-- minimodem -- 32 of 35, with the clock read 3.9 % fast -- while 2.0 is
+-- decoded perfectly by both it and us.  Ultratec's Turbo Code uses two
+-- stop bits for the same reason, to give a tone detector enough mark to
+-- lock to.  The cost is 11 ms a character, six per cent of a line that
+-- is slow anyway.
+--
+-- The receiver deliberately does not enforce this: it wants a mark stop
+-- bit and nothing more, because the stop period is idle mark of
+-- unbounded length and a far end sending the 1.5 minimum is correct.
+tddFraming :: Framing
+tddFraming = Framing 5 2
 
 data FskSpec = FskSpec
   { fskName  :: String

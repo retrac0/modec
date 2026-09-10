@@ -63,7 +63,7 @@ import Data.Bits ((.&.), (.|.))
 import Data.Word (Word8)
 
 import Modec.Async (AsyncRx, asyncRxInit, asyncRxBits)
-import Modec.FSK (framing8N1)
+import Modec.Standards (framing8N1)
 import Modec.Hdlc (HdlcRx, hdlcRxInit, hdlcRxBits)
 import Modec.MnpFrame
 

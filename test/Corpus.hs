@@ -47,7 +47,7 @@ import Test.Tasty.HUnit
 
 import Modec.DSP (Signal)
 import Modec.FSK
-import Modec.Handshake (Role (..), Standard (..), hcV8)
+import Modec.Handshake (hcV8)
 import Modec.Metrics (editDistance)
 import Modec.Mnp (MnpConfig (..), defaultMnpConfig)
 import Modec.Modem
@@ -89,10 +89,7 @@ splitOn c s = case break (== c) s of
   (a, _ : b)   -> a : splitOn c b
 
 standardOf :: String -> Standard
-standardOf m = case m of
-  "bell103" -> Bell103; "v21" -> V21; "v23" -> V23; "bell212a" -> Bell212A
-  "v22" -> V22; "v22bis" -> V22bis; "v32" -> V32; "v32bis" -> V32bis
-  _ -> error ("unknown mode " ++ m)
+standardOf m = fromMaybe (error ("unknown mode " ++ m)) (standardNamed m)
 
 -- | The synthesised fixtures: audio that is nothing but the modulation,
 -- so a demodulator can be pointed at the head of the file.

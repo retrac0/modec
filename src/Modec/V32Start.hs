@@ -58,6 +58,7 @@ module Modec.V32Start
 import Data.Maybe (listToMaybe)
 import qualified Data.Vector.Storable as VS
 
+import Modec.Standards (answerToneItu)
 import Modec.DSP (Signal, chunksOf)
 import Modec.QAM
 import Modec.V32
@@ -629,7 +630,7 @@ emit st n
     p = v32Params (vsFs st)
     -- the V.25 answer tone, reversed every 450 ms to stand down any echo
     -- canceller in the network: we are about to be our own
-    w = 2 * pi * 2100 / vsFs st
+    w = 2 * pi * answerToneItu / vsFs st
     tone = VS.generate n $ \i ->
       let t = vsN st + i
           seg = (t * 1000) `div` (round (vsFs st) * 450 `div` 1000) :: Int

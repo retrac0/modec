@@ -29,7 +29,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit)
 import Data.List (isPrefixOf)
 
-import Modec.Handshake (Role (..))
+import Modec.Standards (Role (..))
 import Modec.Json
 import Modec.Hayes (HayesAction (..), HayesEvent (..))
 

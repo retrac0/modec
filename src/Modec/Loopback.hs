@@ -30,7 +30,7 @@ import Data.Word (Word8)
 
 import Modec.Channel
 import Modec.DSP (Signal, fromDb)
-import Modec.Handshake (Role (..), Standard)
+import Modec.Standards (Role (..), Standard)
 import Modec.Modem
 
 data LoopConfig = LoopConfig

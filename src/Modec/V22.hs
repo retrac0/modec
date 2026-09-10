@@ -71,7 +71,8 @@ import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 
 import Modec.DSP
-import Modec.FSK (Framing, frameBits)
+import Modec.FSK (frameBits)
+import Modec.Standards (Framing)
 import Modec.Hdlc (hdlcFlagBits)
 import Modec.Scrambler
 import Modec.Stream

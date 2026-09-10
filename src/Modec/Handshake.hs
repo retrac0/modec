@@ -68,12 +68,7 @@
 -- the V.22 receiver's phase-step quality decides: unscrambled ones give
 -- exact 270 degree steps, 2225 Hz gives steps 15 degrees off.
 module Modec.Handshake
-  ( Standard (..)
-  , allStandards
-  , isV22Family
-  , isV32
-  , Role (..)
-  , Link (..)
+  ( Link (..)
   , HsConfig (..)
   , defaultHsConfig
   , withModes
@@ -95,7 +90,6 @@ module Modec.Handshake
 
 import Data.Maybe (listToMaybe)
 import Modec.Detect
-import Modec.DSP (fromDb)
 import Modec.Standards
 import Modec.Stream
 import Modec.V22 (Rate (..), TxMode (..), V22Channel (..))
@@ -103,35 +97,6 @@ import Modec.V32 (V32Rate (..))
 import Modec.V8
 import Data.Word (Word8)
 
--- | A modulation the modem can negotiate.  'Bell212A' is the North
--- American 1200 bit/s DPSK standard: the same 600 baud data pump and
--- handshake timings as V.22, but announced with the 2225 Hz Bell answer
--- tone instead of unscrambled binary 1, without guard tones, and with no
--- 2400 bit/s rate.  'V22bis' is V.22 that negotiated 2400 bit/s.
--- 'V23' is V.23 duplex: 1200 bit/s from the answering modem, 75 bit/s
--- back from the calling one.  It is the only asymmetric mode here, and
--- the only one whose two directions run at different rates.
-data Standard = Bell103 | V21 | V23 | Bell212A | V22 | V22bis | V32 | V32bis deriving (Eq, Show, Enum, Bounded)
-
--- | Every mode, best first; the default configuration.  V.23 is not in
--- it: 75 bit/s upstream is worse than V.21 for anything but viewdata, so
--- it is a mode to ask for rather than one to fall into.
-allStandards :: [Standard]
-allStandards = [V22bis, V22, Bell212A, V21, Bell103]
-
--- | Modes that use the V.22 data pump.
-isV22Family :: Standard -> Bool
-isV22Family s = s `elem` [Bell212A, V22, V22bis]
-
--- | V.32 is the one mode here that does not take turns by frequency.
--- Both directions share the whole band on an 1800 Hz carrier, its
--- start-up is the sample-accurate exchange of "Modec.V32Start" rather
--- than anything this tick-driven machine can drive, and it is the only
--- mode that needs an echo canceller.
-isV32 :: Standard -> Bool
-isV32 s = s == V32 || s == V32bis
-
-data Role = Originate | Answer deriving (Eq, Show)
 
 -- | The channels of an established connection: our transmit side and
 -- our receive side.
@@ -464,7 +429,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     -- an answering modem that steps straight from the answer tone to the
     -- next rung of its fallback ladder leaves no silence between them
     sinceOtherTone = case toneSince of
-      Just (f, since) | f /= 2100 -> t - since
+      Just (f, since) | f /= answerToneItu -> t - since
       _ -> 0
     st' = st { hsToneSince = toneSince, hsLastTone = lastTone, hsT = t
              , hsAnsam = ansamSeen, hsV8Last = v8Last', hsV8Reps = v8Reps' }
@@ -556,7 +521,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
     qualified s = heardFor (fskMark (fskRx role s)) >= hcQualify cfg && not (s == Bell103 && role == Originate && u11Seen)
     -- V.22 §6.3.1.1 note: some answering modems emit 2225 Hz where the
     -- Recommendation has unscrambled binary 1; that is a Bell 212A answerer
-    bell212Trigger = heardFor 2225 >= 0.155 && not u11Seen
+    bell212Trigger = heardFor answerToneBell >= 0.155 && not u11Seen
     remoteAlive s = case linkFor role s of
       FskLink _ rx -> t - lastToneOf rx <= hcDrop cfg
       V22Link {} -> True
@@ -671,12 +636,12 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         | v22Allowed && u11Seen -> (enter OV22Wait) { hsFamily = V22 }
         | bellChoice == Just Bell212A && bell212Trigger -> (enter OV22Wait) { hsFamily = Bell212A }
         | bellChoice == Just Bell103 && qualified Bell103 -> enter (OReply Bell103)
-        | heardFor 2100 >= hcQualify cfg -> enter OAnsEnding
+        | heardFor answerToneItu >= hcQualify cfg -> enter OAnsEnding
       OAnsEnding
         -- the answer tone is modulated: the far end speaks V.8 and is
         -- waiting to be told what we have (7.2, 8.1.1)
         | hcV8 cfg && ansamSeen && not (null ourV8Mods) -> enter OV8Wait
-        | dom /= Just 2100 && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
+        | dom /= Just answerToneItu && (quiet >= 0.04 || sinceOtherTone >= 0.1) -> enter OAfterAns
       -- No Bell 212A rung here, and that is not an oversight.  This
       -- ladder is entered on a 2100 Hz answer tone, which is an ITU
       -- answerer by definition -- a Bell 212A answering modem sends
@@ -817,7 +782,7 @@ handshakeStep cfg st fr inp = (st'', HsOut tx status rxRate (hsRole st'') v8List
         Just peer | hsPhaseAt st'' == t -> TxBits v21Channel2 (v8Repeat (sequenceBits SeqJM (v8Reply peer)))
         _ -> TxMark v21Channel2
       AV8Gap -> TxSilence
-      AAns -> TxTone 2100
+      AAns -> TxTone answerToneItu
       AGap -> TxSilence
       AProbe V22 -> TxV22 HighChannel R1200 TxU11
       AProbe s -> TxMark (fskTx Answer s)

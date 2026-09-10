@@ -63,7 +63,7 @@ defaultToneBank = ToneBankConfig
   -- pair is there at all, which is what 5.4.1 has the calling modem
   -- listen for before it commits to V.32.  Neither is within 300 Hz of
   -- anything else here.
-  { tbFreqs = [980, 1070, 1180, 1270, 1300, 1650, 1850, 2025, 2100, 2225, 600, 3000]
+  { tbFreqs = [980, 1070, 1180, 1270, 1300, 1650, 1850, 2025, answerToneItu, answerToneBell, 600, 3000]
   , tbWindowSec = 0.04
   , tbHopSec = 0.02
   }

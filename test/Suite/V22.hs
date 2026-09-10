@@ -6,6 +6,7 @@ import Data.List (isSuffixOf)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
+import Modec.Standards
 import Modec.Channel
 import Modec.DSP
 import Modec.Async

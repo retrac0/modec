@@ -59,6 +59,7 @@ import Data.List (foldl', intercalate, sort)
 import Data.Word (Word8)
 import qualified Data.Vector.Storable as VS
 
+import Modec.Standards (answerToneItu)
 import Modec.DSP (Signal)
 
 -- | Call functions (Table 3), given by the three option bits b5-b7 of
@@ -329,7 +330,7 @@ ansamSignal fs amp secs reversals = VS.generate n sample
       let t = fromIntegral i / fs
           env = 1 + 0.2 * sin (2 * pi * 15 * t)
           flips = if reversals then fromIntegral (floor (t / 0.45) :: Int) * pi else 0
-      in amp * env * sin (2 * pi * 2100 * t + flips)
+      in amp * env * sin (2 * pi * answerToneItu * t + flips)
 
 -- | Detector for ANSam.
 --
@@ -366,7 +367,7 @@ ansamBlock st0 xs = VS.foldl' step (st0, False) xs
     -- 0.4 s of envelope: three bin widths of separation at 15 Hz
     win = round (0.4 * fs) :: Int
     step (st, hit) x =
-      let ph = asPhase st + 2 * pi * 2100 / fs
+      let ph = asPhase st + 2 * pi * answerToneItu / fs
           ph' = if ph > 2 * pi then ph - 2 * pi else ph
           i' = asI st + k * (x * cos ph - asI st)
           q' = asQ st + k * (negate x * sin ph - asQ st)

@@ -44,7 +44,7 @@ import Modec.Dtmf
 import Modec.Progress
 import Modec.Hayes
 import Modec.Modem
-import Modec.Standards (fskBaud, fskName)
+import Modec.Standards
 import Modec.V32 (V32Rate (..), rateBitRate)
 import qualified Modec.V32 as V32
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
