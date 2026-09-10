@@ -28,6 +28,8 @@ module Modec.Modem
     -- * Link properties, for the error-correcting protocol
   , mnpRoleOf
     -- * Transmitter
+  , TxLine (..)
+  , txLineOf
   , TxState
   , txInit
   , txBlock
@@ -39,6 +41,7 @@ import Data.Maybe (isJust)
 import Data.Word (Word8)
 
 import Modec.Link
+import Modec.Modem.Tx
 import Modec.Async
 import Modec.Detect
 import Modec.DSP
@@ -111,98 +114,6 @@ data ModemEvent
   | EvRetrain RetrainCause -- ^ 5.5: the link is being trained again
   | EvRate V32Rate         -- ^ a retrain settled on a different rate
   deriving (Eq, Show)
-
--- | Streaming transmitter: phase-continuous tones, FSK with a byte
--- queue (band limited per channel), and the V.22 modulator.
-data TxState = TxState
-  { txPhase   :: !Double
-  , txBitPos  :: !Double
-  , txCurBit  :: !Bool
-  , txBits    :: [Bool]
-  , txQueue   :: [Word8]
-  , txFir     :: Maybe (String, VS.Vector Double, Signal)   -- ^ spec name, reversed kernel, history
-  , txSync    :: [Bool]             -- ^ synchronous line bits waiting (MNP framing mode 3)
-  , txV22     :: V22TxState
-  , txPhase2  :: !Double            -- ^ second tone phase (dual tones)
-  }
-
-txInit :: TxState
-txInit = TxState 0 0 True [] [] Nothing [] v22TxInit 0
-
--- | Generate @n@ samples for a transmit command, consuming queued bytes
--- only in data modes.
-txBlock :: Double -> Double -> Framing -> Bool -> TxCmd -> Int -> TxState -> (TxState, Signal)
-txBlock fs amp fr guard cmd n st = case cmd of
-  TxSilence -> (st { txFir = Nothing }, VS.replicate n 0)
-  TxTone f ->
-    let w = 2 * pi * f / fs
-        sig = VS.generate n (\i -> amp * sin (txPhase st + w * fromIntegral i))
-    in (st { txPhase = wrap (txPhase st + w * fromIntegral n), txFir = Nothing }, sig)
-  TxMark spec -> fsk spec False
-  TxData spec -> fsk spec True
-  TxBits spec bits -> fsk spec False `withQueuedBits` bits
-  -- ANSam: 2100 Hz with a 15 Hz envelope between 0.8 and 1.2 of average
-  -- (7.2/V.8).  No phase reversals: those exist only to disable network
-  -- echo cancellers, and the Recommendation says not to send them when
-  -- that is not wanted.
-  TxAnsam ->
-    let w = 2 * pi * answerToneItu / fs
-        wm = 2 * pi * 15 / fs
-        sig = VS.generate n (\i ->
-          let k = fromIntegral i
-          in amp * (1 + 0.2 * sin (txPhase2 st + wm * k)) * sin (txPhase st + w * k))
-    in (st { txPhase = wrap (txPhase st + w * fromIntegral n)
-           , txPhase2 = wrap (txPhase2 st + wm * fromIntegral n)
-           , txFir = Nothing }, sig)
-  TxV22 ch rate mode ->
-    let (bytes, st1) = case mode of
-          TxScrambledData -> (txQueue st, st { txQueue = [] })
-          _ -> ([], st)
-        v0 = case mode of
-          TxSyncData -> withBits (txV22 st1) (txSync st1)
-          _ -> txV22 st1
-        (v', sig) = v22TxBlock fs ch fr amp guard rate mode bytes n v0
-        st2 = case mode of { TxSyncData -> st1 { txSync = [] }; _ -> st1 }
-    in (st2 { txV22 = v', txFir = Nothing }, sig)
-  where
-    twoPi = 2 * pi
-    wrap = wrapTwoPi
-    -- queue raw bits before generating (used once per TxBits command)
-    withQueuedBits f bits = let _ = f in fskWith spec' False bits
-      where spec' = case cmd of { TxBits s _ -> s; _ -> error "withQueuedBits" }
-    fskWith spec allowData bits = fskFrom (st { txBits = txBits st ++ bits }) spec allowData
-    fsk spec allowData = fskFrom st spec allowData
-    fskFrom st0 spec allowData =
-      let st = st0 in
-      let spb = fs / fskBaud spec
-          step (!ph, !pos, !cur, bits, queue) =
-            let (pos', cur', bits', queue')
-                  | pos >= spb = nextBit (pos - spb) bits queue
-                  | otherwise = (pos, cur, bits, queue)
-                nextBit p bs q = case bs of
-                  (b : rest) -> (p, b, rest, q)
-                  [] | allowData, (byte : q') <- q, (b : rest) <- frameBits fr [byte] -> (p, b, rest, q')
-                     | otherwise -> (p, True, [], q)
-                f = if cur' then fskMark spec else fskSpace spec
-                v = amp * sin ph
-            in Just (v, (wrap (ph + twoPi * f / fs), pos' + 1, cur', bits', queue'))
-          (raw, (ph1, pos1, cur1, bits1, queue1)) = unfoldExactN n step (txPhase st, txBitPos st, txCurBit st, txBits st, txQueue st)
-          (hrev, hist) = case txFir st of
-            Just (name, h, hs) | name == fskName spec -> (h, hs)
-            _ -> let h = VS.reverse (txFilterKernel fs spec) in (h, VS.replicate (VS.length h - 1) 0)
-          (out, hist') = firStream hrev hist raw
-      in (st { txPhase = ph1, txBitPos = pos1, txCurBit = cur1, txBits = bits1, txQueue = queue1
-             , txFir = Just (fskName spec, hrev, hist') }, out)
-
--- | Like 'VS.unfoldrN' but also returns the final state.
-unfoldExactN :: Int -> (s -> Maybe (Double, s)) -> s -> (Signal, s)
-unfoldExactN n f s0 = go 0 s0 []
-  where
-    go !i s acc
-      | i >= n = (VS.fromListN n (reverse acc), s)
-      | otherwise = case f s of
-          Just (v, s') -> go (i + 1) s' (v : acc)
-          Nothing -> (VS.fromListN n (reverse acc), s)
 
 data Mode
   = Handshaking
@@ -298,25 +209,72 @@ modemInit cfg
       base { msMode = Starting32 (v32StartInit fs ((hcRole hs)) (v32Offer cfg)) V32Committed }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
-      in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
+      in base { msMode = dataModeFor cfg s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
               , msMnp = mnpFor cfg link }
   | otherwise = base
   where
     hs = mcHandshake cfg
     fs = mcRate cfg
-    listenCh = case hcRole hs of { Originate -> HighChannel; Answer -> LowChannel }
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
-             (Just (listenCh, v22RxInit fs)) (hcRole hs) Nothing (ansamInit fs) R1200
+             (Just (listenChannel (hcRole hs), v22RxInit fs)) (hcRole hs) Nothing (ansamInit fs) R1200
              echo0 listen0 0 0 0 0 0 HsBusy [] Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
     echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
     listen0 = if any isV32 (hcModes hs)
                 then Just (v32ListenInit fs ((hcRole hs))) else Nothing
-    dataMode s link = case link of
-      FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
-      V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
-      V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
+
+-- | What the transmitter needs to know about the line, out of the
+-- whole configuration.
+txLineOf :: ModemConfig -> TxLine
+txLineOf cfg = TxLine (mcRate cfg) (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg)
+
+-- | The V.22 channel this end listens on: the other one.
+listenChannel :: Role -> V22Channel
+listenChannel Originate = HighChannel
+listenChannel Answer = LowChannel
+
+-- | The data mode a link runs in, with its receiver and framer fresh.
+-- Written out twice before -- once for @--no-handshake@, once for a
+-- handshake that connected -- and a third site that looked the same
+-- was not: a V.32 retrain resumes the pump and framer it held.
+dataModeFor :: ModemConfig -> Standard -> Link -> Mode
+dataModeFor cfg s link = case link of
+  FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
+  V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
+  V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
+  where fs = mcRate cfg
+
+-- | Whether the start-stop framer may run yet, and what the line hands
+-- the protocol layer this block.
+--
+-- The framer arms on a run of 64 descrambled ones from a receiver that
+-- is both trusted -- its decision error inside the rate's gate -- and
+-- acquired, which is a stricter bar: converged, not merely usable.  The
+-- two data pumps measure those in their own units, so they arrive here
+-- decided.  Once armed it stays armed; and until it is armed nothing
+-- reaches the framer at all, since a start-stop framer given a
+-- descrambler's warm-up will find a start bit in it.
+--
+-- Once the protocol layer has switched to bit-oriented framing the
+-- start-stop framer is out of the way entirely: HDLC finds its own
+-- frames from the flags, so there is nothing to arm and no character
+-- boundary to keep.
+--
+-- This was written out twice, once per pump, and the two had already
+-- begun to differ in their comments.
+armFramer :: Maybe MnpState -> Bool -> Bool -> Bool -> Int -> [Bool] -> AsyncRx
+          -> (AsyncRx, MnpLineIn, Bool)
+armFramer mnp armed trust acquired onesRun bits framer
+  | sync = (framer, LineBits (if trust then bits else []), armed')
+  | otherwise =
+      let (f', bs) = if armed && trust then asyncRxBits framer bits else (framer, [])
+      in (f', LineOctets bs, armed')
+  where
+    armed' = armed || (onesRun >= 64 && trust && acquired)
+    sync = case mnp of
+      Just m -> mnpFraming m == FramingBit
+      Nothing -> False
 
 -- | Which rates we will accept.  If the far end is V.32 only, its rate
 -- signal says so (Table 5\/V.32 bis Note 1) and the exchange settles on
@@ -362,26 +320,6 @@ mnpConfFor cfg link = case mcMnp cfg of
   Nothing -> defaultMnpConfig (linkBitRate link) False
   Just tmpl -> tmpl { mnBitRate = linkBitRate link
                     , mnSyncable = mnSyncable tmpl && linkSyncable link }
-
--- | Octets still waiting to go on the line, across both transmitters.
-txPending :: TxState -> Int
-txPending st =
-  txOctetsPending st + (length (txSync st) + 7) `div` 8
-
--- | Bytes still waiting to be framed as start-stop characters.  The
--- framing switch waits on this: the acknowledgement that closes
--- establishment is octet framed, and a synchronous transmitter does not
--- drain the byte queue, so switching while it is still going out would
--- strand it on the way to a far end waiting for exactly that frame.
---
--- The bits of the character already being shifted out are deliberately
--- not counted.  The synchronous mode appends its frame bits behind them,
--- so the ordering holds either way -- and in that mode those bits /are/
--- the frames, so counting them would hold the switch off for ever and
--- leave the line filling between frames with mark instead of flags.
-txOctetsPending :: TxState -> Int
-txOctetsPending st = length (txQueue st) + v22TxQueued (txV22 st)
-
 
 dataCmd :: Link -> TxCmd
 dataCmd (FskLink tx _) = TxData tx
@@ -492,14 +430,14 @@ modemConnected st = case msMode st of
 modemStep :: ModemConfig -> ModemState -> Signal -> [Word8] -> (ModemState, Signal, [Word8], [ModemEvent])
 modemStep cfg st0 rxBlock newBytes =
   let st = case mcMnp cfg of
-        Nothing -> st0 { msTx = (msTx st0) { txQueue = txQueue (msTx st0) ++ newBytes } }
+        Nothing -> st0 { msTx = txQueueOctets newBytes (msTx st0) }
         -- with error correction the terminal's bytes belong to the
         -- protocol layer, which decides when they go on the line
         Just _ -> st0 { msDte = msDte st0 ++ newBytes }
       fs = mcRate cfg
       n = VS.length rxBlock
       hs = mcHandshake cfg
-      transmit cmd s = txBlock fs (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n (msTx s)
+      transmit cmd s = txBlock (txLineOf cfg) cmd n (msTx s)
   in case msMode st of
     Finished ->
       (st, VS.replicate n 0, [], [])
@@ -554,10 +492,7 @@ modemStep cfg st0 rxBlock newBytes =
           st1 = st { msBank = bank', msHs = hsState', msTxCmd = cmd, msV22Rx = v22'', msRole = role', msV8 = v8'', msAnsam = ansam', msRxRate = rxRate, msZeros = zeros', msListen = listen' }
       in case status of
            HsConnected s link ->
-             let mode = case link of
-                   FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
-                   V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
-                   V32Link role r -> DataV32 role r (v32DataInit fs r) (asyncRxInit (mcFraming cfg)) False
+             let mode = dataModeFor cfg s link
                  st2 = st1 { msMode = mode, msTxCmd = dataCmd link, msStatus = status, msSettled = 0
                            , msMnp = mnpFor cfg link }
                  (txSt, audio) = transmit (markCmd link) st2
@@ -629,8 +564,7 @@ modemStep cfg st0 rxBlock newBytes =
            -- stale; handing that to the probe that follows would have it
            -- deciding about a tone that stopped before the offer began.
            V32Failed _ | entry == V32Offered ->
-             let listenCh = case hcRole hs of
-                   { Originate -> HighChannel; Answer -> LowChannel }
+             let listenCh = listenChannel (hcRole hs)
              in ( st1 { msMode = Handshaking
                       , msHs = handshakeAfterV32 hs (msHs st1)
                       , msV22Rx = Just (listenCh, v22RxInit fs)
@@ -679,16 +613,6 @@ modemStep cfg st0 rxBlock newBytes =
           -- symbol intervals of scrambled ones, which is 512 bits at
           -- 9600, so there is room for it.
           --
-          -- 64 is enough for the descrambler and not for the handover.
-          -- The receiver arrives in data mode with the equaliser the
-          -- start-up trained on four points, a decision error around
-          -- 0.28, and about 160 ms of converging to do on the thirty-two
-          -- points it now has to read.  A fixed ceiling lets it through
-          -- at 0.065 -- comfortably inside 'mcMaxEvmV32', and thirteen
-          -- times the 0.005 it settles at -- so the framer armed on a
-          -- receiver that was still acquiring and handed the terminal a
-          -- page of noise before the first real byte.
-          --
           -- So arming asks for a converged receiver and not merely a
           -- usable one, which is the ordinary split between acquiring a
           -- signal and tracking it: hard to catch, easy to keep.  The
@@ -696,15 +620,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- passing bits with errors in them still beats passing none.
           acquired = decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate / 4 || msSettled st > 0.5
           onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
-          armed' = armed || (onesRun' >= 64 && trust && acquired)
-          sync = case msMnp st of
-            Just m -> mnpFraming m == FramingBit
-            Nothing -> False
-          (framer', line)
-            | sync = (framer, LineBits (if trust then gotBits else []))
-            | otherwise =
-                let (f', bs) = if armed && trust then asyncRxBits framer gotBits else (framer, [])
-                in (f', LineOctets bs)
+          (framer', line, armed') = armFramer (msMnp st) armed trust acquired onesRun' gotBits framer
           listen' = fmap (v32ListenBlock rxBlock) (msListen st)
           present = v32DataPower pump' > mcMinPowerV32 cfg
           -- How long the receiver has been unable to read a line that is
@@ -824,19 +740,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- beats passing none.
           acquired = rxEvmEstimate rxSt' < acqLimit || msSettled st > 0.5
           acqLimit = (decisionMargin rate / 4) ^ (2 :: Int)
-          armed' = armed || (roOnesRun o >= 64 && trust && acquired)
-          -- Once the protocol layer has switched to bit-oriented framing
-          -- the start-stop framer is out of the way entirely: HDLC finds
-          -- its own frames from the flags, so there is nothing to arm and
-          -- no character boundary to keep.
-          sync = case msMnp st of
-            Just m -> mnpFraming m == FramingBit
-            Nothing -> False
-          (framer', line)
-            | sync = (framer, LineBits (if trust then roBits o else []))
-            | otherwise =
-                let (f', bs) = if armed && trust then asyncRxBits framer (roBits o) else (framer, [])
-                in (f', LineOctets bs)
+          (framer', line, armed') = armFramer (msMnp st) armed trust acquired (roOnesRun o) (roBits o) framer
           st1 = st { msV22Rx = Just (rx, rxSt'), msRxRate = rate }
       in finishData st1 (DataV22 tx rx rate framer' armed') (V22Link tx rx rate) (roEnergy o > 1e-5) line
   where
@@ -846,7 +750,7 @@ modemStep cfg st0 rxBlock newBytes =
     -- bits itself, on a carrier shared with the far end.
     finishData = finishDataWith cmdAudio
     cmdAudio n tx1 cmd mode =
-      let (txSt, audio) = txBlock (mcRate cfg) (mcTxAmp cfg) (mcFraming cfg) (mcGuardTone cfg) cmd n tx1
+      let (txSt, audio) = txBlock (txLineOf cfg) cmd n tx1
       in (txSt, audio, mode)
     finishDataWith mkAudio st mode link present line =
       let fs = mcRate cfg
@@ -875,8 +779,8 @@ modemStep cfg st0 rxBlock newBytes =
             -- back in octet framing after a switch was undone: whatever
             -- synchronous bits were still queued are frames the far end
             -- was never going to read, so they go
-            OutOctets bs -> tx0 { txQueue = txQueue tx0 ++ bs, txSync = [] }
-            OutBits bs -> tx0 { txSync = txSync tx0 ++ bs }
+            OutOctets bs -> txQueueOctets bs (txClearSync tx0)
+            OutBits bs -> txQueueBits bs tx0
 
           -- The command has to match what the protocol layer just encoded,
           -- not the framing it will use next: the frame closing
@@ -922,12 +826,12 @@ modemStep cfg st0 rxBlock newBytes =
           -- the pump idles on, so the far end's framer has something to
           -- arm on before the first character arrives
           bits | cmd' == TxV32Idle = []
-               | otherwise = concatMap (\b -> frameBits (mcFraming cfg) [b]) (txQueue tx1) ++ txSync tx1
+               | otherwise = txLineBits (mcFraming cfg) tx1
           (pump', audio) = v32DataTx (mcRate cfg) (role) rate (mcTxAmp cfg) n' bits pump0
           mode' = case mode of
             DataV32 r rt _ fr ar -> DataV32 r rt pump' fr ar
             other -> other
-      in (if cmd' == TxV32Idle then tx1 else tx1 { txQueue = [], txSync = [] }, audio, mode')
+      in (if cmd' == TxV32Idle then tx1 else txDrop tx1, audio, mode')
 
     -- Take our own signal back out of what arrived, and remember what we
     -- sent so the next block can be cleaned too.  Only V.32 needs this;

@@ -27,6 +27,7 @@ library
                       Modec.Handshake.Cues
                       Modec.Handshake.Modes
                       Modec.Modem
+                      Modec.Modem.Tx
                       Modec.Replay
                       Modec.Fixture
                       Modec.Loopback
