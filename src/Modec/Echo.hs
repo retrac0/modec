@@ -301,14 +301,42 @@ echoSearch cfg st
     lags = [ l | l <- [lo .. ecSearch cfg]
                , let o = startOf l, o >= 0, o + w <= refLen ]
     scores = [ (score l, l) | l <- lags ]
+    -- Two accumulator passes over the window, rather than five passes and
+    -- three thousand-element vectors.  The vector form was the whole cost
+    -- of the search: two 'VS.map's and a 'VS.zipWith' is 24 kB written and
+    -- read back per lag, four thousand lags to a call, which stays in no
+    -- cache and kept the collector busy -- one V.32 call allocated 65 GB
+    -- and spent all of its time in here.
+    --
+    -- The answer is the same 'Double', bit for bit, and that is not
+    -- tolerance: 'VS.sum' is @foldl' (+) 0@ over the stream, so an
+    -- accumulator taking the same elements in the same order from the same
+    -- zero is the same sum.  @m@ is therefore identical, so every @c@ is,
+    -- so @nsq@ and @dt@ are.  What would give that up is folding the first
+    -- pass into the second -- prefix sums of the reference and its square,
+    -- so the mean and the norm come out in O(1) -- because that reaches
+    -- them as @sum e^2 - w*m^2@, which is a different sum of different
+    -- numbers.  Worth knowing, and not worth taking: the lag this returns
+    -- aims the filter, and a filter aimed one sample over trains
+    -- differently and hands the data pump a different call.
     score l =
       let o = startOf l
           e = VS.slice o w ref
-          m = VS.sum e / fromIntegral w
-          c = VS.map (subtract m) e
-          nrm = sqrt (VS.sum (VS.map (\v -> v * v) c))
+          sumE !i !acc
+            | i >= w = acc
+            | otherwise = sumE (i + 1) (acc + VS.unsafeIndex e i)
+          m = sumE 0 0 / fromIntegral w
+          -- the squared norm of the centred window, and its correlation
+          -- with the centred receive window, in one pass
+          go !i !nsq !dt
+            | i >= w = (nsq, dt)
+            | otherwise =
+                let c = VS.unsafeIndex e i - m
+                in go (i + 1) (nsq + c * c) (dt + VS.unsafeIndex rxC i * c)
+          (nsq', dt') = go 0 0 0
+          nrm = sqrt nsq'
       in if nrm <= 0 || rxNorm <= 0 then 0
-         else abs (VS.sum (VS.zipWith (*) rxC c)) / (nrm * rxNorm)
+         else abs dt' / (nrm * rxNorm)
     best = maximum (map fst scores)
     bestLag = snd (head [ p | p <- scores, fst p == best ])
     avg = sum (map fst scores) / fromIntegral (length scores)

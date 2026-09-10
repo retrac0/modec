@@ -23,6 +23,7 @@ library
                       Modec.Handshake
                       Modec.Modem
                       Modec.Replay
+                      Modec.Loopback
                       Modec.Telnet
                       Modec.Async
                       Modec.Baudot
