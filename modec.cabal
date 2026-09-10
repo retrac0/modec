@@ -13,6 +13,7 @@ library
     import:           warnings
     exposed-modules:  Modec.DSP
                       Modec.Stream
+                      Modec.Sample
                       Modec.Wav
                       Modec.G711
                       Modec.FSK
@@ -105,6 +106,7 @@ test-suite modec-test
                       Suite.Fsk
                       Suite.Link
                       Suite.Mnp
+                      Suite.Sample
                       Suite.Session
                       Suite.Tones
                       Suite.Tools

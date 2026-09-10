@@ -28,6 +28,7 @@ import Modec.FSK
 import Modec.Standards
 import Modec.Baudot
 import Modec.Stream
+import Modec.Sample
 import Modec.Wav
 
 -- | Which band the offline @decode@/@encode@ tools work in.  This is not
@@ -43,7 +44,7 @@ data Tones = TBell103 | TV21 | TV23 | TTty45 | TTty50 deriving (Eq, Show)
 
 data Cmd
   = Decode Tones Band Double FilePath
-  | Encode Tones Band Int Double FilePath
+  | Encode Tones Band Int Double SampleFormat FilePath
   | Probe FilePath
   | Detect FilePath
   | V32Trace Bool FilePath   -- ^ True = we were the answering modem
@@ -109,6 +110,8 @@ cmdP = hsubparser
     encodeP = Encode <$> stdP <*> channelP
       <*> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "amplitude")
+      <*> option (maybeReader formatNamed) (long "format" <> value S16 <> metavar "FMT"
+             <> help ("sample format, default s16: " ++ unwords formatNames))
       <*> strOption (short 'o' <> long "output" <> metavar "FILE.wav")
     probeP = Probe <$> argument str (metavar "FILE.wav")
     detectP = Detect <$> argument str (metavar "FILE.wav")
@@ -330,14 +333,14 @@ main = do
                                   [x, flushSilence fs spec]
           B.hPut stdout (B.pack (snd (baudotDecode baudotRxInit codes)))
         else B.hPut stdout (B.pack (demodulate fs spec framing8N1 defaultDemodParams { dpSquelch = squelch } x))
-    Encode std ch rate amp out -> do
+    Encode std ch rate amp fmt out -> do
       hSetBinaryMode stdin True
       bytes <- B.getContents
       let spec = specFor std (if ch == BandAuto then BandLow else ch)
           fs = fromIntegral rate
           codes = snd (baudotEncode baudotTxInit (B.unpack bytes))
           burst = (Off, 0.2) : keyedBurst tddFraming (fskBaud spec) defaultBurst codes ++ [(Off, 0.3)]
-      writeWav16Mono out rate $ if isTty std
+      writeWavMono fmt out rate $ if isTty std
         then txFilter fs spec (VS.map (* amp) (modulateKeyed fs spec burst))
         else encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes)
     ListDevices -> do
@@ -392,7 +395,7 @@ main = do
                   , ("v23 back mark", 390), ("v23 back space", 450), ("v23 fwd mark", 1300)
                   , ("tty mark", 1400), ("tty space", 1800)
                   , ("v25 answer tone", 2100), ("v22 low carrier", 1200), ("v22 high carrier", 2400) ]
-      printf "%s: %d Hz, %d channels, %.2f s, rms %.4f\n" path (wavRate w) (wavChannels w)
+      printf "%s: %d Hz, %d channels, %s, %.2f s, rms %.4f\n" path (wavRate w) (wavChannels w) (describeFormat (wavFormat w))
         (fromIntegral n / fs :: Double) (rms x)
       forM_ tones $ \(name, f) -> do
         let e = toneEnergy fs f len x

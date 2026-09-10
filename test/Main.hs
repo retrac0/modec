@@ -13,6 +13,7 @@ import Suite.Dsp
 import Suite.Fsk
 import Suite.Link
 import Suite.Mnp
+import Suite.Sample
 import Suite.Session
 import Suite.Tones
 import Suite.Tools
@@ -26,7 +27,7 @@ main = do
   specs <- specTests
   defaultMain $ testGroup "modec"
     [ testGroup "primitives"
-        [wavTests, dspTests, scramblerTests, stageTests, toneFrameTests]
+        [wavTests, sampleTests, dspTests, scramblerTests, stageTests, toneFrameTests]
     -- What the simulator every other measurement here leans on actually
     -- does, as against what it says it does.
     , channelSimTests
