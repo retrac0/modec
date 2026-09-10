@@ -21,7 +21,7 @@ simulateCall :: HsConfig -> HsConfig -> Double -> Double -> (Side, Side)
 simulateCall cfgO cfgA snr maxT = go 0 (side cfgO) (side cfgA)
   where
     fs = 8000
-    blk = 160 :: Int
+    blk = blockOf fs
     side cfg = Side 0 (toneBank fs (hcBank cfg)) (initialHandshake cfg) [] HsBusy TxSilence
     go t o a
       | t >= maxT = (o, a)
@@ -74,7 +74,7 @@ callerAgainstU11 :: [Standard] -> Double -> [(Double, TxCmd)]
 callerAgainstU11 modes maxT = go 0 (toneBank fs (hcBank cfg)) (initialHandshake cfg) TxSilence []
   where
     fs = 8000
-    blk = 160 :: Int
+    blk = blockOf fs
     cfg = (withModes modes (defaultHsConfig Originate))
     -- 2100 Hz answer tone for three seconds, then the answerer's
     -- unscrambled binary 1 on the high channel, for ever
@@ -133,7 +133,7 @@ modemDuplexFor stop cfgO cfgA snr textO textA maxT cutAt =
   go 0 (modemInit cfgO) (modemInit cfgA) (VS.replicate blk 0) (VS.replicate blk 0) False False Nothing [] [] [] []
   where
     fs = mcRate cfgO
-    blk = 160 :: Int
+    blk = blockOf fs
     impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
     go t so sa fromA fromO sentO sentA fullAt rxO rxA evO evA
       | t >= maxT = out
@@ -173,7 +173,7 @@ modemDuplexDisturb cfgO cfgA snr first second atCaller from until_ =
      False False False False [] [] [] []
   where
     fs = mcRate cfgO
-    blk = 160 :: Int
+    blk = blockOf fs
     maxT = 90
     impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
     wreck t x
@@ -224,7 +224,7 @@ modemDuplexEcho taps cfgO cfgA snr textO textA maxT =
      (replicate hist quiet) (replicate hist quiet) False False Nothing [] [] [] [] 0 0
   where
     fs = mcRate cfgO
-    blk = 160 :: Int
+    blk = blockOf fs
     quiet = VS.replicate blk 0
     -- enough transmit history behind us to cover the longest tap
     hist = 4 :: Int
@@ -276,7 +276,7 @@ modemDuplexStream cfgO cfgA snr perBlock textO textA maxT =
      textO textA [] [] [] []
   where
     fs = mcRate cfgO
-    blk = 160 :: Int
+    blk = blockOf fs
     impair k t x = addNoise (k * 100003 + round (t * 1000)) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.1) x)
     go t so sa fromA fromO bufO bufA rxO rxA evO evA
       | t >= maxT = (reverse rxO, reverse rxA, reverse evO, reverse evA)

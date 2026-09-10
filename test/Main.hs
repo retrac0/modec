@@ -41,7 +41,7 @@ main = do
     -- here whose far end was a real modem on a real line.
     , live
     , testGroup "phase and quadrature"
-        [v22Tests, v32Tests, v32PumpTests, v32FloorTests, v32SignalTests, v32ListenTests, v32StartTests, echoTests]
+        [v22Tests, v32Tests, v32PumpTests, v32FloorTests, v32SignalTests, v32ListenTests, v32StartTests, echoTests, rateTests]
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"

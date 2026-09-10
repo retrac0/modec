@@ -594,7 +594,7 @@ v22Modulate fs ch = v22ModulateAt fs ch R1200
 v22ModulateAt :: Double -> V22Channel -> Rate -> Double -> [Bool] -> Signal
 v22ModulateAt fs ch rate amp bits = VS.concat (go v22TxInit bits)
   where
-    n = 160
+    n = blockOf fs
     go st bs
       | null bs && null (txBits st) = flushTail st
       | otherwise =
@@ -613,6 +613,6 @@ v22DemodulateAt fs ch rate = v22DemodulateWith fs (v22RxSetRate rate (v22RxInit 
 v22DemodulateWith :: Double -> V22RxState -> V22Channel -> Signal -> [Bool]
 v22DemodulateWith fs st0 ch x = concatMap roBits (v22RxRun fs st0 ch x)
 
--- | Offline: all receiver outputs per 160-sample block.
+-- | Offline: all receiver outputs per 20 ms block.
 v22RxRun :: Double -> V22RxState -> V22Channel -> Signal -> [RxOut]
-v22RxRun fs st0 ch x = runStage (v22ReceiverFrom fs ch st0) (chunksOf 160 x)
+v22RxRun fs st0 ch x = runStage (v22ReceiverFrom fs ch st0) (chunksOf (blockOf fs) x)

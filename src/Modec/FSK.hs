@@ -114,6 +114,13 @@ bitWindow :: Double -> FskSpec -> Int
 bitWindow fs spec = max 1 (round (fs / fskBaud spec))
 
 -- | Length of the receive prefilter (and of the transmit filter).
+-- The prefilter is 80 ms long whatever the rate, so its taps grow with
+-- the rate and so does the number of samples pushed through them: the
+-- front end costs O(fs^2), and 48 kHz is thirty-five times the work of
+-- 8 kHz.  That is deliberate -- the shape is what the discriminator
+-- needs -- and the answer for a recording at a sound-card rate is to
+-- bring it to 8 kHz first ('Modec.DSP.resampleTo', @--rate 8000@),
+-- not a shorter filter.
 filterTaps :: Double -> Int
 filterTaps fs = 2 * round (fs / 25) + 1
 

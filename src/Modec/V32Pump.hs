@@ -53,7 +53,7 @@ module Modec.V32Pump
   ) where
 
 import Modec.Link
-import Modec.DSP (Signal, chunksOf)
+import Modec.DSP (Signal, blockOf, chunksOf)
 import Modec.Standards (Role (..))
 import Modec.QAM
 import Modec.Stream (concatStage)
@@ -443,10 +443,10 @@ v32ModulateTrained fs dir r amp trn bits = (modulatePoints fs amp (pre ++ pts), 
     pre = conditioningSymbols dir trn
     (_, pts) = encodeSymbols dir r bits txCoderInit
 
--- | Points on the line at 8 kHz and the usual level, for tests and
--- for generating the start-up signals offline.
-modulatePointsFor :: [Point] -> Signal
-modulatePointsFor = modulatePoints 8000 0.5
+-- | Points on the line at the usual level, for tests and for
+-- generating the start-up signals offline.
+modulatePointsFor :: Double -> [Point] -> Signal
+modulatePointsFor fs = modulatePoints fs 0.5
 
 modulatePoints :: Double -> Double -> [Point] -> Signal
 modulatePoints fs amp pts0 = go qamTxInit pts0 []
@@ -454,7 +454,7 @@ modulatePoints fs amp pts0 = go qamTxInit pts0 []
     p = v32Params fs
     go _ [] acc = VS.concat (reverse acc)
     go st syms acc =
-      let (st', sig, rest) = qamTxBlock p amp 160 syms st
+      let (st', sig, rest) = qamTxBlock p amp (blockOf fs) syms st
       in if length rest == length syms
            then VS.concat (reverse (sig : acc))
            else go st' rest (sig : acc)
@@ -465,7 +465,7 @@ v32Modulate fs dir r amp bits = modulatePoints fs amp (snd (encodeSymbols dir r 
 
 -- | Demodulate a whole signal back to data bits.
 v32Demodulate :: Double -> Role -> V32Rate -> Signal -> [Bool]
-v32Demodulate fs dir r = v32DemodulateWith fs dir r 160
+v32Demodulate fs dir r = v32DemodulateWith fs dir r (blockOf fs)
 
 v32DemodulateWith :: Double -> Role -> V32Rate -> Int -> Signal -> [Bool]
 v32DemodulateWith fs dir r blk sig = snd (decodeSymbols dir r syms rxCoderInit)
@@ -566,7 +566,7 @@ tailSyms = 32
 -- hand to a second pass under a different slicer, which is the one thing
 -- a 'Stage' cannot give back, so this stays a plain fold.
 runBlocks :: QamParams -> QamRxCfg -> Signal -> QamRxState -> ([QamSym], QamRxState)
-runBlocks p cfg sig st0 = go st0 (chunksOf 160 sig)
+runBlocks p cfg sig st0 = go st0 (chunksOf (blockOf (qpFs p)) sig)
   where
     go st [] = ([], st)
     go st (c : cs) =

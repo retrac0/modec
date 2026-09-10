@@ -1,6 +1,6 @@
 -- | V.32 and V.32bis: the coding layer, the data pump, the start-up of
 -- Figure 4, and the echo canceller that makes it possible.
-module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests) where
+module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests, rateTests) where
 
 import Control.Monad (forM_, replicateM)
 import Data.List (nub)
@@ -10,6 +10,7 @@ import Test.Tasty.HUnit
 import Modec.Standards
 import Modec.Link
 import Modec.Channel
+import Modec.Loopback
 import Modec.DSP
 import Modec.Modem
 import Modec.V32
@@ -465,7 +466,7 @@ echoTests = testGroup "echo cancellation"
       -- 0.83 ms and would find a delay anywhere.  Only TRN decorrelates,
       -- and a test driven by anything tidier would pass while the real
       -- thing failed.
-      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
+      let tx = modulatePointsFor 8000 (conditioningSymbols Originate 1400)
           lag = 928 :: Int          -- 116 ms, as measured on the line
           rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
           (_, st) = runEcho defaultEchoConfig 160 tx rx
@@ -478,7 +479,7 @@ echoTests = testGroup "echo cancellation"
   , testCase "and taken out once the filter is aimed where it was found" $ do
       -- The whole point of the search: the same path the bulk delay
       -- could not reach, cancelled.
-      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
+      let tx = modulatePointsFor 8000 (conditioningSymbols Originate 1400)
           lag = 928 :: Int
           rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
           (_, found) = runEcho defaultEchoConfig 160 tx rx
@@ -490,7 +491,7 @@ echoTests = testGroup "echo cancellation"
           assertBool ("return loss " ++ show (echoErle st) ++ " dB, aimed at " ++ show l)
             (echoErle st > 20)
   , testCase "a leg with no echo on it offers no delay to find" $ do
-      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
+      let tx = modulatePointsFor 8000 (conditioningSymbols Originate 1400)
           rx = VS.replicate (VS.length tx) 0
           (_, st) = runEcho defaultEchoConfig 160 tx rx
       assertEqual "nothing to find" Nothing (fmap fst (echoSearch defaultEchoConfig st))
@@ -676,10 +677,10 @@ v32SignalTests = testGroup "V.32 start-up signals"
 -- A run of one state, then a run of another, through the real pump.
 modulateStates2 :: Int -> [TrainState] -> Int -> [TrainState] -> Signal
 modulateStates2 n1 a n2 b =
-  modulatePointsFor (take n1 (cycle (map statePoint a)) ++ take n2 (cycle (map statePoint b)))
+  modulatePointsFor 8000 (take n1 (cycle (map statePoint a)) ++ take n2 (cycle (map statePoint b)))
 
 modulateStates :: Int -> [TrainState] -> Signal
-modulateStates n a = modulatePointsFor (take n (cycle (map statePoint a)))
+modulateStates n a = modulatePointsFor 8000 (take n (cycle (map statePoint a)))
 
 -- Two V.32 modems talking to each other through a noisy, attenuated
 -- line, one block of transport delay in each direction -- the same
@@ -848,3 +849,25 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
           assertBool ("MT " ++ show b ++ " samples") (b > 100 && b < 1200)
         _ -> assertFailure ("round trip not measured: " ++ show (nt, mt))
   ]
+
+-- | The phase and quadrature modes at rates other than 8 kHz.
+--
+-- Everything below the audio boundary takes its sample rate as an
+-- argument and derives what it needs -- filter lengths, samples per
+-- symbol, the block -- so no rate should be special.  Bell 103 has
+-- been checked at 48 kHz and 11025 Hz since early on; these modes had
+-- never been run anywhere but 8 kHz, which is the only rate every
+-- recording, fixture and live call is at.  A whole call each, through
+-- "Modec.Loopback", at two rates that divide the baud rate in neither
+-- case.
+rateTests :: TestTree
+rateTests = testGroup "other sample rates"
+  [ testCase (show mode ++ " at " ++ show (round fs :: Int) ++ " Hz") $
+      assertBool "the call goes through and the text arrives whole"
+        (loopOk (defaultLoop fs [mode]) textO textA)
+  | mode <- [V22bis, V32]
+  , fs <- [9600, 16000]
+  ]
+  where
+    textO = map (fromIntegral . fromEnum) "calling at another rate\r\n"
+    textA = map (fromIntegral . fromEnum) "answering at another rate\r\n"

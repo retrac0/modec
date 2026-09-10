@@ -31,6 +31,7 @@
 module Modec.Echo
   ( EchoConfig (..)
   , defaultEchoConfig
+  , echoConfigAt
   , EchoState
   , echoInit
   , echoPush
@@ -58,19 +59,28 @@ data EchoConfig = EchoConfig
   , ecOnRatio :: !Double -- ^ predicted echo over received power worth subtracting
   } deriving (Eq, Show)
 
--- | 256 taps is 32 ms at 8 kHz -- far wider than the few milliseconds a
--- hybrid smears its return over, because the bulk delay is not known
--- nearly as well as it looks.  See 'echoSetFar'.
--- The search reaches 500 ms because a real one does.  Dialling the
--- voip.ms echo test, which returns everything it is sent, put our own
--- signal back at 116 ms: a filter spanning 20 to 52 ms -- which is what
--- ecDelay and ecTaps came to on their own -- never had a chance at it.
--- 4000 samples of reference history is 32 kB, which is not worth being
--- clever about.
+-- | The configuration for a sample rate.  32 ms of taps is far wider
+-- than the few milliseconds a hybrid smears its return over, because
+-- the bulk delay is not known nearly as well as it looks; see
+-- 'echoSetFar'.  The search reaches 500 ms because a real one does.
+-- Dialling the voip.ms echo test, which returns everything it is sent,
+-- put our own signal back at 116 ms: a filter spanning 20 to 52 ms --
+-- which is what ecDelay and ecTaps came to on their own -- never had a
+-- chance at it.  Half a second of reference history is 32 kB at 8 kHz,
+-- which is not worth being clever about.
+--
+-- These were 256, 160, 4000 and 64 samples, which are those times at
+-- 8 kHz and nothing in particular at any other rate.
+echoConfigAt :: Double -> EchoConfig
+echoConfigAt fs = EchoConfig
+  { ecTaps = ms 32, ecDelay = ms 20, ecMu = 0.3, ecLeak = 1e-7
+  , ecSearch = ms 500, ecPre = ms 8, ecPeak = 4, ecOnRatio = 0.01 }
+  where
+    ms t = round (t * fs / 1000)
+
+-- | 'echoConfigAt' 8 kHz, for the tests and the offline tools that run there.
 defaultEchoConfig :: EchoConfig
-defaultEchoConfig = EchoConfig
-  { ecTaps = 256, ecDelay = 160, ecMu = 0.3, ecLeak = 1e-7
-  , ecSearch = 4000, ecPre = 64, ecPeak = 4, ecOnRatio = 0.01 }
+defaultEchoConfig = echoConfigAt 8000
 
 data EchoState = EchoState
   { esRef    :: !Signal   -- ^ what we have transmitted, oldest first

@@ -8,6 +8,7 @@
 module Modec.DSP
   ( Signal
   , chunksOf
+  , blockOf
     -- * Windows and correlators
   , movingSum
   , rectWindow
@@ -62,6 +63,11 @@ type Signal = VS.Vector Double
 -- streaming receiver is defined by its behaviour not depending on where
 -- these fall, so the offline helpers that drive one over a whole
 -- recording all have to cut it up somewhere; they cut it up here.
+-- | The block the offline tools and the tests run in: 20 ms, which is
+-- 160 samples at 8 kHz and had been written as 160 in six places.
+blockOf :: Double -> Int
+blockOf fs = max 1 (round (0.02 * fs))
+
 chunksOf :: Int -> Signal -> [Signal]
 chunksOf n x
   | n <= 0 = [x]

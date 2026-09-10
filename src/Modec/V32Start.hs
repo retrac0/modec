@@ -60,7 +60,7 @@ import qualified Data.Vector.Storable as VS
 
 import Modec.Link
 import Modec.Standards (Role (..), answerToneItu)
-import Modec.DSP (Signal, chunksOf)
+import Modec.DSP (Signal, blockOf, chunksOf)
 import Modec.QAM
 import Modec.V32
 import Modec.V32Pump
@@ -969,8 +969,7 @@ chosen r = case r of
 v32Timeline :: Double -> Role -> Signal -> [(Double, String)]
 v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
   where
-    blk = 160
-    p = v32Params fs
+    blk = blockOf fs
     st0 = v32StartInit fs dir allRates
     go _ _ [] acc = reverse acc
     go st n (c : cs) acc =
