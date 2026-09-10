@@ -45,7 +45,6 @@ import Modec.DSP (Signal)
 import Modec.Modem
 import Modec.Progress
 import Modec.Standards (Role (..))
-import Modec.Wav (decodeS16, encodeS16)
 
 -- | What the line is doing.  In a Hayes session it moves between all
 -- three; in a plain call it is 'LineCall' from the first block.
@@ -65,10 +64,11 @@ data Line
 data Session = Session
   { seFs        :: !Double
   , seBlockN    :: !Int
-  , seRead      :: IO B.ByteString
-    -- ^ one block of raw s16le, recordings and all.  Short means the
-    -- stream stopped.
-  , seWrite     :: B.ByteString -> IO ()
+  , seRead      :: IO Signal
+    -- ^ one block of samples, recordings and all.  Short means the
+    -- stream stopped.  What the bytes on the device meant was the
+    -- audio backend's business; here there are only samples.
+  , seWrite     :: Signal -> IO ()
   , seRecv      :: IO B.ByteString           -- ^ bytes the DTE has for the line
   , seSend      :: B.ByteString -> IO ()     -- ^ bytes the line has for the DTE
   , seSay       :: String -> IO ()           -- ^ the call log
@@ -135,11 +135,11 @@ runLoop :: Session -> Controller -> IO ()
 runLoop se co = loop
   where
     blockN = seBlockN se
-    silence = encodeS16 (VS.replicate blockN 0)
+    silence = VS.replicate blockN 0
 
     loop = do
       raw <- seRead se
-      if B.length raw < 2 * blockN
+      if VS.length raw < blockN
         then do
           coCarrier co
           ok <- seLost se
@@ -150,16 +150,16 @@ runLoop se co = loop
           line <- readIORef (seLine se)
           case line of
             LineIdle -> do
-              coIdle co (decodeS16 raw)
+              coIdle co raw
               seWrite se silence
             LineDialing sig -> do
               -- The dial signal is played out a block at a time; the
               -- call starts on the block the last of it goes out.
               let (now, rest) = VS.splitAt blockN sig
-              seWrite se (encodeS16 (now VS.++ VS.replicate (blockN - VS.length now) 0))
+              seWrite se (now VS.++ VS.replicate (blockN - VS.length now) 0)
               writeIORef (seLine se)
                 (if VS.null rest then seStartCall se Originate else LineDialing rest)
-            LineCall st c watch -> call k turn st c watch (decodeS16 raw)
+            LineCall st c watch -> call k turn st c watch raw
           modifyIORef' (seBlock se) (+ 1)
           done <- coDone co
           unless done loop
@@ -171,7 +171,7 @@ runLoop se co = loop
       let dte = if tuOnline turn then B.unpack (greet <> tuDte turn) else []
           (st', audio, rxBytes, events) = modemStep c st rx dte
       seObserve se k st st'
-      seWrite se (encodeS16 audio)
+      seWrite se audio
       when (tuOnline turn && not (null rxBytes)) $ seSend se (B.pack rxBytes)
       watch' <- listen st' watch rx
       -- The watcher may have hung the call up between here and there.

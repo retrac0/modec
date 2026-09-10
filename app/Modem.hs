@@ -1,7 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 -- | The live modem: audio in and out through PipeWire (pw-cat) or raw
--- 16-bit little-endian mono pipes, bytes through a telnet socket or
--- stdio.  The main loop is paced by the audio input, one block at a
+-- mono pipes in any of "Modec.Sample"'s formats, bytes through a telnet
+-- socket or stdio.  The main loop is paced by the audio input, one block at a
 -- time; the pure modem in "Modec.Modem" does all the work.
 module Modem
   ( AudioIO (..)
@@ -35,7 +35,7 @@ import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 
 import CallLog
 import Modec.Link
-import Modec.DSP (rms)
+import Modec.DSP (Signal, rms)
 import Modec.Handshake
 import Modec.Baresip
 import Modec.Dtmf
@@ -50,8 +50,9 @@ import PipewireIO
 import Modec.V8 (describeMenu)
 import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
+import Modec.Sample
 import Modec.Session
-import Modec.Wav (closeWav, encodeS16, openWav16Mono, wavAppendRaw)
+import Modec.Wav (closeWav, openWav16Mono, wavAppend)
 
 data AudioIO
   = AudioPipewire (Maybe String) (Maybe String) Bool
@@ -59,16 +60,28 @@ data AudioIO
     -- substring of either; 'Nothing' means the PipeWire default), and
     -- whether to record the output's monitor instead of an input
   | AudioSipLoop String              -- ^ PipeWire loopback pair for a softphone; the prefix names the nodes
-  | AudioFiles FilePath FilePath     -- ^ raw s16le mono: input, output (files or FIFOs)
-  | AudioStdio                       -- ^ raw s16le mono on stdin/stdout
+  | AudioFiles FilePath FilePath     -- ^ raw mono in 'moFormat': input, output (files or FIFOs)
+  | AudioStdio                       -- ^ raw mono in 'moFormat' on stdin/stdout
 
 -- | The audio interface the main loop sees.  Reading is the clock: a
 -- short read means the capture stream stopped, and 'aiRestart' offers to
 -- put it back (only the PipeWire backends can).
+--
+-- Samples, not bytes: what the bytes on a device mean is settled here,
+-- once, by the format the backend was opened with, and the loop above
+-- never sees them.
 data AudioIf = AudioIf
-  { aiRead    :: Int -> IO B.ByteString
-  , aiWrite   :: B.ByteString -> IO ()
+  { aiRead    :: Int -> IO Signal        -- ^ this many samples
+  , aiWrite   :: Signal -> IO ()
   , aiRestart :: IO Bool
+  }
+
+-- | An interface over a byte reader and writer, in a format.
+sampleIf :: SampleFormat -> (Int -> IO B.ByteString) -> (B.ByteString -> IO ()) -> IO Bool -> AudioIf
+sampleIf fmt rd wr restart = AudioIf
+  { aiRead = \n -> decodeSamples fmt <$> rd (n * bytesPerSample fmt)
+  , aiWrite = wr . encodeSamples fmt
+  , aiRestart = restart
   }
 
 data DataIO
@@ -95,6 +108,7 @@ data ModemOpts = ModemOpts
   , moSip      :: Maybe String       -- ^ baresip ctrl_tcp address host:port
   , moSipDomain :: String
   , moAudio    :: AudioIO
+  , moFormat   :: Maybe SampleFormat  -- ^ what the audio device or pipe carries; 'Nothing' takes the backend's own default
   , moData     :: DataIO
   , moAmp      :: Double
   , moRecordRx :: Maybe FilePath   -- ^ write everything received to this WAV
@@ -115,12 +129,17 @@ defaultModemOpts = ModemOpts
   , moNoHandshake = False, moV8 = False, moV8All = False, moProbe = False
   , moMaxEvm = 1.0, moV32Rates = Nothing, moMnp = Nothing, moMnpTrt = 0.5, moMnpProbes = 6, moMnpProbeGap = 2.5
   , moHayes = False, moSip = Nothing, moSipDomain = ""
-  , moAudio = AudioSipLoop "modec", moData = DataStdio, moAmp = 0.5
+  , moAudio = AudioSipLoop "modec", moFormat = Nothing, moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
   , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
+
+-- | The format the audio moves in: what was asked for, else s16, which
+-- is what every sound card and pipe here has always carried.
+audioFormat :: ModemOpts -> SampleFormat
+audioFormat o = maybe S16 id (moFormat o)
 
 runModem :: ModemOpts -> IO ()
 runModem o = do
@@ -163,7 +182,7 @@ runModem o = do
   sip <- case moSip o of
     Nothing -> return Nothing
     Just addr -> Just <$> sipConnect addr
-  withAudio (moAudio o) (moRate o) (moRole o) $ \ai ->
+  withAudio (moAudio o) (audioFormat o) (moRate o) (moRole o) $ \ai ->
     withData (moData o) $ \recvBytes sendBytes -> do
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
       blockRef <- newIORef (0 :: Int)
@@ -192,8 +211,8 @@ runModem o = do
       -- block; the cushion follows the first block in.
       leadMs <- maybe 100 read <$> lookupEnv "MODEC_TX_LEAD_MS"
       let leadBlocks = max 1 ((leadMs + moBlockMs o - 1) `div` moBlockMs o) :: Int
-          lead = encodeS16 (VS.replicate (blockN * leadBlocks) 0)
-      aiWrite ai (encodeS16 (VS.replicate blockN 0))
+          lead = VS.replicate (blockN * leadBlocks) 0
+      aiWrite ai (VS.replicate blockN 0)
       primed <- newIORef False
       restarts <- newIORef (0 :: Int)
       -- optional session recordings, useful for checking what a VoIP trunk
@@ -231,20 +250,20 @@ runModem o = do
                 callRecEnd c outcome
                 writeIORef callRef Nothing
       let readBlock = do
-            bs <- aiRead ai (2 * blockN)
+            x <- aiRead ai blockN
             p <- readIORef primed
             unless p $ do
               writeIORef primed True
               aiWrite ai lead
-            mapM_ (\w -> wavAppendRaw w bs) recRx
+            mapM_ (\w -> wavAppend w x) recRx
             mc <- readIORef callRef
-            mapM_ (\c -> callRecWrite c bs) mc
-            return bs
-          writeBlock bs = do
-            mapM_ (\w -> wavAppendRaw w bs) recTx
+            mapM_ (\c -> callRecWrite c x) mc
+            return x
+          writeBlock x = do
+            mapM_ (\w -> wavAppend w x) recTx
             mc <- readIORef callRef
-            mapM_ (\c -> callRecWriteTx c bs) mc
-            aiWrite ai bs
+            mapM_ (\c -> callRecWriteTx c x) mc
+            aiWrite ai x
           closeRecordings = endCall >> mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
           -- the peer closed a FIFO).  Try to put it back a few times
@@ -261,7 +280,7 @@ runModem o = do
                   then do
                     writeIORef restarts (n + 1)
                     logMsg ("audio restarted (attempt " ++ show (n + 1) ++ ")")
-                    aiWrite ai (encodeS16 (VS.replicate blockN 0))
+                    aiWrite ai (VS.replicate blockN 0)
                     writeIORef primed False
                     return True
                   else return False
@@ -676,12 +695,8 @@ v22Info st = case modemV22Rx st of
   _ -> ""
 
 -- | An audio interface backed by two handles that cannot be restarted.
-handleIf :: Handle -> Handle -> AudioIf
-handleIf hi ho = AudioIf
-  { aiRead = B.hGet hi
-  , aiWrite = \bs -> B.hPut ho bs >> hFlush ho
-  , aiRestart = return False
-  }
+handleIf :: SampleFormat -> Handle -> Handle -> AudioIf
+handleIf fmt hi ho = sampleIf fmt (B.hGet hi) (\bs -> B.hPut ho bs >> hFlush ho) (return False)
 
 -- | A running pw-cat pair: capture pipe, playback pipe, and the two
 -- child processes.
@@ -693,8 +708,8 @@ type ProcResult = (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 -- | Run a record/playback pw-cat pair, giving the body an interface that
 -- can respawn it.  Reads and writes go through an 'IORef' so that a
 -- restart is invisible to the caller.
-withPwCatPair :: [String] -> [String] -> (AudioIf -> IO a) -> IO a
-withPwCatPair recArgs playArgs body = do
+withPwCatPair :: SampleFormat -> [String] -> [String] -> (AudioIf -> IO a) -> IO a
+withPwCatPair fmt recArgs playArgs body = do
   ref <- newIORef Nothing
   let spawn = do
         r <- try (createProcess (proc "pw-cat" recArgs) { std_out = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
@@ -752,7 +767,7 @@ withPwCatPair recArgs playArgs body = do
         spawn
   started <- spawn
   unless started exitFailure
-  body (AudioIf rd wr restart) `finally` stop
+  body (sampleIf fmt rd wr restart) `finally` stop
 
 -- | Name a resolved device for the log.
 nodeLabel :: Maybe PwNode -> String
@@ -773,12 +788,20 @@ resolveOpt (Just spec) want = do
       exitFailure
 
 -- | Open the audio interface.
-withAudio :: AudioIO -> Int -> Role -> (AudioIf -> IO a) -> IO a
-withAudio aio rate role body = lookupEnv "MODEC_PW_LATENCY" >>= \pwLatencyEnv -> withAudio' aio rate role body pwLatencyEnv
+withAudio :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> IO a
+withAudio aio fmt rate role body = lookupEnv "MODEC_PW_LATENCY" >>= \pwLatencyEnv -> withAudio' aio fmt rate role body pwLatencyEnv
 
-withAudio' :: AudioIO -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> IO a
-withAudio' aio rate role body pwLatencyEnv = case aio of
-  AudioStdio -> body (handleIf stdin stdout)
+-- | The name pw-cat gives a format, for the ones it has.  PipeWire
+-- converts whatever the device does to what a stream asks for, so a
+-- format it lacks is not a device it cannot reach, only a name.
+pwCatFormat :: SampleFormat -> Maybe String
+pwCatFormat f = case f of
+  U8 -> Just "u8"; S8 -> Just "s8"; S16 -> Just "s16"; S32 -> Just "s32"; F32 -> Just "f32"
+  _ -> Nothing
+
+withAudio' :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> IO a
+withAudio' aio fmt rate role body pwLatencyEnv = case aio of
+  AudioStdio -> body (handleIf fmt stdin stdout)
   AudioFiles i o -> do
     -- Blocking POSIX opens (GHC's openFile opens FIFOs non-blocking and
     -- fails with ENXIO when no reader exists yet).  Each FIFO open waits
@@ -793,8 +816,9 @@ withAudio' aio rate role body pwLatencyEnv = case aio of
     hSetBinaryMode hi True
     hSetBinaryMode ho True
     hSetBuffering ho NoBuffering
-    body (handleIf hi ho) `finally` (ignoreIO (hClose hi) >> ignoreIO (hClose ho))
+    body (handleIf fmt hi ho) `finally` (ignoreIO (hClose hi) >> ignoreIO (hClose ho))
   AudioSipLoop prefix -> do
+    requirePwFormat
     -- Two loopbacks: modec plays into <prefix>-to-sip whose other side is
     -- the Audio/Source <prefix>-line (the softphone captures it); the
     -- softphone plays into sip-to-<prefix> whose other side is
@@ -815,11 +839,12 @@ withAudio' aio rate role body pwLatencyEnv = case aio of
           logMsg "is pipewire running, and is pw-loopback installed?"
           exitFailure
         logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
-        withPwCatPair
+        withPwCatPair fmt
           (["--record", "--target", sipSrc, "-P", streamProps (prefix ++ "-rx")] ++ common ++ ["-"])
           (["--playback", "--target", toSip, "-P", streamProps (prefix ++ "-tx")] ++ common ++ ["-"])
           (withGainCheck [prefix ++ "-rx", prefix ++ "-tx"] body)
   AudioPipewire inSpec outSpec monitor0 -> do
+    requirePwFormat
     -- With no capture device the only thing to record is an output's
     -- monitor; pw-cat cannot auto-connect to that, and a failed capture
     -- stream would end the audio-paced loop before anything is heard.
@@ -837,10 +862,17 @@ withAudio' aio rate role body pwLatencyEnv = case aio of
                   ++ target inN ++ common ++ ["-"]
         playArgs = ["--playback", "-P", streamProps "modec-tx"] ++ target outN ++ common ++ ["-"]
     logMsg ("audio in: " ++ (if monitor then "monitor of " else "") ++ nodeLabel inN
-            ++ ", out: " ++ nodeLabel outN ++ ", " ++ show rate ++ " Hz")
-    withPwCatPair recArgs playArgs (withGainCheck ["modec-rx", "modec-tx"] body)
+            ++ ", out: " ++ nodeLabel outN ++ ", " ++ show rate ++ " Hz " ++ formatName fmt)
+    withPwCatPair fmt recArgs playArgs (withGainCheck ["modec-rx", "modec-tx"] body)
   where
-    common = ["--raw", "--rate", show rate, "--channels", "1", "--format", "s16", "--latency", pwLatency]
+    common = ["--raw", "--rate", show rate, "--channels", "1", "--format", pwFmt, "--latency", pwLatency]
+    pwFmt = maybe "s16" id (pwCatFormat fmt)
+    requirePwFormat = case pwCatFormat fmt of
+      Just _ -> return ()
+      Nothing -> do
+        logMsg ("pw-cat cannot carry " ++ formatName fmt ++ " audio; PipeWire converts whatever the device"
+                ++ " does to the format a stream asks for, so ask for s16 (or u8, s8, s32, f32)")
+        exitFailure
     -- The quantum both pw-cat streams run on.  Overridable while the
     -- right figure is being found: MODEC_PW_LATENCY=50ms.
     pwLatency = maybe "100ms" id pwLatencyEnv

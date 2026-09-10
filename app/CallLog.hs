@@ -23,7 +23,6 @@ module CallLog
   ) where
 
 import Control.Exception (IOException, try)
-import qualified Data.ByteString as B
 import Data.Char (isAlphaNum)
 import Data.Time (UTCTime, ZonedTime, defaultTimeLocale, diffUTCTime, formatTime,
                   getCurrentTime, getZonedTime, zonedTimeToUTC)
@@ -32,7 +31,8 @@ import System.FilePath ((</>))
 import System.IO
 import Text.Printf (printf)
 
-import Modec.Wav (WavWriter, closeWav, openWav16Mono, wavAppendRaw)
+import Modec.DSP (Signal)
+import Modec.Wav (WavWriter, closeWav, openWav16Mono, wavAppend)
 
 data CallRec = CallRec
   { crNumber :: String
@@ -79,15 +79,15 @@ callRecStart dir number rate = do
       return Nothing
 
 -- | Received audio, exactly as it arrived.
-callRecWrite :: CallRec -> B.ByteString -> IO ()
-callRecWrite c bs = wavAppendRaw (crWav c) bs
+callRecWrite :: CallRec -> Signal -> IO ()
+callRecWrite c x = wavAppend (crWav c) x
 
 -- | Transmitted audio, exactly as it went out.  Half of what goes wrong
 -- on a call is in this direction and invisible without it: a handshake
 -- signal that never made it onto the line looks, from the recording of
 -- what came back, exactly like a far end that ignored it.
-callRecWriteTx :: CallRec -> B.ByteString -> IO ()
-callRecWriteTx c bs = wavAppendRaw (crWavTx c) bs
+callRecWriteTx :: CallRec -> Signal -> IO ()
+callRecWriteTx c x = wavAppend (crWavTx c) x
 
 -- | A line of the modem's own commentary, stamped with how far into the
 -- call it happened.  The offsets are what make the log readable next to

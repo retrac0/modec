@@ -170,6 +170,9 @@ cmdP = hsubparser
                                <> help "drive baresip over its ctrl_tcp module (implies --hayes): ATD dials a SIP call, ATA answers, RING on incoming. `modec dial` sets this up for you"))
       <*> strOption (long "sip-domain" <> value "" <> metavar "DOMAIN" <> help "domain appended to dialled numbers (sip:NUMBER@DOMAIN)")
       <*> audioP
+      <*> optional (option (maybeReader formatNamed) (long "audio-format" <> metavar "FMT"
+             <> help ("what the audio device or pipe carries: " ++ unwords formatNames
+                      ++ ". Default s16. PipeWire converts, so pw-cat takes only the linear ones")))
       <*> dataP
       <*> option auto (long "amp" <> value 0.5 <> showDefault <> help "transmit amplitude")
       <*> optional (strOption (long "record-rx" <> metavar "FILE.wav" <> help "also record the whole session's received audio to one WAV, start to finish"))
@@ -271,9 +274,10 @@ cmdP = hsubparser
       (a, _ : rest) -> a : splitOn c rest
     audioP =
           flag' () (long "audio-pipewire" <> help "capture and play through pw-cat") *> pipewireP
-      <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW") <*> strOption (long "audio-out" <> metavar "RAW")
+      <|> AudioFiles <$> strOption (long "audio-in" <> metavar "RAW" <> help "headerless mono audio to read, in --audio-format (a file or a FIFO)")
+                     <*> strOption (long "audio-out" <> metavar "RAW" <> help "and to write")
       <|> AudioSipLoop <$> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> help "PipeWire loopback pair for a softphone (nodes PREFIX-to-sip / PREFIX-line and sip-to-PREFIX / PREFIX-sip-line)")
-      <|> flag' AudioStdio (long "audio-stdio" <> help "raw s16le mono audio on stdin/stdout")
+      <|> flag' AudioStdio (long "audio-stdio" <> help "headerless mono audio on stdin/stdout, in --audio-format")
     pipewireP = mkPw
       <$> optional (strOption (long "pw-in" <> metavar "DEV" <> help "capture device: node id, name, or part of either (see: modec devices)"))
       <*> optional (strOption (long "pw-out" <> metavar "DEV" <> help "playback device: node id, name, or part of either"))

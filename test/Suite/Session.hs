@@ -28,7 +28,6 @@ import Modec.Modem
 import Modec.Progress (defaultProgressParams, progressRxInit)
 import Modec.Session
 import Modec.Standards
-import Modec.Wav (decodeS16, encodeS16)
 
 fs :: Double
 fs = 8000
@@ -49,9 +48,9 @@ silence n = replicate n (VS.replicate blockN 0)
 -- | A session reading a fixed list of blocks and piling up what it
 -- writes.  Running out of audio is a short read, which is what a dead
 -- capture stream is.
-scripted :: [Signal] -> IO (Session, IORef [B.ByteString], IORef B.ByteString, IORef [String])
+scripted :: [Signal] -> IO (Session, IORef [Signal], IORef B.ByteString, IORef [String])
 scripted blocks = do
-  inp <- newIORef (map encodeS16 blocks)
+  inp <- newIORef blocks
   out <- newIORef []
   toDte <- newIORef B.empty
   lg <- newIORef []
@@ -61,7 +60,7 @@ scripted blocks = do
   let se = Session
         { seFs = fs, seBlockN = blockN
         , seRead = atomicModifyIORef' inp (\bs -> case bs of
-            []       -> ([], B.empty)
+            []       -> ([], VS.empty)
             (b : r)  -> (r, b))
         , seWrite = \b -> modifyIORef' out (++ [b])
         , seRecv = return B.empty
@@ -95,7 +94,7 @@ sessionTests = testGroup "the block loop"
       runLoop se co
       bs <- readIORef out
       assertEqual "blocks written" 50 (length bs)
-      forM_ bs $ \b -> assertEqual "block size" (2 * blockN) (B.length b)
+      forM_ bs $ \b -> assertEqual "block size" blockN (VS.length b)
 
   -- The greeting is the flag that did nothing in one of the two copies
   -- of the loop.  There is one expression now, governed by tuOnline.
@@ -128,7 +127,7 @@ sessionTests = testGroup "the block loop"
       n <- readIORef seen
       assertEqual "every block offered to the idle hook" 10 n
       bs <- readIORef out
-      forM_ bs $ \b -> assertEqual "silence" 0 (VS.sum (VS.map abs (decodeS16 b)))
+      forM_ bs $ \b -> assertEqual "silence" 0 (VS.sum (VS.map abs b))
 
   , testCase "dialling plays its signal out and then the call starts" $ do
       (se, out, _, _) <- scripted (silence 10)
@@ -140,7 +139,7 @@ sessionTests = testGroup "the block loop"
         LineCall {} -> return ()
         _ -> assertFailure "the dial signal never became a call"
       bs <- readIORef out
-      let loud = length [ () | b <- take 3 bs, VS.sum (VS.map abs (decodeS16 b)) > 1 ]
+      let loud = length [ () | b <- take 3 bs, VS.sum (VS.map abs b) > 1 ]
       assertEqual "the dial tones went out" 3 loud
 
   -- A plain call survives an audio restart with its modem state; a Hayes
@@ -181,7 +180,7 @@ callThroughLoop = do
   let farCfg = defaultModemConfig fs Answer [Bell103]
   far <- newIORef (modemInit farCfg)
   farSays <- newIORef (BC.pack "answered\r\n")
-  pending <- newIORef (encodeS16 (VS.replicate blockN 0))
+  pending <- newIORef (VS.replicate blockN 0)
   fromLine <- newIORef B.empty
   blocks <- newIORef (0 :: Int)
   line <- newIORef (startCall Originate)
@@ -196,14 +195,14 @@ callThroughLoop = do
       -- what it says back.
       readBlock = do
         k <- atomicModifyIORef' blocks (\n -> (n + 1, n))
-        if k > 2000 then return B.empty else do
+        if k > 2000 then return VS.empty else do
           ours <- readIORef pending
           st <- readIORef far
           out <- atomicModifyIORef' farSays (\b -> (B.empty, b))
-          let (st', audio, rxBytes, _) = modemStep farCfg st (impair 1 (decodeS16 ours)) (B.unpack out)
+          let (st', audio, rxBytes, _) = modemStep farCfg st (impair 1 ours) (B.unpack out)
           writeIORef far st'
           modifyIORef' fromLine (<> B.pack rxBytes)
-          return (encodeS16 (impair 2 audio))
+          return (impair 2 audio)
       se = Session
         { seFs = fs, seBlockN = blockN
         , seRead = readBlock

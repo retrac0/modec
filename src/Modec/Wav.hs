@@ -13,14 +13,10 @@ module Modec.Wav
   , readWav
   , writeWavMono
   , writeWav16Mono
-    -- * Raw 16-bit little-endian mono
-  , decodeS16
-  , encodeS16
     -- * Streaming writer
   , WavWriter
   , openWav16Mono
   , wavAppend
-  , wavAppendRaw
   , closeWav
   ) where
 
@@ -139,14 +135,6 @@ encodeWavMono fmt0 rate x = BB.toLazyByteString $
 encodeWav16Mono :: Int -> Signal -> BL.ByteString
 encodeWav16Mono = encodeWavMono S16
 
--- | Samples exactly as they come off a sound card or go down a pipe:
--- 16-bit little-endian, one channel, no header.
-decodeS16 :: B.ByteString -> Signal
-decodeS16 = decodeSamples S16
-
-encodeS16 :: Signal -> B.ByteString
-encodeS16 = encodeSamples S16
-
 readWav :: FilePath -> IO Wav
 readWav path = do
   bs <- B.readFile path
@@ -180,11 +168,8 @@ openWav16Mono path rate = do
 
 -- | Append a block of samples.
 wavAppend :: WavWriter -> Signal -> IO ()
-wavAppend w x = wavAppendRaw w (encodeS16 x)
-
--- | Append little-endian 16-bit samples already encoded.
-wavAppendRaw :: WavWriter -> B.ByteString -> IO ()
-wavAppendRaw w@(WavWriter h ref) bs = do
+wavAppend w@(WavWriter h ref) x = do
+  let bs = encodeSamples S16 x
   B.hPut h bs
   (n, k) <- readIORef ref
   let n' = n + B.length bs
