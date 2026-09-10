@@ -14,15 +14,29 @@
 -- code back, for every code of every format.  That is what makes
 -- recording a call as 16-bit PCM lossless whatever the line delivered:
 -- s16 is the identity, an 8-bit code is a 16-bit code with a zero low
--- byte, and G.711 and 14-bit PCM both decode into a 14-bit range that
--- 16 bits holds exactly.  The old writer scaled by 32767, which is one
--- step short of an identity: -32768 came back as -32767.
+-- byte, G.711 decodes into a 14-bit range that 16 bits holds exactly,
+-- and 14-bit PCM arrives already left-justified in a 16-bit word.  The
+-- old writer scaled by 32767, which is one step short of an identity:
+-- -32768 came back as -32767.
 --
 -- 'Pcm14' is the odd one out, being nobody's sound card format.  It is
 -- the "14 bit PCM" a Conexant-class USB modem offers in voice mode:
--- two bytes a sample, low byte first, a signed value in -8192..8191.
--- More resolution than G.711 can carry, and the reason to prefer that
--- path over a SIP trunk.
+-- two bytes a sample, low byte first.  More resolution than G.711 can
+-- carry, and the reason to prefer that path over a SIP trunk.
+--
+-- Which end of the word the 14 bits sit in was the one assumption here
+-- no test could check, so it was measured instead.  A CX93001 held
+-- off-hook on dial tone (350 + 440 Hz, 99.1 % of the energy in those
+-- two bins) returns a little-endian word peaking at 17659 -- more than
+-- twice the 8191 a right-justified value could reach.  The value is
+-- therefore left-justified: the 14 bits sit in bits 15..2, and the
+-- scale is 32768, not 8192.  Bit 0 is set in every sample the modem
+-- sends and bit 1 in two of sixteen thousand, which is a word-framing
+-- marker rather than signal -- so decoding the whole word by 32768 and
+-- reading a 14-bit value by 8192 are the same arithmetic, and this
+-- takes the first.  Going the other way there is no marker to imitate:
+-- a sample is quantised to the 14 bits the modem actually has and
+-- shifted up, so what is encoded is what it can represent.
 module Modec.Sample
   ( SampleFormat (..)
   , bytesPerSample
@@ -57,7 +71,7 @@ data SampleFormat
   | F32     -- ^ IEEE single precision little-endian, already on [-1, 1]
   | Ulaw    -- ^ G.711 mu-law
   | Alaw    -- ^ G.711 A-law
-  | Pcm14   -- ^ 14-bit linear in a 16-bit little-endian word, right-justified
+  | Pcm14   -- ^ 14-bit linear in a 16-bit little-endian word, left-justified
   deriving (Eq, Show, Enum, Bounded)
 
 bytesPerSample :: SampleFormat -> Int
@@ -84,7 +98,7 @@ decodeSamples fmt bs = VS.generate n (\i -> dec (i * bps))
       S8    -> \o -> fromIntegral (fromIntegral (B.index bs o) :: Int8) / 128
       U8    -> \o -> (fromIntegral (B.index bs o) - 128) / 128
       S16   -> \o -> fromIntegral (fromIntegral (le16 bs o) :: Int16) / 32768
-      Pcm14 -> \o -> fromIntegral (fromIntegral (le16 bs o) :: Int16) / 8192
+      Pcm14 -> \o -> fromIntegral (fromIntegral (le16 bs o) :: Int16) / 32768
       S24   -> \o ->
         let v = le16 bs o .|. (fromIntegral (B.index bs (o + 2)) `shiftL` 16)
             s = if v >= 0x800000 then v - 0x1000000 else v
@@ -104,7 +118,7 @@ encodeSamples fmt x =
       S8    -> BB.int8 . fromIntegral . quant 128
       U8    -> BB.word8 . fromIntegral . (+ 128) . quant 128
       S16   -> BB.int16LE . fromIntegral . quant 32768
-      Pcm14 -> BB.int16LE . fromIntegral . quant 8192
+      Pcm14 -> BB.int16LE . fromIntegral . (`shiftL` 2) . quant 8192
       S24   -> \v ->
         let c = quant 8388608 v .&. 0xFFFFFF
         in BB.word8 (fromIntegral c) <> BB.word8 (fromIntegral (c `shiftR` 8))

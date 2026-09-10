@@ -9,7 +9,7 @@
 module Suite.Sample (sampleTests) where
 
 import Control.Monad (forM_)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.))
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Vector.Storable as VS
@@ -52,7 +52,8 @@ sampleTests = testGroup "sample formats"
       assertEqual "ulaw" [0x7F] bad
       let all16 = B.concat [ leBytes 2 v | v <- [0 .. 65535] ]
       assertEqual "s16" all16 (roundTrip S16 all16)
-      let all14 = B.concat [ leBytes 2 (v .&. 0xFFFF) | v <- [-8192 .. 8191] ]
+      -- 14 bits left-justified: every code whose low two bits are clear
+      let all14 = B.concat [ leBytes 2 ((v `shiftL` 2) .&. 0xFFFF) | v <- [-8192 .. 8191] ]
       assertEqual "pcm14" all14 (roundTrip Pcm14 all14)
       -- the wide ones: both ends, and two thousand codes across the range
       forM_ [(S24, 24), (S32, 32)] $ \(f, bits) -> do
@@ -69,8 +70,10 @@ sampleTests = testGroup "sample formats"
       let one f bs = decodeSamples f bs VS.! 0
       assertEqual "u8 128 is zero" 0 (one U8 (B.pack [128]))
       assertEqual "s8 -128 is -1" (-1) (one S8 (B.pack [0x80]))
-      assertEqual "pcm14 8191 is one step under full scale" (8191 / 8192) (one Pcm14 (B.pack [0xFF, 0x1F]))
-      assertEqual "pcm14 -8192 is -1" (-1) (one Pcm14 (B.pack [0x00, 0xE0]))
+      -- left-justified, as measured off a CX93001: the top 14-bit code
+      -- is 0x1FFF shifted up two, and the bottom one fills the word
+      assertEqual "pcm14 8191 is one step under full scale" (8191 / 8192) (one Pcm14 (B.pack [0xFC, 0x7F]))
+      assertEqual "pcm14 -8192 is -1" (-1) (one Pcm14 (B.pack [0x00, 0x80]))
       assertEqual "mu-law is G.711" (ulawDecode 0x9A) (one Ulaw (B.pack [0x9A]))
       assertEqual "an 8-bit code is a 16-bit code with a zero low byte"
         (B.pack [0x00, 0x60]) (encodeSamples S16 (decodeSamples S8 (B.pack [0x60])))

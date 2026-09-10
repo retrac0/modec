@@ -140,11 +140,29 @@ logMsg s = hPutStrLn stderr ("modec: " ++ s)
 
 -- | The format the audio moves in: what was asked for, else what the
 -- backend naturally carries -- s16 for every sound card and pipe, and
--- for a voice-mode modem its 14-bit linear, the most it offers.
+-- for a voice-mode modem mu-law.
+--
+-- The 14-bit linear @+VSM=133@ offers is the better front end on paper
+-- and unusable duplex in fact.  A CX93001 has one throughput budget
+-- shared by both directions, and it is about 30.4 kB/s.  Receiving
+-- alone, 14-bit runs at its full 16.5 kB/s with a single underrun; it
+-- is holding a carrier at the same time that breaks it, because 16
+-- kB/s each way is 32 kB/s and that does not fit.  Measured, with only
+-- the transmit load varied: at 4, 8 and 12 kB/s out the receive side
+-- still gets its full 16.5 kB/s, and at 16 kB/s out it falls to 14.4
+-- and the modem reports 5921 buffer underruns.  Mu-law is 8 kB/s each
+-- way, 16 kB/s the pair, half the budget, and it runs clean -- and
+-- 'Modec.G711' decodes it exactly.
+--
+-- Neither knob that looks like the answer is one.  The DTE rate is not
+-- the throttle: B115200 through B921600 all measure the same 14.4
+-- kB/s, and so does @+VPR@ at 0, 48 and 96, which is what CDC-ACM
+-- ignoring its own line coding looks like.  Ask for @--audio-format
+-- pcm14@ when only receiving, or on a dongle with a wider budget.
 audioFormat :: ModemOpts -> SampleFormat
 audioFormat o = case (moFormat o, moAudio o) of
   (Just f, _) -> f
-  (Nothing, AudioSerial _) -> Pcm14
+  (Nothing, AudioSerial _) -> Ulaw
   _ -> S16
 
 runModem :: ModemOpts -> IO ()

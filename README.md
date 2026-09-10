@@ -227,7 +227,7 @@ cabal run modec -- modem --answer --audio-pipewire --v8 --listen 2323
 scripts/smoke-loopback.sh
 # the pipes can carry any sample format; a VoIP trunk's is mu-law
 cabal run modec -- modem --answer --audio-in b2a --audio-out a2b --audio-format ulaw --listen 2323
-# a Conexant USB modem in voice mode is the telephone line itself: 8 kHz, 14-bit PCM over the port
+# a Conexant USB modem in voice mode is the telephone line itself: 8 kHz mu-law over the port
 cabal run modec -- modem --answer --audio-serial /dev/ttyACM0 --listen 2323
 # the same without the hardware: a fake dongle on a pseudo-terminal, a modem behind it, every format
 scripts/smoke-serial.sh
@@ -260,8 +260,16 @@ audio, giving up after three attempts.
 CX93010-class dongle, `AT+FCLASS=8`, see
 [docs/asterisk.md](docs/asterisk.md) -- as the audio device and the
 line at once. Samples go both ways over the port at 8 kHz in
-`--audio-format` (`pcm14` by default; `ulaw`, `alaw`, `u8` and `s8` are
-the others it offers), the answering side waits for RING before going
+`--audio-format` (`ulaw` by default; `pcm14`, `alaw`, `u8` and `s8` are
+the others it offers). The 14-bit linear the chip advertises is finer
+than mu-law, and a CX93001 can carry it in one direction but not two:
+receiving alone it runs at its full 16.5 kB/s, and transmitting at the
+same time puts the pair over the roughly 30.4 kB/s the part has to
+give, so it drops samples rather than saying so. Mu-law is half that
+and runs clean, which is why it is the default; raising the port speed
+is not the fix, and [docs/asterisk.md](docs/asterisk.md) has the
+measurement. The answering
+side waits for RING before going
 off hook, and the events the modem shields into the stream -- busy
 tone, dial tone, its buffer running dry -- go to the log. The dialogue
 that gets it streaming is a list in `Modec.Voice`, and the log names

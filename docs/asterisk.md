@@ -235,25 +235,60 @@ cleaner front end than anything G.711 can deliver.
 `+VSM=<format>,8000`, `+VSD=0,0`, `+VIT=0`, `+VPR=0`, then `+VLS=1` and
 `+VTR` -- the `<DLE>` shielding taken off the stream, and the modem run
 on the samples, in `pcm14` unless `--audio-format` says otherwise. The
-dialogue is data, and the log names the step that fails. It has only
-ever run against `modec fake-dongle`, so bring-up on the real part, in
-order:
+dialogue is data, and the log names the step that fails. Bring-up on
+the real part has now happened, on a `CX93001-EIS_V0.2013-V92` behind
+an HT802V2, and this is what it found:
 
-1. `AT+FCLASS=?` must list 8, and `AT+VTR=?` must answer at all: the
-   driver has no half-duplex mode to fall back to.
-2. `AT+VSM=?` -- confirm 133 is there and what 131 and 132 are called;
-   `vsmCode` has the numbers the data sheet gives.
-3. `--audio-format ulaw` first: one byte a sample, the framing at half
-   the byte rate, and a decoder checked against the Sun reference.
-4. Then `pcm14`, the default, and `modec probe` on the call's
-   recording. The assumption is a signed 14-bit value right-justified
-   in the 16-bit word, so a loud call peaks well under full scale and
-   never clips. If instead it fills the range with the two low bits
-   always zero, the value is left-justified, and the scale in
-   `Modec.Sample` for `Pcm14` goes from 8192 to 32768 -- one number.
-5. Underruns and overruns on the port are counted and reported at
-   hang-up. More than a handful in a call means the host is not keeping
-   up with the stream, and the block size and `+VPR` are where to look.
+1. `AT+FCLASS=?` answers `0,1,1.0,2,8`, so voice is there. **`AT+VTR=?`
+   returns ERROR, and that means nothing at all.** This firmware has no
+   test form for any *action* command -- `AT+VRX=?` and `AT+VTX=?`
+   error the same way, and those are mandatory in Class 8 -- while every
+   parameter command (`+VSM`, `+VSD`, `+VIT`, `+VTS`, `+VGT`, `+VPR`)
+   answers its `=?` properly. The only test of `+VTR` is `+VTR` itself,
+   off hook: it answers `CONNECT` and streams both ways.
+2. `AT+VSM=?` lists exactly the table above, 133 included.
+3. `--audio-format ulaw`: one byte a sample, the framing at half the
+   byte rate, and a decoder checked against the Sun reference. This is
+   now the default for `--audio-serial`, for the reason in 5.
+4. `pcm14` is **left-justified**, so the scale in `Modec.Sample` is
+   32768 and not 8192. Measured rather than assumed: held off hook on
+   dial tone, the little-endian word peaks at 17659, which is more than
+   twice the 8191 a right-justified value could reach, and 99.1 % of
+   the energy sits in the 350 and 440 Hz bins, so the alignment is not
+   in doubt either. The 14 bits sit in bits 15..2; bit 0 is set in
+   every sample and bit 1 in two of sixteen thousand, which is a
+   word-framing marker rather than signal.
+5. **14-bit PCM works one direction at a time and not both.** The
+   CX93001 has a single throughput budget shared by the two
+   directions, about **30.4 kB/s**. Receiving alone, `pcm14` runs at
+   its full 16.5 kB/s with one underrun. It is transmitting at the
+   same time that breaks it: 16 kB/s each way is 32 kB/s, and that
+   does not fit. Varying only the transmit load, with the receive side
+   always asking for 16 kB/s:
+
+   | transmit | receive | total | underruns in 6 s |
+   | --- | --- | --- | --- |
+   | 0 | 16493 | 16493 | 1 |
+   | 4005 | 16475 | 20480 | 1493 |
+   | 8011 | 16479 | 24490 | 2976 |
+   | 12013 | 16106 | 28120 | 4440 |
+   | 16018 | 14396 | 30414 | 5921 |
+
+   Mu-law is 8 kB/s each way, 16 kB/s the pair, and runs clean: 1
+   underrun and 0 overruns against `pcm14`'s 9611 and 1476 over a call
+   of the same length. So `--audio-format pcm14` is right for a
+   recording and wrong for a call.
+
+   Neither knob that looks like the answer is one. The DTE rate is not
+   the throttle -- B115200, B230400, B460800 and B921600 all measure
+   the same 14.4 kB/s -- and neither is `+VPR`, at 0, 48 or 96. That is
+   what CDC-ACM ignoring its own line coding looks like: the rate is
+   nominal, and the limit is in the part.
+6. A run interrupted mid-stream leaves the modem in the voice duplex
+   state, and it answers the next run's first `AT` with the tail of the
+   old one. `Serial.resync` sends `<DLE><ETX>`, `<DLE><^>` and a bare
+   carriage return before the dialogue, so this no longer costs every
+   second run.
 
 The four things the driver does for the modem that it would not work
 without:

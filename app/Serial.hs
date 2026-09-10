@@ -49,6 +49,7 @@ withSerial dev fmt rate role say body = do
     exitFailure
   bracket (openPort dev) (\(hr, hw) -> ignore (hClose hr) >> ignore (hClose hw)) $ \(hr, hw) -> do
     say ("audio: " ++ dev ++ ", " ++ show rate ++ " Hz " ++ formatName fmt ++ " (voice mode)")
+    resync hr hw
     dialogue hr hw say (voiceSetup code role)
     say "the line is streaming"
     inbox <- newInbox
@@ -88,6 +89,32 @@ withSerial dev fmt rate role say body = do
           ignore (B.hPut hw (cmd <> "\r"))
           void (timeout 2000000 (finalResult hr))
         WaitFor _ -> return ()
+
+-- | Leave whatever state the last run died in, before saying @AT@.
+--
+-- A bench session is interrupted mid-stream constantly, and a modem
+-- still in the voice duplex state answers the next run's first @AT@
+-- with the tail of the old one -- @CONNECT@, or a sample byte that is
+-- no result code at all -- so every second run failed until this was
+-- here.  The two escapes mean nothing to a modem already in command
+-- mode; the bare carriage return ends any half-typed line they leave,
+-- and the drain eats whatever all of it echoed.
+resync :: Handle -> Handle -> IO ()
+resync hr hw = do
+  ignoreIO (B.hPut hw dleEtx)
+  threadDelay 200000
+  ignoreIO (B.hPut hw dleLeaveDuplex)
+  threadDelay 200000
+  ignoreIO (B.hPut hw "\r")
+  threadDelay 100000
+  drain
+  where
+    ignoreIO act = void (try act :: IO (Either IOException ()))
+    drain = do
+      r <- timeout 150000 (try (B.hGetSome hr 4096) :: IO (Either IOException B.ByteString))
+      case r of
+        Just (Right bs) | not (B.null bs) -> drain
+        _ -> return ()
 
 -- | Reading and writing handles on the device, in raw mode when it is
 -- a terminal.  A FIFO or a file is taken as it is, which is what lets a

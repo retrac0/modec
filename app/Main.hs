@@ -327,7 +327,7 @@ cmdP = hsubparser
       <|> AudioSipLoop <$> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> help "PipeWire loopback pair for a softphone (nodes PREFIX-to-sip / PREFIX-line and sip-to-PREFIX / PREFIX-sip-line)")
       <|> flag' AudioStdio (long "audio-stdio" <> help "headerless mono audio on stdin/stdout, in --audio-format")
       <|> AudioSerial <$> strOption (long "audio-serial" <> metavar "DEV"
-             <> help "a voice-mode USB modem (AT+FCLASS=8) on this serial port, e.g. /dev/ttyACM0: the line itself, at 8000 Hz. --audio-format defaults to pcm14 here")
+             <> help "a voice-mode USB modem (AT+FCLASS=8) on this serial port, e.g. /dev/ttyACM0: the line itself, at 8000 Hz. --audio-format defaults to ulaw here; pcm14 is finer but a CX93001 cannot carry it without losing samples")
     pipewireP = mkPw
       <$> optional (strOption (long "pw-in" <> metavar "DEV" <> help "capture device: node id, name, or part of either (see: modec devices)"))
       <*> optional (strOption (long "pw-out" <> metavar "DEV" <> help "playback device: node id, name, or part of either"))
