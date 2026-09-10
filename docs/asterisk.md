@@ -230,7 +230,33 @@ HT802's are strangers. It is also the answer to having no capture device
 on this box, and it makes `133, 14 bit PCM` available, which is a
 cleaner front end than anything G.711 can deliver.
 
-Four things to get right before it works:
+`--audio-serial /dev/ttyACM0` is this in modec: the dialogue in
+[Modec.Voice](../src/Modec/Voice.hs) -- `AT+FCLASS=8`,
+`+VSM=<format>,8000`, `+VSD=0,0`, `+VIT=0`, `+VPR=0`, then `+VLS=1` and
+`+VTR` -- the `<DLE>` shielding taken off the stream, and the modem run
+on the samples, in `pcm14` unless `--audio-format` says otherwise. The
+dialogue is data, and the log names the step that fails. It has only
+ever run against `modec fake-dongle`, so bring-up on the real part, in
+order:
+
+1. `AT+FCLASS=?` must list 8, and `AT+VTR=?` must answer at all: the
+   driver has no half-duplex mode to fall back to.
+2. `AT+VSM=?` -- confirm 133 is there and what 131 and 132 are called;
+   `vsmCode` has the numbers the data sheet gives.
+3. `--audio-format ulaw` first: one byte a sample, the framing at half
+   the byte rate, and a decoder checked against the Sun reference.
+4. Then `pcm14`, the default, and `modec probe` on the call's
+   recording. The assumption is a signed 14-bit value right-justified
+   in the 16-bit word, so a loud call peaks well under full scale and
+   never clips. If instead it fills the range with the two low bits
+   always zero, the value is left-justified, and the scale in
+   `Modec.Sample` for `Pcm14` goes from 8192 to 32768 -- one number.
+5. Underruns and overruns on the port are counted and reported at
+   hang-up. More than a handful in a call means the host is not keeping
+   up with the stream, and the block size and `+VPR` are where to look.
+
+The four things the driver does for the modem that it would not work
+without:
 
 - **`+VSD`** silence detection will cheerfully end the stream on quiet.
   Turn it off, or a handshake's silence intervals truncate the call.

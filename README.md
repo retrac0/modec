@@ -132,8 +132,13 @@ and the library it links carries no dependency that could.
   start and stop bits between the modems, worth a fifth of the line;
   class 4 sizes the frames to it. See [docs/mnp.md](docs/mnp.md) and
   [docs/mnp-bench.md](docs/mnp-bench.md).
-- **The line** (`Modec.Modem`, `Modec.Pipewire`, `Modec.Baresip`): audio
-  through `pw-cat` or raw 8 kHz s16le pipes, or through baresip for SIP;
+- **The line** (`Modec.Modem`, `Modec.Pipewire`, `Modec.Baresip`,
+  `Modec.Sample`, `Modec.Voice`): audio through `pw-cat`, through raw
+  pipes in any of nine sample formats (`--audio-format`: s8, u8, s16,
+  s24, s32, f32, G.711 mu-law and A-law, and the 14-bit PCM of a
+  Conexant USB modem), through such a modem in voice mode on its
+  serial port (`--audio-serial`, the line itself), or through baresip
+  for SIP;
   data over telnet (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
   escaped), stdio, or a terminal in raw mode. Hayes AT on the DTE side
   (`--hayes`: ATD, ATA, ATH, ATO, ATZ, AT&F, ATS0, "+++" with its guard
@@ -143,9 +148,13 @@ and the library it links carries no dependency that could.
   modem made of it stamped from the start of the call, and a line in
   `recordings/calls.log`; `--record-rx` / `--record-tx` keep a whole
   session, and `modec probe`, `detect`, `progress` and `dtmf` read them
-  back through the WAV reader (PCM 8, 16, 24 and 32 bit, and float 32).
-  Length fields are refreshed twice a second, so a process killed
-  mid-call still leaves a playable file.
+  back through the WAV reader (PCM 8, 16, 24 and 32 bit, float 32,
+  G.711 mu-law and A-law) or, with `--raw FMT`, out of a headerless
+  capture. Length fields are refreshed twice a second, so a process
+  killed mid-call still leaves a playable file. A recording made at a
+  sound card's rate rather than the line's is brought to 8 kHz by
+  `--rate 8000`, which is also thirty-five times faster through the
+  FSK front end.
 
 Why each of these is built the way it is -- why the burst receiver
 decides carrier on whether the band holds a tone rather than on energy,
@@ -216,6 +225,12 @@ cabal run modec -- modem --hayes --audio-pipewire --mode bell212a,bell103 --list
 cabal run modec -- modem --answer --audio-pipewire --v8 --listen 2323
 # loop two instances through FIFOs with no sound card
 scripts/smoke-loopback.sh
+# the pipes can carry any sample format; a VoIP trunk's is mu-law
+cabal run modec -- modem --answer --audio-in b2a --audio-out a2b --audio-format ulaw --listen 2323
+# a Conexant USB modem in voice mode is the telephone line itself: 8 kHz, 14-bit PCM over the port
+cabal run modec -- modem --answer --audio-serial /dev/ttyACM0 --listen 2323
+# the same without the hardware: a fake dongle on a pseudo-terminal, a modem behind it, every format
+scripts/smoke-serial.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
 cabal run modec -- modem --hayes --audio-pipewire --listen 2323
 scripts/smoke-hayes.sh
@@ -239,7 +254,21 @@ both. An ambiguous name is refused with a listing rather than guessed.
 With no capture device modec records the playback monitor instead and
 says so, which lets the modem hear its own tones (`--pw-monitor` forces
 it). If the capture stream stops, it reports NO CARRIER and restarts the
-audio, giving up after three attempts. To play with it from a terminal:
+audio, giving up after three attempts.
+
+`--audio-serial DEV` opens a voice-mode USB modem -- a Conexant
+CX93010-class dongle, `AT+FCLASS=8`, see
+[docs/asterisk.md](docs/asterisk.md) -- as the audio device and the
+line at once. Samples go both ways over the port at 8 kHz in
+`--audio-format` (`pcm14` by default; `ulaw`, `alaw`, `u8` and `s8` are
+the others it offers), the answering side waits for RING before going
+off hook, and the events the modem shields into the stream -- busy
+tone, dial tone, its buffer running dry -- go to the log. The dialogue
+that gets it streaming is a list in `Modec.Voice`, and the log names
+the step that fails. `modec fake-dongle` is the same thing without the
+hardware: a pseudo-terminal that answers the dialogue the way the chip
+does and carries a modem behind it, which `scripts/smoke-serial.sh`
+runs in every format. To play with the PipeWire path from a terminal:
 
 ```
 cabal run modec -- modem --hayes --audio-pipewire --pw-monitor --data-stdio
