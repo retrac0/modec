@@ -29,10 +29,7 @@
 --   quadrant coding is differential, so the four-fold phase ambiguity of
 --   the carrier lock does not matter.
 module Modec.V22
-  ( V22Channel (..)
-  , carrierOf
-  , Rate (..)
-  , TxMode (..)
+  ( TxMode (..)
   , V22TxState
   , v22TxInit
   , v22TxBlock
@@ -72,18 +69,11 @@ import Data.Word (Word8)
 
 import Modec.DSP
 import Modec.FSK (frameBits)
+import Modec.Link
 import Modec.Standards (Framing)
 import Modec.Hdlc (hdlcFlagBits)
 import Modec.Scrambler
 import Modec.Stream
-
-data V22Channel = LowChannel | HighChannel deriving (Eq, Show)
-
-carrierOf :: V22Channel -> Double
-carrierOf LowChannel = 1200
-carrierOf HighChannel = 2400
-
-data Rate = R1200 | R2400 deriving (Eq, Show)
 
 baud :: Double
 baud = 600

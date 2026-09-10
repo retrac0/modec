@@ -13,12 +13,12 @@ import System.FilePath (takeFileName, (</>))
 
 import Dial
 import qualified Modec.Channel as Ch
+import Modec.Link
 import Modec.Mnp (defaultMnpConfig, MnpConfig (..))
 import Modec.Modem
 import Modec.Replay
 import Modec.Detect
 import Modec.V32Start (v32Timeline)
-import qualified Modec.V32 as V32
 import Modec.Dtmf
 import Modec.Progress
 import Modec.Pipewire (describeNodes)
@@ -257,12 +257,12 @@ cmdP = hsubparser
       "all" -> Just allStandards
       _ -> mapM modeReader (splitOn ',' s)
     v32RateReader m = case m of
-      "4800" -> Just V32.V32R4800
-      "7200" -> Just V32.V32R7200
-      "9600" -> Just V32.V32R9600
-      "9600t" -> Just V32.V32R9600T
-      "12000" -> Just V32.V32R12000
-      "14400" -> Just V32.V32R14400
+      "4800" -> Just V32R4800
+      "7200" -> Just V32R7200
+      "9600" -> Just V32R9600
+      "9600t" -> Just V32R9600T
+      "12000" -> Just V32R12000
+      "14400" -> Just V32R14400
       _ -> Nothing
     modeReader = standardNamed
     splitOn c s = case break (== c) s of
@@ -353,7 +353,7 @@ main = do
     V32Trace answered path -> do
       w <- readWav path
       let fs = fromIntegral (wavRate w)
-          dir = if answered then V32.Answering else V32.Calling
+          dir = if answered then Answer else Originate
       forM_ (v32Timeline fs dir (wavSamples w)) $ \(t, what) ->
         printf "%8.3f  %s\n" t what
     Replay ro -> runReplay ro
@@ -447,7 +447,7 @@ describeEvent e = case e of
   -- crashed the replay rather than printing a line about it.  Every
   -- renderer of this type must be total; there is more than one of them.
   EvRetrain _ -> "retraining"
-  EvRate r -> "now " ++ show (V32.rateBitRate r) ++ " bit/s"
+  EvRate r -> "now " ++ show (rateBitRate r) ++ " bit/s"
 
 -- | The channel simulator, driven from a named profile and repeated
 -- @--impair K=V@ options, so a fixture can be asked what it survives

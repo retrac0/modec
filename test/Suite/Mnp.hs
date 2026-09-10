@@ -11,6 +11,7 @@ import Test.QuickCheck
 import Test.Tasty
 import Test.Tasty.HUnit
 import Test.Tasty.QuickCheck (testProperty)
+import Modec.Link
 import Modec.Channel
 import Modec.Handshake
 import Modec.Metrics

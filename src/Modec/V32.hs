@@ -25,16 +25,8 @@
 -- interwork using the 16-state alternative, so the non-redundant path is
 -- not an optional extra: it is the one that always has to work.
 module Modec.V32
-  ( -- * Rates
-    V32Rate (..)
-  , rateBitsPerSymbol
-  , rateTrellis
-  , rateUncoded
-  , allV32Rates
-  , rateBitRate
-    -- * Scrambler (§4)
-  , Direction (..)
-  , Scrambler
+  ( -- * Scrambler (§4)
+    Scrambler
   , scramblerInit
   , scrambleBit
   , descrambleBit
@@ -94,58 +86,18 @@ import Control.Monad (replicateM)
 import Data.List (foldl')
 import qualified Data.Vector.Unboxed as VU
 
+import Modec.Link
+import Modec.Standards (Role (..))
 import Modec.Scrambler (Lfsr, lfsr, scramble, descramble)
 import qualified Modec.Scrambler as Scr
 
--- | The rates this implementation offers.  2400 bit\/s is "for further
--- study" in §2.4.3 and does not exist in any real modem, so it is not
--- here; the rate signal can still advertise it as unavailable.
-data V32Rate
-  = V32R4800    -- ^ 4800 bit\/s, four states, no trellis (V.32 §2.4.2)
-  | V32R7200    -- ^ 7200 bit\/s, 16-point trellis coded (V.32bis §2.3.4)
-  | V32R9600    -- ^ 9600 bit\/s, 16-point non-redundant (V.32 §2.4.1.1)
-  | V32R9600T   -- ^ 9600 bit\/s, 32-point trellis coded (V.32 §2.4.1.2)
-  | V32R12000   -- ^ 12000 bit\/s, 64-point trellis coded (V.32bis §2.3.2)
-  | V32R14400   -- ^ 14400 bit\/s, 128-point trellis coded (V.32bis §2.3.1)
-  deriving (Eq, Ord, Show, Enum, Bounded)
 
--- | The V.32bis rates, best first.  4800 and 9600 are V.32's and are
--- reached by a V.32bis modem talking to a V.32 one; Table 5\/V.32bis
--- Note 1 says as much, by making the bits for those two rates
--- permanently set.
-allV32Rates :: [V32Rate]
-allV32Rates = [V32R14400, V32R12000, V32R9600T, V32R9600, V32R7200, V32R4800]
-
--- | Data bits carried per symbol.  A trellis rate's redundant bit is not
--- among them: it is the constellation that grows, not the payload.
-rateBitsPerSymbol :: V32Rate -> Int
-rateBitsPerSymbol V32R4800 = 2
-rateBitsPerSymbol V32R7200 = 3
-rateBitsPerSymbol V32R9600 = 4
-rateBitsPerSymbol V32R9600T = 4
-rateBitsPerSymbol V32R12000 = 5
-rateBitsPerSymbol V32R14400 = 6
-
--- | Whether this rate runs through the convolutional encoder.
-rateTrellis :: V32Rate -> Bool
-rateTrellis r = r `elem` [V32R7200, V32R9600T, V32R12000, V32R14400]
-
--- | Bits that bypass the coding entirely (Q3 onwards), choosing between
--- the points of one trellis subset.
-rateUncoded :: V32Rate -> Int
-rateUncoded r
-  | rateTrellis r = rateBitsPerSymbol r - 2
-  | otherwise = 0
-
-rateBitRate :: V32Rate -> Int
-rateBitRate r = 2400 * rateBitsPerSymbol r
-
--- | Which end of the call we are.  §4.1.1: the calling station scrambles
--- with GPC and descrambles with GPA, the answering station the other way
--- round.  Giving each direction its own polynomial is not only about
--- whitening -- it is what stops an echo canceller from mistaking our own
--- returning signal for the far end's.
-data Direction = Calling | Answering deriving (Eq, Show)
+-- | §4.1.1: the calling station scrambles with GPC and descrambles with
+-- GPA, the answering station the other way round.  Giving each direction
+-- its own polynomial is not only about whitening -- it is what stops an
+-- echo canceller from mistaking our own returning signal for the far
+-- end's.  Which end we are is 'Role', from "Modec.Standards": V.32 calls
+-- it a direction, V.22 calls it a role, and it is one bit either way.
 
 -- | 23-bit history of the line (scrambled) bits, newest in bit 0.
 newtype Scrambler = Scrambler Int deriving (Eq, Show)
@@ -156,27 +108,27 @@ scramblerInit = Scrambler 0
 -- | The generating polynomial of each direction (§4): GPC =
 -- 1 + x^-18 + x^-23 for the calling modem, GPA = 1 + x^-5 + x^-23 for
 -- the answering one.
-scrPoly :: Direction -> Lfsr
-scrPoly Calling = lfsr 18 23
-scrPoly Answering = lfsr 5 23
+scrPoly :: Role -> Lfsr
+scrPoly Originate = lfsr 18 23
+scrPoly Answer = lfsr 5 23
 
 -- | Scramble one bit: the line bit is the data bit plus the two tapped
 -- line bits, and the register then remembers it.
-scrambleBit :: Direction -> Scrambler -> Bool -> (Scrambler, Bool)
+scrambleBit :: Role -> Scrambler -> Bool -> (Scrambler, Bool)
 scrambleBit dir (Scrambler reg) d = wrapScr (scramble (scrPoly dir) reg d)
 
 -- | Descramble one bit.  The register takes the same line bits as the
 -- far scrambler did, which is what makes it self-synchronising.
-descrambleBit :: Direction -> Scrambler -> Bool -> (Scrambler, Bool)
+descrambleBit :: Role -> Scrambler -> Bool -> (Scrambler, Bool)
 descrambleBit dir (Scrambler reg) line = wrapScr (descramble (scrPoly dir) reg line)
 
 -- | Scramble a run of bits, in order.
-scrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
+scrambleRun :: Role -> Scrambler -> [Bool] -> (Scrambler, [Bool])
 scrambleRun dir (Scrambler reg) bs = wrapScr (Scr.scrambleRun (scrPoly dir) reg bs)
 
 -- | Descramble a run of bits, in order.  The far end scrambles with the
 -- polynomial of /its/ direction, so a receiver passes the other one.
-descrambleRun :: Direction -> Scrambler -> [Bool] -> (Scrambler, [Bool])
+descrambleRun :: Role -> Scrambler -> [Bool] -> (Scrambler, [Bool])
 descrambleRun dir (Scrambler reg) bs = wrapScr (Scr.descrambleRun (scrPoly dir) reg bs)
 
 wrapScr :: (Int, a) -> (Scrambler, a)
@@ -576,7 +528,7 @@ viterbiDecode rate depth = go start (0 :: Int)
 -- | Segment 3 of the receiver conditioning signal (§5.2.3): binary ones
 -- scrambled at 4800 bit\/s from an all-zero register, with the
 -- differential encoding disabled.
-trnBits :: Direction -> Int -> [Bool]
+trnBits :: Role -> Int -> [Bool]
 trnBits dir n = go scramblerInit n
   where
     go _ 0 = []
@@ -588,7 +540,7 @@ trnBits dir n = go scramblerInit n
 -- switch-over wrong is invisible in the spectrum and fatal to the far
 -- end's equaliser, so the Recommendation's own opening strings are worth
 -- keeping as a test.
-trnStates :: Direction -> Int -> [TrainState]
+trnStates :: Role -> Int -> [TrainState]
 trnStates dir n = zipWith pick [0 :: Int ..] (dibits (trnBits dir (2 * n)))
   where
     dibits (a : b : rest) = (a, b) : dibits rest

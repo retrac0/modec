@@ -17,6 +17,7 @@ library
                       Modec.G711
                       Modec.FSK
                       Modec.Standards
+                      Modec.Link
                       Modec.Channel
                       Modec.Metrics
                       Modec.Detect

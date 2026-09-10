@@ -58,7 +58,8 @@ module Modec.V32Start
 import Data.Maybe (listToMaybe)
 import qualified Data.Vector.Storable as VS
 
-import Modec.Standards (answerToneItu)
+import Modec.Link
+import Modec.Standards (Role (..), answerToneItu)
 import Modec.DSP (Signal, chunksOf)
 import Modec.QAM
 import Modec.V32
@@ -130,7 +131,7 @@ data TxSrc
   deriving (Eq, Show)
 
 data V32Start = V32Start
-  { vsRole    :: !Role'
+  { vsRole    :: !Role
   , vsPhase   :: !V32Phase
   , vsFs      :: !Double
   , vsSps     :: !Double
@@ -163,7 +164,7 @@ data V32Start = V32Start
   , vsBits    :: [Bool]          -- ^ recent descrambled bits, newest first
   , vsSeenS   :: !Bool
   , vsSeenTrn :: !Bool
-  , vsFar     :: !Direction      -- ^ the far end's scrambler
+  , vsFar     :: !Role      -- ^ the far end's scrambler
   , vsRevAt   :: [(Double, Int)] -- ^ reversals seen in this block
   , vsACLimit :: !Int            -- ^ symbols to hold the pair in AAC before giving up
   , vsACHold  :: !Int            -- ^ symbols of the pair to send before reacting to AA
@@ -173,8 +174,6 @@ data V32Start = V32Start
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
   , vsLineErr :: !Double         -- ^ the far end's training, as a decision error
   }
-
-data Role' = Calling' | Answering' deriving (Eq, Show)
 
 v32Phase :: V32Start -> V32Phase
 v32Phase = vsPhase
@@ -272,7 +271,7 @@ v32Bis s = rateSeqV32bis (vsOffer s) && maybe False rateSeqV32bis (vsPeer s)
 -- and restarting them mid-signal costs more than it saves.  The round
 -- trip carries over too, as a fallback for the timers, and is measured
 -- again anyway.
-v32RetrainInit :: Double -> Direction -> RateSeq -> Bool
+v32RetrainInit :: Double -> Role -> RateSeq -> Bool
                -> QamRxState -> QamTxState -> Maybe Int -> V32Start
 v32RetrainInit fs dir offer initiating rx tx trip =
   (v32StartInit fs dir offer)
@@ -281,9 +280,9 @@ v32RetrainInit fs dir offer initiating rx tx trip =
     (phase, src) = case (dir, initiating) of
       -- AAC both sends the alternating pair and listens for the
       -- caller's 1800, so the answering modem enters there either way
-      (Answering, _) -> (AAC, TxAltAC True)
-      (Calling, True) -> (OAA, TxState StA)
-      (Calling, False) -> (OListen, TxNothing)
+      (Answer, _) -> (AAC, TxAltAC True)
+      (Originate, True) -> (OAA, TxState StA)
+      (Originate, False) -> (OListen, TxNothing)
 
 -- | Listening for the far end to go back to training, from data mode.
 --
@@ -296,11 +295,11 @@ data V32Listen = V32Listen
   { vlRev1800 :: !RevTracker
   , vlRev600  :: !RevTracker
   , vlRev3000 :: !RevTracker
-  , vlDir     :: !Direction
+  , vlDir     :: !Role
   , vlRun     :: !Int        -- ^ blocks the opening tone has been up
   }
 
-v32ListenInit :: Double -> Direction -> V32Listen
+v32ListenInit :: Double -> Role -> V32Listen
 v32ListenInit fs dir =
   V32Listen (revInit fs 1800) (revInit fs 600) (revInit fs 3000) dir 0
 
@@ -321,8 +320,8 @@ v32ListenBlock rx l = l'
 heardOpening :: V32Listen -> Bool
 heardOpening l = case vlDir l of
   -- we are the caller, so the far end is the answering modem
-  Calling -> strong (vlRev600 l) || strong (vlRev3000 l)
-  Answering -> strong (vlRev1800 l)
+  Originate -> strong (vlRev600 l) || strong (vlRev3000 l)
+  Answer -> strong (vlRev1800 l)
   where
     -- A level is a correlation divided by the signal's own root mean
     -- square, so on a line with nothing on it it is noise over noise and
@@ -336,7 +335,7 @@ heardOpening l = case vlDir l of
 -- normalised by a signal that has just gone, so it spikes exactly once
 -- as the far end hangs up -- and a hang-up read as a retrain takes the
 -- call round the start-up again instead of ending it.
-v32ListenRetrain :: Direction -> V32Listen -> Bool
+v32ListenRetrain :: Role -> V32Listen -> Bool
 v32ListenRetrain _ l = vlRun l >= 5
 
 -- | An answering modem offering V.32 on spec, per A.2.2, with a bound
@@ -349,21 +348,21 @@ v32ListenRetrain _ l = vlRun l >= 5
 -- understands.  Note 5 forbids /disconnecting/ inside three seconds of
 -- the pair; falling back to another rung is not disconnecting, and the
 -- ladder below V.32 is outside this Recommendation's scope anyway.
-v32StartOffer :: Double -> Direction -> RateSeq -> Double -> V32Start
+v32StartOffer :: Double -> Role -> RateSeq -> Double -> V32Start
 v32StartOffer fs dir offer secs =
   (v32StartAfterAnswerTone fs dir offer)
     { vsACLimit = max 1 (round (secs * 2400)), vsACHold = 512 }
 
-v32StartAfterAnswerTone :: Double -> Direction -> RateSeq -> V32Start
+v32StartAfterAnswerTone :: Double -> Role -> RateSeq -> V32Start
 v32StartAfterAnswerTone fs dir offer =
   let st = v32StartInit fs dir offer
   in case vsRole st of
-       Answering' -> st { vsPhase = AAC, vsSrc = TxAltAC True }
-       Calling' -> st
+       Answer -> st { vsPhase = AAC, vsSrc = TxAltAC True }
+       Originate -> st
 
-v32StartInit :: Double -> Direction -> RateSeq -> V32Start
+v32StartInit :: Double -> Role -> RateSeq -> V32Start
 v32StartInit fs dir offer = V32Start
-  { vsRole = role, vsPhase = if role == Calling' then OListen else AAns
+  { vsRole = role, vsPhase = if role == Originate then OListen else AAns
   , vsFs = fs, vsSps = samplesPerSymbol (v32Params fs)
   , vsN = 0, vsSince = 0
   , vsOffer = offer, vsPeer = Nothing, vsRate = Nothing
@@ -380,7 +379,7 @@ v32StartInit fs dir offer = V32Start
   , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0
   , vsLineErr = 1 }
   where
-    role = case dir of { Calling -> Calling'; Answering -> Answering' }
+    role = case dir of { Originate -> Originate; Answer -> Answer }
     p = v32Params fs
     cfg = v32StartCfg
 
@@ -399,9 +398,9 @@ v32StartStep st0 rx = (st3, tx, status)
       V32Fail e -> V32Failed e
       _ -> V32Busy
 
-far :: Direction -> Direction
-far Calling = Answering
-far Answering = Calling
+far :: Role -> Role
+far Originate = Answer
+far Answer = Originate
 
 symbols :: V32Start -> Int -> Int
 symbols st k = round (fromIntegral k * vsSps st)
@@ -661,7 +660,7 @@ emit st n
 
 -- | Bits onto the four states, as §5.3 sends a rate sequence: scrambled,
 -- then dibits differentially encoded by Table 1.
-codedPoints :: Direction -> Scrambler -> (Bool, Bool) -> [Bool] -> (Scrambler, (Bool, Bool), [Point])
+codedPoints :: Role -> Scrambler -> (Bool, Bool) -> [Bool] -> (Scrambler, (Bool, Bool), [Point])
 codedPoints dir sc0 q0 bits = (sc1, q1, ps)
   where
     (sc1, line) = scrambleRun dir sc0 bits
@@ -676,7 +675,7 @@ codedPoints dir sc0 q0 bits = (sc1, q1, ps)
 -- differential encoding switched off, and §5.3 then has the rate signal
 -- pick up the differential encoder from TRN's final symbol -- so these
 -- two values are the seam between them, and have to be carried across it.
-conditioningRun :: Direction -> Int -> ([Point], Scrambler, (Bool, Bool))
+conditioningRun :: Role -> Int -> ([Point], Scrambler, (Bool, Bool))
 conditioningRun dir trn = (ps, sc, q)
   where
     ps = conditioningSymbols dir trn
@@ -685,15 +684,15 @@ conditioningRun dir trn = (ps, sc, q)
       (lastSt : _) -> dibitOfState lastSt
       [] -> (False, False)
 
-dirOf :: V32Start -> Direction
-dirOf st = case vsRole st of { Calling' -> Calling; Answering' -> Answering }
+dirOf :: V32Start -> Role
+dirOf st = case vsRole st of { Originate -> Originate; Answer -> Answer }
 
 -- | The state machine of Figure 4.
 advance :: V32Start -> Int -> V32Start
 advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
   where
     st = st0
-    dir = case vsRole st0 of { Calling' -> Calling; Answering' -> Answering }
+    dir = case vsRole st0 of { Originate -> Originate; Answer -> Answer }
     sym k = symbols st0 k
     enter ph s = s { vsPhase = ph, vsSince = 0 }
     -- The turnaround is 64 symbol periods after the reversal was heard,
@@ -967,7 +966,7 @@ chosen r = case r of
 --
 -- Each entry is (seconds, what).  @dir@ is which end /we/ are, since it
 -- decides which scrambler the rate signals are read with.
-v32Timeline :: Double -> Direction -> Signal -> [(Double, String)]
+v32Timeline :: Double -> Role -> Signal -> [(Double, String)]
 v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
   where
     blk = 160

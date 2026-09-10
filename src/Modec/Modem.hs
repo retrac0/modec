@@ -26,8 +26,6 @@ module Modec.Modem
   , modemV22Rx
   , modemMnp
     -- * Link properties, for the error-correcting protocol
-  , linkBitRate
-  , linkSyncable
   , mnpRoleOf
     -- * Transmitter
   , TxState
@@ -40,6 +38,7 @@ import qualified Data.Vector.Storable as VS
 import Data.Maybe (isJust)
 import Data.Word (Word8)
 
+import Modec.Link
 import Modec.Async
 import Modec.Detect
 import Modec.DSP
@@ -48,7 +47,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
+import Modec.V32 (RateSeq (..), rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
 import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
@@ -296,7 +295,7 @@ modemInit cfg
   -- through a capabilities exchange that cannot name the one thing it
   -- can do.
   | [s] <- hcModes hs, isV32 s, not (hcV8 hs) =
-      base { msMode = Starting32 (v32StartInit fs (dirOfRole (hcRole hs)) (v32Offer cfg)) V32Committed }
+      base { msMode = Starting32 (v32StartInit fs ((hcRole hs)) (v32Offer cfg)) V32Committed }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataMode s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
@@ -313,7 +312,7 @@ modemInit cfg
     -- own signal taken back out of what returns.
     echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
     listen0 = if any isV32 (hcModes hs)
-                then Just (v32ListenInit fs (dirOfRole (hcRole hs))) else Nothing
+                then Just (v32ListenInit fs ((hcRole hs))) else Nothing
     dataMode s link = case link of
       FskLink tx rx -> DataFsk s tx rx (fskDiscriminator fs rx (mcDemod cfg)) (fskDeframer fs rx (mcFraming cfg) (mcDemod cfg))
       V22Link tx rx r -> DataV22 tx rx r (asyncRxInit (mcFraming cfg)) False
@@ -335,29 +334,6 @@ v32Offer cfg = case mcV32Rates cfg of
     | V32bis `elem` modes -> v32bisRates
     | otherwise -> v32Rates
   where modes = hcModes (mcHandshake cfg)
-
-dirOfRole :: Role -> Direction
-dirOfRole Originate = Calling
-dirOfRole Answer = Answering
-
--- | The line rate of an established link, for the protocol layer's timers.
--- On an asymmetric link the slow direction is the one that governs: an
--- acknowledgement crawling back at 75 bit/s is what a timeout has to
--- wait for, whatever the other direction manages.
-linkBitRate :: Link -> Double
-linkBitRate (FskLink tx rx) = min (fskBaud tx) (fskBaud rx)
-linkBitRate (V22Link _ _ R1200) = 1200
-linkBitRate (V22Link _ _ R2400) = 2400
-linkBitRate (V32Link _ r) = fromIntegral (rateBitRate r)
-
--- | Whether the link can carry bit-oriented framing.  Only the V.22 data
--- pump can: dropping the start and stop bits at 300 bit/s would buy 20 %
--- of thirty characters a second, and the FSK link is noise limited rather
--- than framing limited anyway.
-linkSyncable :: Link -> Bool
-linkSyncable V22Link {} = True
-linkSyncable V32Link {} = True
-linkSyncable FskLink {} = False
 
 -- | Which end starts the protocol.  This reads the established link, not
 -- the configured role: a V.8bis mode select reverses the two before the
@@ -557,7 +533,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- already counts a duration rather than an instant -- which is
           -- what 5.4.2 asks for.
           listen' = fmap (v32ListenBlock rxBlock) (msListen st)
-          v32Peer = maybe False (v32ListenRetrain (dirOfRole (hcRole hs))) listen'
+          v32Peer = maybe False (v32ListenRetrain ((hcRole hs))) listen'
           -- the block's events go to the first frame of the block only;
           -- the pump report is a running state and goes to every frame
           hsInFor i = if i == 0 then HsIn v8Evs v32Peer ansamHit report
@@ -597,14 +573,14 @@ modemStep cfg st0 rxBlock newBytes =
              -- on the alternating pair: that whole time it is
              -- transmitting 600 and 3000 Hz, which no V.22, V.21 or Bell
              -- caller understands.
-             let s32 = v32StartAfterAnswerTone fs (dirOfRole (hcRole hs)) (v32Offer cfg)
+             let s32 = v32StartAfterAnswerTone fs ((hcRole hs)) (v32Offer cfg)
                  st2 = st1 { msMode = Starting32 s32 V32Committed
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
            -- A.2.2: the answering ladder offering the pair on spec.  The
            -- same handoff, bounded, and with somewhere to go back to.
            HsOfferV32 ->
-             let s32 = v32StartOffer fs (dirOfRole (hcRole hs)) (v32Offer cfg) (hcV32Offer hs)
+             let s32 = v32StartOffer fs ((hcRole hs)) (v32Offer cfg) (hcV32Offer hs)
                  st2 = st1 { msMode = Starting32 s32 V32Offered
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
@@ -666,7 +642,7 @@ modemStep cfg st0 rxBlock newBytes =
       let (echo', rxClean) = cancelEcho False st n rxBlock
           -- receive only; what goes on the line is decided further down,
           -- once the protocol layer has had its say
-          (pump', gotBits) = v32DataRx fs (dirOfRole role) rate pump rxClean
+          (pump', gotBits) = v32DataRx fs (role) rate pump rxClean
           -- Scaled by how far this constellation's points are from the
           -- wrong answer, because the same decision error means
           -- different things at 4800 and at 14400 -- 0.71 of margin
@@ -750,7 +726,7 @@ modemStep cfg st0 rxBlock newBytes =
             -- Figure 4 instead of ending it, and the watchdog never gets
             -- its turn because the retrain suspends it.
             | not present = Nothing
-            | maybe False (v32ListenRetrain (dirOfRole role)) listen' = Just RetrainFarEnd
+            | maybe False (v32ListenRetrain (role)) listen' = Just RetrainFarEnd
             | bad' >= round (1.0 / blockSecs) = Just RetrainLocal
             | otherwise = Nothing
           blockSecs = fromIntegral (max 1 n) / fs
@@ -768,7 +744,7 @@ modemStep cfg st0 rxBlock newBytes =
           st1 = st { msEcho = echo', msZeros = onesRun', msListen = listen', msBad = bad' }
       in case wantRetrain of
            Just why | hdCount held < mcRetrainMax cfg, not (rateSeqCleardown offer') ->
-             let s32 = v32RetrainInit fs (dirOfRole role) offer'
+             let s32 = v32RetrainInit fs (role) offer'
                          (why == RetrainLocal)
                          (v32DataRxState pump') (v32DataTxState pump') Nothing
                  (txSt, audio) = transmit TxSilence st1
@@ -806,7 +782,7 @@ modemStep cfg st0 rxBlock newBytes =
       -- echo, which is the condition the half-duplex windows exist to
       -- create and the one this arranges directly.
       let (echo', _) = cancelEcho True st n rxBlock
-          (pump', audio) = v32DataTx fs Calling V32R9600T (mcTxAmp cfg) n [] pump
+          (pump', audio) = v32DataTx fs Originate V32R9600T (mcTxAmp cfg) n [] pump
           st1 = st { msEcho = pushEcho audio echo', msMode = Probe32 pump' }
       in (st1, audio, [], [])
     DataV22 tx rx rate framer armed ->
@@ -947,7 +923,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- arm on before the first character arrives
           bits | cmd' == TxV32Idle = []
                | otherwise = concatMap (\b -> frameBits (mcFraming cfg) [b]) (txQueue tx1) ++ txSync tx1
-          (pump', audio) = v32DataTx (mcRate cfg) (dirOfRole role) rate (mcTxAmp cfg) n' bits pump0
+          (pump', audio) = v32DataTx (mcRate cfg) (role) rate (mcTxAmp cfg) n' bits pump0
           mode' = case mode of
             DataV32 r rt _ fr ar -> DataV32 r rt pump' fr ar
             other -> other

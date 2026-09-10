@@ -52,7 +52,9 @@ module Modec.V32Pump
   , v32DemodulateTrainedEvmWith
   ) where
 
+import Modec.Link
 import Modec.DSP (Signal, chunksOf)
+import Modec.Standards (Role (..))
 import Modec.QAM
 import Modec.Stream (concatStage)
 import Modec.V32
@@ -317,7 +319,7 @@ txCoderFrom sc q = TxCoder sc q convInit []
 
 -- | Scramble and code as many whole symbols as the given bits allow,
 -- keeping the remainder for next time.
-encodeSymbols :: Direction -> V32Rate -> [Bool] -> TxCoder -> (TxCoder, [Point])
+encodeSymbols :: Role -> V32Rate -> [Bool] -> TxCoder -> (TxCoder, [Point])
 encodeSymbols dir r newBits st0 = go st0 { tcBits = [] } (tcBits st0 ++ scrambled) []
   where
     (scr', scrambled) = scrambleRun dir (tcScr st0) newBits
@@ -364,7 +366,7 @@ rxCoderInit = RxCoder scramblerInit (False, False)
 --
 -- The far end scrambles with the polynomial of /its/ direction, so the
 -- descrambler here is given the other one.
-decodeSymbols :: Direction -> V32Rate -> [QamSym] -> RxCoder -> (RxCoder, [Bool])
+decodeSymbols :: Role -> V32Rate -> [QamSym] -> RxCoder -> (RxCoder, [Bool])
 decodeSymbols dir r syms st = decodeQuads dir r (codedQuads r syms) st
 
 -- | Decided symbols to the coded bits they carry, before any of the
@@ -395,10 +397,10 @@ codedQuads r syms
 --
 -- The far end scrambles with the polynomial of /its/ direction, so the
 -- descrambler here is given the other one.
-decodeQuads :: Direction -> V32Rate -> [Coded] -> RxCoder -> (RxCoder, [Bool])
+decodeQuads :: Role -> V32Rate -> [Coded] -> RxCoder -> (RxCoder, [Bool])
 decodeQuads dir r quads st0 = (st1 { rcDescr = descr' }, dataBits)
   where
-    far = case dir of { Calling -> Answering; Answering -> Calling }
+    far = case dir of { Originate -> Answer; Answer -> Originate }
     diff = if rateTrellis r then diffDecode2 else diffDecode1
     (st1, coded) = foldlAcc (\st (y1, y2, rest) ->
       let (q1, q2) = diff (y1, y2) (rcPrev st)
@@ -426,7 +428,7 @@ stateSymbols n st = replicate n (statePoint st)
 -- adaptive equaliser at the far end and the echo canceller at this one.
 -- A receiver judged on data it was handed cold is being asked to do
 -- something the Recommendation never asks of it.
-conditioningSymbols :: Direction -> Int -> [Point]
+conditioningSymbols :: Role -> Int -> [Point]
 conditioningSymbols dir trn =
   take 256 (cycle [statePoint StA, statePoint StB])
   ++ take 16 (cycle [statePoint StC, statePoint StD])
@@ -435,7 +437,7 @@ conditioningSymbols dir trn =
 -- | Modulate data behind a full receiver conditioning signal, the way a
 -- V.32 modem actually puts data on a line.  Returns the signal and how
 -- many symbols precede the data.
-v32ModulateTrained :: Double -> Direction -> V32Rate -> Double -> Int -> [Bool] -> (Signal, Int)
+v32ModulateTrained :: Double -> Role -> V32Rate -> Double -> Int -> [Bool] -> (Signal, Int)
 v32ModulateTrained fs dir r amp trn bits = (modulatePoints fs amp (pre ++ pts), length pre)
   where
     pre = conditioningSymbols dir trn
@@ -458,14 +460,14 @@ modulatePoints fs amp pts0 = go qamTxInit pts0 []
            else go st' rest (sig : acc)
 
 -- | Modulate data bits into a signal.  Offline: the whole thing at once.
-v32Modulate :: Double -> Direction -> V32Rate -> Double -> [Bool] -> Signal
+v32Modulate :: Double -> Role -> V32Rate -> Double -> [Bool] -> Signal
 v32Modulate fs dir r amp bits = modulatePoints fs amp (snd (encodeSymbols dir r bits txCoderInit))
 
 -- | Demodulate a whole signal back to data bits.
-v32Demodulate :: Double -> Direction -> V32Rate -> Signal -> [Bool]
+v32Demodulate :: Double -> Role -> V32Rate -> Signal -> [Bool]
 v32Demodulate fs dir r = v32DemodulateWith fs dir r 160
 
-v32DemodulateWith :: Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
+v32DemodulateWith :: Double -> Role -> V32Rate -> Int -> Signal -> [Bool]
 v32DemodulateWith fs dir r blk sig = snd (decodeSymbols dir r syms rxCoderInit)
   where
     p = v32Params fs
@@ -483,12 +485,12 @@ v32DemodulateWith fs dir r blk sig = snd (decodeSymbols dir r syms rxCoderInit)
 -- diverges rather than converges.  This is why a V.32 receiver has to
 -- know where it is in the start-up, and cannot simply be pointed at the
 -- line.
-v32DemodulateTrained :: Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
+v32DemodulateTrained :: Double -> Role -> V32Rate -> Int -> Signal -> [Bool]
 v32DemodulateTrained = v32DemodulateTrainedWith id
 
 -- | The same, with the receiver's tuning adjusted -- for finding out
 -- what the tuning should be.
-v32DemodulateTrainedWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal -> [Bool]
+v32DemodulateTrainedWith :: (QamRxCfg -> QamRxCfg) -> Double -> Role -> V32Rate -> Int -> Signal -> [Bool]
 v32DemodulateTrainedWith tune fs dir r preSyms sig =
   fst (v32DemodulateTrainedEvmWith tune fs dir r preSyms sig)
 
@@ -512,10 +514,10 @@ v32DemodulateTrainedWith tune fs dir r preSyms sig =
 -- at another, which is why the ceilings hanging off it had to be set at
 -- 60 % before they were quiet.  The head goes too -- 'settleSyms' of it
 -- -- because a receiver acquiring is not a receiver's floor.
-v32DemodulateTrainedEvm :: Double -> Direction -> V32Rate -> Int -> Signal -> ([Bool], Double)
+v32DemodulateTrainedEvm :: Double -> Role -> V32Rate -> Int -> Signal -> ([Bool], Double)
 v32DemodulateTrainedEvm = v32DemodulateTrainedEvmWith id
 
-v32DemodulateTrainedEvmWith :: (QamRxCfg -> QamRxCfg) -> Double -> Direction -> V32Rate -> Int -> Signal
+v32DemodulateTrainedEvmWith :: (QamRxCfg -> QamRxCfg) -> Double -> Role -> V32Rate -> Int -> Signal
                             -> ([Bool], Double)
 v32DemodulateTrainedEvmWith tune fs dir r preSyms sig =
   (snd (decodeSymbols dir r syms rxCoderInit), settledEvm syms)
@@ -654,7 +656,7 @@ viterbiDepth = 16
 -- function doing both has to be handed a dummy for whichever half the
 -- caller does not mean, and it then advances that half's state anyway --
 -- which is silent, and costs every byte on the link.
-v32DataRx :: Double -> Direction -> V32Rate -> V32Data -> Signal -> (V32Data, [Bool])
+v32DataRx :: Double -> Role -> V32Rate -> V32Data -> Signal -> (V32Data, [Bool])
 v32DataRx fs dir r st rx = (st', out)
   where
     p = v32Params fs
@@ -680,7 +682,7 @@ v32DataRx fs dir r st rx = (st', out)
 
 -- | Transmit @n@ samples, carrying as many of @bits@ as will fit.  What
 -- does not fit stays in the coder, so nothing has to be handed back.
-v32DataTx :: Double -> Direction -> V32Rate -> Double -> Int -> [Bool] -> V32Data
+v32DataTx :: Double -> Role -> V32Rate -> Double -> Int -> [Bool] -> V32Data
           -> (V32Data, Signal)
 v32DataTx fs dir r amp n bits st = (st { vdTx = tx', vdCode = code', vdBits = keep }, audio)
   where

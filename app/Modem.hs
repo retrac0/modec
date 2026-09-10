@@ -37,6 +37,7 @@ import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 
 import CallLog
+import Modec.Link
 import Modec.DSP (Signal, rms)
 import Modec.Handshake
 import Modec.Baresip
@@ -45,13 +46,12 @@ import Modec.Progress
 import Modec.Hayes
 import Modec.Modem
 import Modec.Standards
-import Modec.V32 (V32Rate (..), rateBitRate)
 import qualified Modec.V32 as V32
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
 import Modec.Pipewire
 import PipewireIO
 import Modec.V8 (describeMenu)
-import Modec.V22 (Rate (..), rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
+import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 import Modec.Wav (closeWav, openWav16Mono, wavAppendRaw)
 
@@ -88,7 +88,7 @@ data ModemOpts = ModemOpts
   , moProbe    :: Bool
   , moV8All    :: Bool
   , moMaxEvm   :: Double
-  , moV32Rates :: Maybe V32.V32Rate  -- ^ hold V.32 to one rate
+  , moV32Rates :: Maybe V32Rate  -- ^ hold V.32 to one rate
   , moMnp      :: Maybe Int          -- ^ highest MNP class to offer (2, 3 or 4)
   , moMnpTrt   :: Double             -- ^ round trip the retransmission timer allows for
   , moMnpProbes :: Int               -- ^ link requests sent before giving up
@@ -326,13 +326,13 @@ runModem o = do
             writeIORef bannerRef (BC.pack (concatMap (++ "\r\n") ls))
           report ev = case ev of
             EvConnected st link -> do
-              writeIORef outcomeRef ("connected " ++ show st ++ " " ++ describeRate link)
-              say ("CONNECT " ++ show st ++ " " ++ describeRate link ++ ", " ++ describeChannels link)
+              writeIORef outcomeRef ("connected " ++ show st ++ " " ++ linkRateName link)
+              say ("CONNECT " ++ show st ++ " " ++ linkRateName link ++ ", " ++ linkChannels link)
               -- "this end" because the banner is read at the other one,
               -- where "sending HighChannel" would otherwise look like a
               -- description of the reader's own side
-              writeIORef connRef [ "CONNECT " ++ show st ++ " " ++ describeRate link
-                                 , "this end: " ++ describeChannels link ]
+              writeIORef connRef [ "CONNECT " ++ show st ++ " " ++ linkRateName link
+                                 , "this end: " ++ linkChannels link ]
               -- with no protocol to wait for, the carrier is the boundary
               when (moMnp o == Nothing) (sendBanner "none")
               when trace (logMsg (show link))
@@ -416,6 +416,10 @@ runModem o = do
           let tNow = do
                 k <- readIORef blockRef
                 return (fromIntegral (k * blockN) / fs :: Double)
+              -- The number in the CONNECT result code, which is what the
+              -- DTE is told it is talking at.  Not 'linkBitRate': a
+              -- terminal on a V.23 call is told 300, not the 75 bit/s
+              -- its own direction crawls back at.
               rateOf link = case link of
                 FskLink {} -> 300
                 V22Link _ _ R1200 -> 1200
@@ -636,28 +640,6 @@ runModem o = do
                     unless done loop
           loop `finally` closeRecordings
   where
-    -- What the index line calls the speed.  An asymmetric link has two,
-    -- and naming only one of them would be a lie by omission.
-    describeRate link = case link of
-      FskLink tx rx | fskBaud tx == fskBaud rx -> show (round (fskBaud tx) :: Int) ++ " bit/s"
-                    | otherwise -> show (round (fskBaud rx) :: Int) ++ "/" ++ show (round (fskBaud tx) :: Int) ++ " bit/s"
-      V22Link _ _ R1200 -> "1200 bit/s"
-      V22Link _ _ R2400 -> "2400 bit/s"
-      V32Link _ r -> show (rateBitRate r) ++ " bit/s"
-    showV32Rate r = case r of
-      V32R4800 -> "4800 bit/s"
-      V32R7200 -> "7200 bit/s, trellis coded"
-      V32R9600 -> "9600 bit/s, 16 point"
-      V32R9600T -> "9600 bit/s, trellis coded"
-      V32R12000 -> "12000 bit/s, trellis coded"
-      V32R14400 -> "14400 bit/s, trellis coded"
-    -- which way round the link runs, in the terms the standard uses
-    describeChannels link = case link of
-      FskLink tx rx -> "sending " ++ fskName tx ++ ", hearing " ++ fskName rx
-      V22Link tx rx _ -> "sending " ++ show tx ++ ", hearing " ++ show rx
-      -- V.32 has one carrier and both ends on it, which is the whole
-      -- reason it needs an echo canceller and the others do not
-      V32Link role r -> "1800 Hz both ways, " ++ show role ++ ", " ++ showV32Rate r
     isFinal EvDropped = True
     isFinal (EvFailed _) = True
     isFinal _ = False

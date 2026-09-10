@@ -14,6 +14,7 @@ import Data.Word (Word8)
 import Options.Applicative
 import Text.Printf (printf)
 
+import Modec.Link
 import Modec.Channel
 import Modec.DSP
 import Modec.FSK
@@ -526,9 +527,9 @@ v32Fuzz = v32FuzzWith id
 v32FuzzWith :: (QamRxCfg -> QamRxCfg) -> V32Rate -> [(String, Channel)] -> [(String, Int)]
 v32FuzzWith tune r conds =
   [ (nm, errs) | (nm, ch) <- conds
-  , let (clean, preSyms) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+  , let (clean, preSyms) = v32ModulateTrained 8000 Originate r 0.5 1400 payload
         sig = applyChannel 8000 ch clean
-        got = v32DemodulateTrainedWith tune 8000 Answering r preSyms sig
+        got = v32DemodulateTrainedWith tune 8000 Answer r preSyms sig
         errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
                        | o <- [0 .. 300] ] ]
   where payload = prbs (11, 9) 4000
@@ -578,7 +579,7 @@ v32LoopTrace =
         , ("walk .02/5", (telephoneChannel 25) { chJitter = WalkJitter 0.02 5 }) ] $ \(nm, ch) -> do
     let r = V32R4800
         payload = prbs (11, 9) 4000
-        (clean, _) = v32ModulateTrained 8000 Calling r 0.5 1400 payload
+        (clean, _) = v32ModulateTrained 8000 Originate r 0.5 1400 payload
         sig = applyChannel 8000 ch clean
         p = v32Params 8000
         cfg = v32RxCfg V32R4800

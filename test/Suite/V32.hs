@@ -7,6 +7,8 @@ import Data.List (nub)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
+import Modec.Standards
+import Modec.Link
 import Modec.Channel
 import Modec.DSP
 import Modec.Modem
@@ -106,13 +108,13 @@ v32Tests = testGroup "V.32 coding layer"
       -- A/C convention of the first 256 symbols.
       let showBits = concatMap (\b -> if b then "1" else "0")
           showStates = map (\st -> case st of StA -> 'A'; StB -> 'B'; StC -> 'C'; StD -> 'D')
-      assertEqual "GPC bits" "111111111111111111000001111111" (showBits (trnBits Calling 30))
-      assertEqual "GPA bits" "111110000011111000001110011111" (showBits (trnBits Answering 30))
-      assertEqual "call mode states" "CCCCCCCCCAAACCC" (showStates (trnStates Calling 15))
-      assertEqual "answer mode states" "CCCAACCCAACCACC" (showStates (trnStates Answering 15))
+      assertEqual "GPC bits" "111111111111111111000001111111" (showBits (trnBits Originate 30))
+      assertEqual "GPA bits" "111110000011111000001110011111" (showBits (trnBits Answer 30))
+      assertEqual "call mode states" "CCCCCCCCCAAACCC" (showStates (trnStates Originate 15))
+      assertEqual "answer mode states" "CCCAACCCAACCACC" (showStates (trnStates Answer 15))
 
   , testCase "a scrambler and its descrambler are inverse" $
-      forM_ [Calling, Answering] $ \d -> do
+      forM_ [Originate, Answer] $ \d -> do
         let bits = prbs (11, 9) 500
             line = snd (foldl (\(sc, acc) b -> let (sc', o) = V32.scrambleBit d sc b in (sc', acc ++ [o])) (scramblerInit, []) bits)
             back = snd (foldl (\(sc, acc) b -> let (sc', o) = V32.descrambleBit d sc b in (sc', acc ++ [o])) (scramblerInit, []) line)
@@ -189,8 +191,8 @@ v32Tests = testGroup "V.32 coding layer"
       -- else in the module would notice.
       forM_ allV32Rates $ \r -> do
         let payload = prbs (11, 9) 1600
-            enc = snd (encodeSymbols Calling r payload txCoderInit)
-            dec ps = snd (decodeQuads Answering r (codedQuads r
+            enc = snd (encodeSymbols Originate r payload txCoderInit)
+            dec ps = snd (decodeQuads Answer r (codedQuads r
                        [ QamSym p (slicePoint r p) 0 p | p <- ps ]) rxCoderInit)
             skip = if rateTrellis r then 200 else 40
         forM_ [0, 1, 2, 3] $ \k -> do
@@ -369,8 +371,8 @@ v32PumpTests = testGroup "V.32 data pump"
     -- 4.1.1 gives each its own scrambler, so they train on different
     -- sequences -- and testing only one of them hid a rate that worked
     -- calling to answering and not the other way about.
-  , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
-                     , ("ans->call", Answering, Calling) ]
+  , (way, tx, rx) <- [ ("call->ans", Originate, Answer)
+                     , ("ans->call", Answer, Originate) ]
   , (nm, ch) <- conds ]
   where
     -- There used to be a list here of what the answering-to-calling
@@ -463,7 +465,7 @@ echoTests = testGroup "echo cancellation"
       -- 0.83 ms and would find a delay anywhere.  Only TRN decorrelates,
       -- and a test driven by anything tidier would pass while the real
       -- thing failed.
-      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
           lag = 928 :: Int          -- 116 ms, as measured on the line
           rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
           (_, st) = runEcho defaultEchoConfig 160 tx rx
@@ -476,7 +478,7 @@ echoTests = testGroup "echo cancellation"
   , testCase "and taken out once the filter is aimed where it was found" $ do
       -- The whole point of the search: the same path the bulk delay
       -- could not reach, cancelled.
-      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
           lag = 928 :: Int
           rx = echoPath [(fromIntegral lag, 0.5), (fromIntegral lag + 3.7, 0.2)] tx
           (_, found) = runEcho defaultEchoConfig 160 tx rx
@@ -488,7 +490,7 @@ echoTests = testGroup "echo cancellation"
           assertBool ("return loss " ++ show (echoErle st) ++ " dB, aimed at " ++ show l)
             (echoErle st > 20)
   , testCase "a leg with no echo on it offers no delay to find" $ do
-      let tx = modulatePointsFor (conditioningSymbols Calling 1400)
+      let tx = modulatePointsFor (conditioningSymbols Originate 1400)
           rx = VS.replicate (VS.length tx) 0
           (_, st) = runEcho defaultEchoConfig 160 tx rx
       assertEqual "nothing to find" Nothing (fmap fst (echoSearch defaultEchoConfig st))
@@ -621,8 +623,8 @@ v32FloorTests = testGroup "what the receiver costs itself"
     -- and the constellations it is divided by are not.
   | (r, lim) <- [ (V32R4800, 0.06), (V32R7200, 0.14), (V32R9600, 0.14)
                 , (V32R9600T, 0.18), (V32R12000, 0.11), (V32R14400, 0.13) ]
-  , (way, tx, rx) <- [ ("call->ans", Calling, Answering)
-                     , ("ans->call", Answering, Calling) ]
+  , (way, tx, rx) <- [ ("call->ans", Originate, Answer)
+                     , ("ans->call", Answer, Originate) ]
   ]
   where
     payload = prbs (11, 9) 4000
@@ -690,8 +692,8 @@ v32StartDuplex snr maxT blk = go 0 o0 a0 quiet quiet V32Busy V32Busy []
     fs = 8000
     quiet = VS.replicate blk 0
     offer = allRates
-    o0 = v32StartInit fs Calling offer
-    a0 = v32StartInit fs Answering offer
+    o0 = v32StartInit fs Originate offer
+    a0 = v32StartInit fs Answer offer
     impair k t x = addNoise (k * 100003 + t) (0.05 * 0.707 / fromDb snr) (VS.map (* 0.7) x)
     go t so sa fromA fromO stO stA trace
       | fromIntegral t * fromIntegral blk / fs > maxT = (stO, stA, reverse trace, v32RoundTrip so, v32RoundTrip sa)
@@ -720,10 +722,10 @@ v32PumpDuplex r blocks payload = go 0 (v32DataInit fs r) (v32DataInit fs r) quie
     go i po pa fromA bits acc
       | i >= blocks = (concat (reverse acc), v32DataEvm po)
       | otherwise =
-          let (po1, got) = v32DataRx fs Calling r po fromA
-              (pa1, _) = v32DataRx fs Answering r pa quiet
-              (pa2, audA) = v32DataTx fs Answering r 0.5 160 (take per bits) pa1
-              (po2, _) = v32DataTx fs Calling r 0.5 160 [] po1
+          let (po1, got) = v32DataRx fs Originate r po fromA
+              (pa1, _) = v32DataRx fs Answer r pa quiet
+              (pa2, audA) = v32DataTx fs Answer r 0.5 160 (take per bits) pa1
+              (po2, _) = v32DataTx fs Originate r 0.5 160 [] po1
           in go (i + 1) po2 pa2 audA (drop per bits) (got : acc)
 
 -- The calling modem's V.32 decision error at the end of a call.
@@ -758,8 +760,8 @@ v32ListenTests = testGroup "the retrain listener does not hear data"
             in (l', max worst (if v32ListenRetrain (other dir) l' then 1 else 0 :: Int))
           (_, fired) = foldl step (v32ListenInit 8000 (other dir), 0) (chunksOf 160 sig)
       assertEqual "a data signal asked for a retrain" 0 fired
-  | r <- allV32Rates, dir <- [Calling, Answering] ]
-  where other d = case d of { Calling -> Answering; Answering -> Calling }
+  | r <- allV32Rates, dir <- [Originate, Answer] ]
+  where other d = case d of { Originate -> Answer; Answer -> Originate }
 
 v32StartTests :: TestTree
 v32StartTests = testGroup "V.32 start-up per Figure 4"
@@ -772,8 +774,8 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
       -- is the block plumbing, and that is the same at every rate.
       forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
         let payload = prbs (11, 9) 6000
-            sig = v32Modulate 8000 Answering r 0.5 payload
-            step (st, acc) blk = let (st', bs) = v32DataRx 8000 Calling r st blk
+            sig = v32Modulate 8000 Answer r 0.5 payload
+            step (st, acc) blk = let (st', bs) = v32DataRx 8000 Originate r st blk
                                  in (st', acc ++ bs)
             (_, got) = foldl step (v32DataInit 8000 r, []) (chunksOf 160 sig)
             best = minimum [ (length (filter id (zipWith (/=) (drop 500 payload) (drop o got))), o)
@@ -784,12 +786,12 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
       forM_ [V32R4800, V32R9600, V32R9600T] $ \r -> do
         let payload = prbs (11, 9) 6000
             step (st, acc) chunk =
-              let (st', a) = v32DataTx 8000 Answering r 0.5 160 chunk st
+              let (st', a) = v32DataTx 8000 Answer r 0.5 160 chunk st
               in (st', acc ++ [a])
             perBlock = rateBitsPerSymbol r * 48
             chunks = takeWhile (not . null) (map (\i -> take perBlock (drop (i * perBlock) payload)) [0 .. 60])
             (_, blocks) = foldl step (v32DataInit 8000 r, []) chunks
-            got = v32Demodulate 8000 Calling r (VS.concat blocks)
+            got = v32Demodulate 8000 Originate r (VS.concat blocks)
             best = minimum [ (length (filter id (zipWith (/=) (drop 500 payload) (drop o got))), o)
                            | o <- [0 .. 800] ]
         assertBool ("block transmitter, " ++ show r ++ ": " ++ show (length got) ++ " bits, best " ++ show best)
@@ -823,8 +825,8 @@ v32StartTests = testGroup "V.32 start-up per Figure 4"
                 | otherwise = case v32StartStep st (VS.replicate 160 0) of
                     (_, _, V32Failed why) -> (Just why, fromIntegral t * 160 / fs)
                     (st', _, _) -> go (t + 1) st'
-          (unbounded, tUnb) = run (v32StartAfterAnswerTone fs Answering allRates) 40
-          (offered, tOff) = run (v32StartOffer fs Answering allRates 2.0) 40
+          (unbounded, tUnb) = run (v32StartAfterAnswerTone fs Answer allRates) 40
+          (offered, tOff) = run (v32StartOffer fs Answer allRates 2.0) 40
       assertEqual "the unbounded form still gives up" (Just "no calling modem") unbounded
       assertBool ("unbounded gave up after " ++ show tUnb ++ " s, wanted well past Note 5's three")
         (tUnb > 3 && tUnb < 30)

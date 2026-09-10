@@ -68,8 +68,7 @@
 -- the V.22 receiver's phase-step quality decides: unscrambled ones give
 -- exact 270 degree steps, 2225 Hz gives steps 15 degrees off.
 module Modec.Handshake
-  ( Link (..)
-  , HsConfig (..)
+  ( HsConfig (..)
   , defaultHsConfig
   , withModes
   , TxCmd (..)
@@ -84,50 +83,17 @@ module Modec.Handshake
   , noHsIn
   , handshakeStep
   , handshakeStage
-  , linkFor
-  , v22LinkAt
   ) where
 
 import Data.Maybe (listToMaybe)
 import Modec.Detect
 import Modec.Standards
 import Modec.Stream
-import Modec.V22 (Rate (..), TxMode (..), V22Channel (..))
-import Modec.V32 (V32Rate (..))
+import Modec.Link
+import Modec.V22 (TxMode (..))
 import Modec.V8
 import Data.Word (Word8)
 
-
--- | The channels of an established connection: our transmit side and
--- our receive side.
-data Link
-  = FskLink FskSpec FskSpec
-  | V22Link V22Channel V22Channel Rate
-  -- | V.32 is symmetric -- one carrier, one rate, the same both ways --
-  -- so a link is just which end we are and what was settled on.
-  | V32Link Role V32Rate
-  deriving (Eq, Show)
-
--- | The link a standard runs on, at its own rate.
-linkFor :: Role -> Standard -> Link
-linkFor Originate Bell103 = FskLink bell103Originate bell103Answer
-linkFor Answer Bell103 = FskLink bell103Answer bell103Originate
-linkFor Originate V21 = FskLink v21Channel1 v21Channel2
-linkFor Answer V21 = FskLink v21Channel2 v21Channel1
--- The caller has the 75 bit/s backward channel and listens to the 1200
--- bit/s forward one; the answerer, which is the end with something to
--- say, has it the other way round.
-linkFor Originate V23 = FskLink v23Backward v23Forward
-linkFor Answer V23 = FskLink v23Forward v23Backward
-linkFor role Bell212A = v22LinkAt role R1200
-linkFor role V22 = v22LinkAt role R1200
-linkFor role V22bis = v22LinkAt role R2400
-linkFor role V32 = V32Link role V32R9600T
-linkFor role V32bis = V32Link role V32R9600T
-
-v22LinkAt :: Role -> Rate -> Link
-v22LinkAt Originate r = V22Link LowChannel HighChannel r
-v22LinkAt Answer r = V22Link HighChannel LowChannel r
 
 data HsConfig = HsConfig
   { hcRole        :: Role

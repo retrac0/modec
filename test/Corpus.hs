@@ -45,6 +45,7 @@ import System.FilePath (dropExtension, replaceExtension, (</>))
 import Test.Tasty
 import Test.Tasty.HUnit
 
+import Modec.Link
 import Modec.DSP (Signal)
 import Modec.FSK
 import Modec.Handshake (hcV8)

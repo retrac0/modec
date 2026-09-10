@@ -8,6 +8,7 @@ import Data.List (isInfixOf)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
+import Modec.Link
 import Modec.Handshake
 import Modec.Modem
 import Modec.Telnet

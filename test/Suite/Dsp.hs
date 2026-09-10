@@ -6,6 +6,8 @@ import Control.Monad (forM_)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
 import Test.Tasty.HUnit
+import Modec.Standards
+import Modec.Link
 import Modec.Detect
 import Modec.Scrambler (lfsr)
 import qualified Modec.Scrambler as Scr
@@ -172,7 +174,7 @@ stageTests = testGroup "pump receivers do not depend on the block size"
 
   , testCase "V.32 at 9600 bit/s" $ do
       let bits = prbs (11, 9) 2000
-          sig = v32Modulate 8000 Calling V32R9600 0.5 bits
+          sig = v32Modulate 8000 Originate V32R9600 0.5 bits
           p = v32Params 8000
           at c = concatStage (qamReceiver p (v32RxCfg V32R9600)) (chunksOf c sig)
       forM_ [7, 160, 1000, 4096] $ \c ->
