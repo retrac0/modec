@@ -52,6 +52,7 @@ import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 import Modec.Sample
 import Modec.Session
+import Serial (withSerial)
 import Modec.Wav (closeWav, openWav16Mono, wavAppend)
 
 data AudioIO
@@ -62,6 +63,7 @@ data AudioIO
   | AudioSipLoop String              -- ^ PipeWire loopback pair for a softphone; the prefix names the nodes
   | AudioFiles FilePath FilePath     -- ^ raw mono in 'moFormat': input, output (files or FIFOs)
   | AudioStdio                       -- ^ raw mono in 'moFormat' on stdin/stdout
+  | AudioSerial FilePath             -- ^ a voice-mode modem on this serial port: the line itself
 
 -- | The audio interface the main loop sees.  Reading is the clock: a
 -- short read means the capture stream stopped, and 'aiRestart' offers to
@@ -136,10 +138,14 @@ defaultModemOpts = ModemOpts
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
 
--- | The format the audio moves in: what was asked for, else s16, which
--- is what every sound card and pipe here has always carried.
+-- | The format the audio moves in: what was asked for, else what the
+-- backend naturally carries -- s16 for every sound card and pipe, and
+-- for a voice-mode modem its 14-bit linear, the most it offers.
 audioFormat :: ModemOpts -> SampleFormat
-audioFormat o = maybe S16 id (moFormat o)
+audioFormat o = case (moFormat o, moAudio o) of
+  (Just f, _) -> f
+  (Nothing, AudioSerial _) -> Pcm14
+  _ -> S16
 
 runModem :: ModemOpts -> IO ()
 runModem o = do
@@ -802,6 +808,8 @@ pwCatFormat f = case f of
 withAudio' :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> IO a
 withAudio' aio fmt rate role body pwLatencyEnv = case aio of
   AudioStdio -> body (handleIf fmt stdin stdout)
+  AudioSerial dev -> withSerial dev fmt rate role logMsg $ \rd wr ->
+    body (sampleIf fmt rd wr (return False))
   AudioFiles i o -> do
     -- Blocking POSIX opens (GHC's openFile opens FIFOs non-blocking and
     -- fails with ENXIO when no reader exists yet).  Each FIFO open waits

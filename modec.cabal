@@ -68,6 +68,8 @@ executable modec
     other-modules:    Modem
                       CallLog
                       Dial
+                      Serial
+                      FakeDongle
                       PipewireIO
                       Paths_modec
     autogen-modules:  Paths_modec

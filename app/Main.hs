@@ -11,6 +11,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeFileName, (</>))
 
 import Dial
+import FakeDongle
 import qualified Modec.Channel as Ch
 import Modec.Link
 import Modec.Modem
@@ -55,6 +56,7 @@ data Cmd
   | DialOut DialOpts
   | AnswerIn AnswerOpts
   | ListDevices
+  | FakeDongleCmd FakeOpts
 
 -- | Reading a recording back through the whole modem, and optionally
 -- minting a test fixture out of what came back.
@@ -102,6 +104,7 @@ cmdP = hsubparser
   <> command "answer" (info answerP (progDesc "Register over SIP and answer incoming calls, greeting the caller"))
   <> command "modem"  (info modemP  (progDesc "Run a live modem: audio via PipeWire or raw pipes, data via telnet"))
   <> command "devices" (info (pure ListDevices) (progDesc "List the PipeWire audio devices usable with --pw-in / --pw-out"))
+  <> command "fake-dongle" (info fakeP (progDesc "Fake a voice-mode USB modem on a pseudo-terminal, with a modem behind it, for --audio-serial"))
   )
   where
     decodeP = Decode <$> stdP <*> channelP
@@ -140,6 +143,17 @@ cmdP = hsubparser
       <*> argument str (metavar "FILE.wav"))
     progressP = ProgressOf <$> argument str (metavar "FILE.wav")
     dtmfP = DtmfOf <$> argument str (metavar "FILE.wav")
+    fakeP = FakeDongleCmd <$> (FakeOpts
+      <$> option (maybeReader formatNamed) (long "format" <> value Pcm14 <> metavar "FMT"
+             <> help "the +VSM format the dongle streams in: pcm14, ulaw, alaw, u8 or s8 (default pcm14)")
+      <*> flag Originate Answer (long "far-answers"
+             <> help "the modem behind the line answers rather than calls, so nothing rings")
+      <*> (modesP <|> pure allStandards)
+      <*> strOption (long "say" <> value "" <> metavar "TEXT" <> help "what the far end sends once connected")
+      <*> optional (strOption (long "heard" <> metavar "FILE" <> help "write what the far end received here (default: stderr)"))
+      <*> optional (strOption (long "record" <> metavar "FILE.wav" <> help "record what arrived over the port, as 16-bit PCM"))
+      <*> optional (strOption (long "play" <> metavar "FILE.wav" <> help "stream this recording instead of a modem's audio"))
+      <*> option auto (long "seconds" <> value 30 <> showDefault <> help "end the stream after this much audio"))
     modemP = RunModem <$> (ModemOpts
       <$> option auto (long "rate" <> value 8000 <> showDefault <> help "sample rate")
       <*> option auto (long "block-ms" <> value 20 <> showDefault <> help "audio block length")
@@ -278,6 +292,8 @@ cmdP = hsubparser
                      <*> strOption (long "audio-out" <> metavar "RAW" <> help "and to write")
       <|> AudioSipLoop <$> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> help "PipeWire loopback pair for a softphone (nodes PREFIX-to-sip / PREFIX-line and sip-to-PREFIX / PREFIX-sip-line)")
       <|> flag' AudioStdio (long "audio-stdio" <> help "headerless mono audio on stdin/stdout, in --audio-format")
+      <|> AudioSerial <$> strOption (long "audio-serial" <> metavar "DEV"
+             <> help "a voice-mode USB modem (AT+FCLASS=8) on this serial port, e.g. /dev/ttyACM0: the line itself, at 8000 Hz. --audio-format defaults to pcm14 here")
     pipewireP = mkPw
       <$> optional (strOption (long "pw-in" <> metavar "DEV" <> help "capture device: node id, name, or part of either (see: modec devices)"))
       <*> optional (strOption (long "pw-out" <> metavar "DEV" <> help "playback device: node id, name, or part of either"))
@@ -347,6 +363,7 @@ main = do
       writeWavMono fmt out rate $ if isTty std
         then txFilter fs spec (VS.map (* amp) (modulateKeyed fs spec burst))
         else encodeBytes fs spec framing8N1 amp 0.5 0.2 (B.unpack bytes)
+    FakeDongleCmd fo -> runFakeDongle fo
     ListDevices -> do
       ns <- pwAudioNodes
       if null ns
