@@ -14,6 +14,7 @@ library
     exposed-modules:  Modec.DSP
                       Modec.Stream
                       Modec.Sample
+                      Modec.Voice
                       Modec.Wav
                       Modec.G711
                       Modec.FSK
@@ -109,6 +110,7 @@ test-suite modec-test
                       Suite.Link
                       Suite.Mnp
                       Suite.Sample
+                      Suite.Voice
                       Suite.Session
                       Suite.Tones
                       Suite.Tools

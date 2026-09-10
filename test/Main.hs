@@ -19,6 +19,7 @@ import Suite.Tones
 import Suite.Tools
 import Suite.V22
 import Suite.V32
+import Suite.Voice
 
 main :: IO ()
 main = do
@@ -44,7 +45,7 @@ main = do
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"
-        [hayesTests, baresipTests, pipewireTests, sessionTests, hermeticTests]
+        [hayesTests, baresipTests, pipewireTests, sessionTests, voiceTests, hermeticTests]
     , testGroup "tones as meaning"
         [ttyTests, dtmfTests, progressTests]
     ]
