@@ -166,6 +166,78 @@ signal R2`.
 genuine Bell answerer, which `bbslist.txt` records as never having been
 achieved against any of the twelve boards that were tried. T2.2 is done.
 
+### The second batch, same day
+
+Re-run with a 24 s read window, Bell 103 and V.21 are clean both ways
+(496/496, 464/464), so every row from 300 to 2400 bit/s now stands
+without a footnote. Six of these calls are in `test/fixtures/live/` as
+`cx93001-*`, the first `role: answer` fixtures in the corpus.
+
+| Test | Reference | modec | Result |
+| --- | --- | --- | --- |
+| V.8, T2.3 | `AT+MS=V32B,1,4800,14400` | `--v8` | **V.8 works**: modec's answering CM/JM exchange landed `CONNECT V32bis 14400` against a real menu -- then the 14400 receiver fault, as everywhere |
+| automode, no V.8 | same | no `--v8` | connected 14400, retrained, **`now running at 12000 bit/s`** -- T3.2's rate renegotiation, seen for the first time -- then the 12000 receiver fault |
+| LAPM, T3.4 | `AT\N3` at V.22bis | `--mnp` | **fails the criterion**: 19 s after CONNECT, `MNP link down: no reply to the link request`, and the call drops |
+| guard tone, T3.5 | `AT&G2` at V.22bis, as caller | -- | first call timed out in `AV22Ones2400`; **repeat was clean both ways**. Not a guard-tone effect: a caller does not send one, and 1800 Hz is barely in the audio (peak 0.02). T3.5 proper needs the reference answering, which is blocked (below) |
+
+**Intermittent, and counted.** Three calls out of about twenty on
+otherwise clean modes failed once and passed on repeat: an 8-byte
+burst in V.22, a corrupt receive at V.32bis 9600, a handshake timeout
+at V.22bis. Roughly one call in seven. Nothing yet says whether that
+is the SIP leg, the ATA, or modec; the recordings of the failed ones
+are kept, and the answer is a job for the channel simulator once one
+of them has been read.
+
+The LAPM one is worth the words. `Modec.Mnp` implements A.7.2.2
+faithfully: link requests unanswered *and* damaged frames seen means
+there is a protocol over there, so it sends LD to say goodbye. A LAPM
+modem's XID and SABME are exactly "damaged frames" to an MNP framer,
+and a V.42 modem that receives an MNP disconnect hangs up. So the pair
+never reaches the "no error correction" outcome the option promises;
+the disconnect modec sends is what ends the call. The far end in `\N3`
+would have fallen back to plain mode on its own if modec had simply
+gone quiet. That is a fix, not a finding to live with.
+
+### What the failures are, read offline
+
+Every failed start-up above is reproducible from its recording with
+`modec replay --answer`, which turns a bench afternoon into a unit:
+
+- **Plain V.32 (`--mode v32`, 4800 and 9600) is not silent, it is
+  slow.** Replay: AR1 at 16.5 s, ATrainR2 at 18.7, ACond2 at 21.6,
+  **AR3 at 22.3, and nothing after.** AR3 in `Modec.V32Start` has two
+  exits: signal E, or 80000 symbols later `no E from the calling
+  modem`. A plain V.32 caller sends R2, reads R3, and goes to data --
+  there is no E in V.32, only in V.32bis §5.3.2. The Conexant pinned
+  to `V32` does exactly that, modec waits 33 s for an E that cannot
+  come, and the reference's S7 gives up first. **modec cannot answer a
+  V.32 modem that is not a V.32bis modem.** Loopback never showed it
+  because both ends were modec, and modec always sends E.
+- **7200 is the opposite: R2 is there and unread.** `v32trace` on the
+  recording finds `rate signal 7200 tcm (V.32bis)` from the reference
+  at 17.36 s, after modec's own R1 of the same at 16.48; replay sits
+  in ATrainR2 until 51.96 s and fails `no rate signal R2`. At 9600 the
+  same modem sends a plain-V.32 R2 (`rate signal 9600`) and modec
+  connects; at 12000 and 14400 it sends V.32bis R2s and modec
+  connects. What is different about 7200's is not yet known, and the
+  recording is `recordings/20260910T173045-1001.wav`.
+- **On a real modem's idle, this receiver emits junk.** At V.32 9600,
+  after the payload and before the far end hung up, ~500 spurious
+  bytes over 18 s of scrambled ones. The 9600 fixture is cut at 16.5 s
+  to keep that out of the reference decode.
+
+### Roles reversed: blocked at the ATA
+
+T1.1 wants both directions. With modec dialling, the HT802V2 **ignores
+every SIP message from this host** -- INVITE, OPTIONS, on 5060 and
+5062, not even a 100 Trying -- while cheerfully sending REGISTERs that
+baresip cannot honour. It originates with `Outgoing Call without
+Registration` but will not terminate a call from a proxy it is not
+registered to. Two ways out: a setting in the ATA that accepts inbound
+from the proxy while unregistered, or a real registrar. `opensips` is
+in `extra`; Asterisk is AUR and also buys the progress tones and
+per-leg recording in [asterisk/](asterisk/).
+
 ## Tier 1 — the questions that are open now
 
 ### T1.1 Does modec's 14400 receiver carry a real modem's data?

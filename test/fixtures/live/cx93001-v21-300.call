@@ -1,0 +1,9 @@
+# 20260910T172545-1001.wav
+seconds:   27.5
+role:      answer
+modes:     v21
+v8:        no
+connect:   V21 300
+retrains:  0
+expect:    
+tolerance: 0

@@ -1,0 +1,18 @@
+# A Conexant CX93001 (`AT+MS=B212,0,1200,1200`, `AT\N0 AT%C0`) dialling in through
+# a Grandstream HT802V2 over SIP, 10 Sep 2026, modec answering.  The
+# first fixtures where modec was the answering side: everything before
+# these was `role: originate`, because a replay cannot answer a modem
+# that speaks first.  The far end sent a known 464-byte pattern, so what
+# it said is known rather than guessed.
+# The first Bell 212A call this project ever completed: twelve BBSes
+# were tried before this and every one answered ANSam then V.22.
+source:    recordings/20260910T172629-1001.wav
+seconds:   24.0
+role:      answer
+modes:     bell212a
+v8:        no
+connect:   Bell212A 1200
+retrains:  0
+expect:    B0000 pack my box with five dozen liquor jugs 9876543210
+expect:    B0007 pack my box with five dozen liquor jugs 9876543210
+tolerance: 0

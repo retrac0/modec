@@ -1,0 +1,16 @@
+# A Conexant CX93001 (`AT+MS=V22,0,1200,1200`, `AT\N0 AT%C0`) dialling in through
+# a Grandstream HT802V2 over SIP, 10 Sep 2026, modec answering.  The
+# first fixtures where modec was the answering side: everything before
+# these was `role: originate`, because a replay cannot answer a modem
+# that speaks first.  The far end sent a known 464-byte pattern, so what
+# it said is known rather than guessed.
+source:    recordings/20260910T173659-1001.wav
+seconds:   24.0
+role:      answer
+modes:     v22
+v8:        no
+connect:   V22 1200
+retrains:  0
+expect:    B0000 pack my box with five dozen liquor jugs 9876543210
+expect:    B0007 pack my box with five dozen liquor jugs 9876543210
+tolerance: 0

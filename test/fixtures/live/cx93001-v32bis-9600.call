@@ -1,0 +1,9 @@
+# 20260910T173744-1001.wav
+seconds:   16.5
+role:      answer
+modes:     v32bis
+v8:        no
+connect:   V32 9600
+retrains:  0
+expect:    
+tolerance: 0

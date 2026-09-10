@@ -1,0 +1,9 @@
+# 20260910T172504-1001.wav
+seconds:   24.5
+role:      answer
+modes:     bell103
+v8:        no
+connect:   Bell103 300
+retrains:  0
+expect:    
+tolerance: 0
