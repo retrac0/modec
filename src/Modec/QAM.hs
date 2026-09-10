@@ -44,13 +44,13 @@ module Modec.QAM
   , qamRxTiming
   , qamRxUnlock
   , quarterTurns
-    -- * Phase reversal tracking
-  , RevTracker
-  , revInit
-  , revRearm
-  , revBlock
-  , revLevel
-  , revPower
+  , qamRxEnergy
+    -- * Starting a receiver somewhere other than at rest
+  , QamRxSeed (..)
+  , defaultSeed
+  , qamRxInitWith
+    -- * What a restart predicate sees
+  , QamTap (..)
   ) where
 
 import qualified Data.Vector.Storable as VS
@@ -93,6 +93,45 @@ data QamRxCfg = QamRxCfg
   , qrPower     :: !Double  -- ^ mean square of the constellation (the AGC target)
   , qrSlice     :: (Double, Double) -> Int          -- ^ nearest point, as an index
   , qrPoint     :: Int -> (Double, Double)          -- ^ that index back to a point
+    -- The fields below exist so that V.22 can be this receiver too.
+    -- Each reproduces one measured difference between the two pumps as a
+    -- parameter, and each default is what V.32 always did.
+  , qrSteerAt   :: !Int
+    -- ^ distinct decisions among the last eight before the timing loop
+    -- is steered at all.  A steady tone is one point and says nothing
+    -- about where in the symbol the samples fall; V.32 wants two, V.22
+    -- steers unconditionally.
+  , qrAdaptAt   :: !Int
+    -- ^ ...and before the equaliser adapts.  A one- or two-point signal
+    -- has a singular autocorrelation and runs the taps away.
+  , qrAdaptRun  :: !Int
+    -- ^ consecutive identical phase steps that also stop the equaliser:
+    -- V.22's way of asking the same question of unscrambled ones.
+  , qrFreqFf    :: !Double
+    -- ^ weight of the measured phase-step deviation in the frequency
+    -- estimate, or 0 for none.  The differential path sees the carrier
+    -- offset directly, as the signed deviation of each step from the
+    -- nearest quarter turn; V.22 uses it to pull the estimate in during
+    -- 1200 bit/s training so the decision-directed loop only tracks the
+    -- residual.
+  , qrFreqFfRun :: !Int     -- ^ ...suppressed while the step has been constant this long
+  , qrEvmBad    :: !(Maybe Double)
+    -- ^ decision error power a symbol is counted as bad above, towards
+    -- 'qrEvmGiveUp'; 'Nothing' means 'qrEvmFreeze', which is what it
+    -- always was.
+  , qrRestartOn :: QamTap -> Bool
+    -- ^ start the coherent path over on this symbol, in addition to the
+    -- give-up count.  Mid-block, because it has to take effect for the
+    -- rest of the block: V.22 restarts on the 93rd symbol of the
+    -- answerer's unscrambled ones.
+  }
+
+-- | What 'qrRestartOn' is shown, per symbol.
+data QamTap = QamTap
+  { qtStep    :: !Int      -- ^ this symbol's phase step, in quarter turns
+  , qtStepRun :: !Int      -- ^ how many symbols running it has been the same
+  , qtEvm     :: !Double   -- ^ the tracked decision error power
+  , qtSyms    :: !Int      -- ^ symbols since the receiver last started over
   }
 
 -- | Gains that work at 2400 baud with a unit-mean-power constellation.
@@ -125,7 +164,10 @@ defaultRxCfg slice point = QamRxCfg
   , qrAgcRate = 0.05, qrAgcSettled = 0.05
   , qrLockAt = 1 / 0, qrLoopGate = 1 / 0
   , qrEvmFreeze = 0.4, qrEvmGiveUp = 200, qrAdapt = True, qrTrack = True, qrPower = 1
-  , qrSlice = slice, qrPoint = point }
+  , qrSlice = slice, qrPoint = point
+  , qrSteerAt = 2, qrAdaptAt = 3, qrAdaptRun = maxBound
+  , qrFreqFf = 0, qrFreqFfRun = maxBound
+  , qrEvmBad = Nothing, qrRestartOn = const False }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -204,6 +246,12 @@ data QamSym = QamSym
   , qsIndex    :: !Int               -- ^ the immediate decision
   , qsError    :: !Double            -- ^ squared distance to it
   , qsRaw      :: !(Double, Double)  -- ^ before gain, carrier and equaliser
+  , qsStep     :: !Int
+    -- ^ phase advance from the previous raw symbol, in quarter turns:
+    -- the differential decision, which owes nothing to the carrier loop
+  , qsDev      :: !Double
+    -- ^ that advance's signed deviation from the nearest quarter turn,
+    -- in radians: the carrier offset, seen directly
   } deriving (Eq, Show)
 
 -- | Phase advance from one symbol to the next, in quarter turns.
@@ -249,20 +297,43 @@ data QamRxState = QamRxState
   , rxLocked  :: !Bool   -- ^ the error has once been under 'qrLockAt'
   , rxSyms    :: !Int    -- ^ symbols since the receiver last started over
   , rxTiming  :: !Bool   -- ^ the timing loop has been on the pulse and may narrow
+  , rxLastStep :: !Int   -- ^ the previous symbol's phase step
+  , rxStepRun :: !Int    -- ^ symbols running the step has been the same
+  , rxEnergy  :: !Double -- ^ mean matched-filter power over the last block
+  , rxSeed    :: QamRxSeed  -- ^ where 'qamRxReset' returns to
   }
 
+-- | The values a receiver starts from.  Two pumps that are one machine
+-- did not start it in the same place: V.22 began a symbol later, with
+-- the previous symbol at (1, 0) and the error estimate at 1, and the
+-- first Gardner error and first differential step follow from those.
+data QamRxSeed = QamRxSeed
+  { srTau0   :: !Double            -- ^ added to the timing offset, in samples
+  , srPower0 :: !Double            -- ^ the power estimate
+  , srEvm0   :: !Double            -- ^ the error estimate, here and after every reset
+  , srPrev0  :: !(Double, Double)  -- ^ the previous raw symbol
+  } deriving (Eq, Show)
+
+-- | At rest, which is where V.32 always started.
+defaultSeed :: QamRxSeed
+defaultSeed = QamRxSeed 0 0 0 (0, 0)
+
 qamRxInit :: QamParams -> QamRxCfg -> QamRxState
-qamRxInit p cfg = QamRxState
+qamRxInit p cfg = qamRxInitWith p cfg defaultSeed
+
+qamRxInitWith :: QamParams -> QamRxCfg -> QamRxSeed -> QamRxState
+qamRxInitWith p cfg seed = QamRxState
   { rxN = 0
   , rxHistRe = VS.replicate hist 0, rxHistIm = VS.replicate hist 0
   , rxPrevRe = VS.replicate carry 0, rxPrevIm = VS.replicate carry 0
-  , rxTau = fromIntegral carry, rxSps = sps
-  , rxPrevSym = (0, 0), rxPower_ = 0
+  , rxTau = fromIntegral carry + srTau0 seed, rxSps = sps
+  , rxPrevSym = srPrev0 seed, rxPower_ = srPower0 seed
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
-  , rxTiming = False }
+  , rxEvm_ = srEvm0 seed, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
+  , rxTiming = False
+  , rxLastStep = 0, rxStepRun = 0, rxEnergy = 0, rxSeed = seed }
   where
     sps = samplesPerSymbol p
     taps = qrEqTaps cfg
@@ -280,7 +351,7 @@ qamRxReset _ cfg st = st
   , rxEqRe = VS.generate taps (\i -> if i == 2 * (taps `div` 4) then 1 else 0)
   , rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
-  , rxEvm_ = 0, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
+  , rxEvm_ = srEvm0 (rxSeed st), rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
   , rxTiming = False }
   where taps = qrEqTaps cfg
 
@@ -298,6 +369,10 @@ kernel p = rrcKernel (qpFs p) (qpBaud p) (qpRollOff p) (qpSpan p)
 
 qamRxEvm :: QamRxState -> Double
 qamRxEvm = rxEvm_
+
+-- | Mean matched-filter power over the last block.
+qamRxEnergy :: QamRxState -> Double
+qamRxEnergy = rxEnergy
 
 -- | How long the gain chases its own input before settling down.  A
 -- fifth of a second at 2400 baud: long enough for a receiver starting
@@ -363,6 +438,19 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               yr = cubicAt extRe tau; yi = cubicAt extIm tau
               hr = cubicAt extRe (tau - sps / 2); hi = cubicAt extIm (tau - sps / 2)
               (pr, pim) = rxPrevSym st
+              -- The differential decision: this symbol against the
+              -- last, before gain, carrier or equaliser.  The same
+              -- arithmetic as 'quarterTurns', per symbol, because three
+              -- things inside the loop act on it for the *next* symbol
+              -- -- the frequency feed-forward, the equaliser gate and
+              -- the restart predicate -- and could not be fed from
+              -- outside.
+              dr = yr * pr + yi * pim
+              di = yi * pr - yr * pim
+              ang = atan2 di dr
+              step = (round (ang / (pi / 2)) :: Int) `mod` 4
+              dev = ang - fromIntegral (round (ang / (pi / 2)) :: Int) * (pi / 2)
+              stepRun = if step == rxLastStep st then rxStepRun st + 1 else 0
               -- The gain's own noise.  The power estimate is an
               -- exponential mean of the symbol samples, and the gain is
               -- the square root of its reciprocal: on the four training
@@ -489,7 +577,12 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- mean converged -- 'qrLockAt', not 'qrEvmFreeze' -- and
               -- not merely "still adapting".
               good = not (rxLocked st) || err2 < qrLoopGate cfg
-              freq' = if locked && qrTrack cfg && good then rxFreq st + qrThKi cfg * phErr else rxFreq st
+              -- Guarded on the weight rather than multiplied by it, so
+              -- a receiver with none is bit for bit what it was.
+              freqFf | qrFreqFf cfg > 0 && locked && stepRun < qrFreqFfRun cfg
+                         = (1 - qrFreqFf cfg) * rxFreq st + qrFreqFf cfg * dev
+                     | otherwise = rxFreq st
+              freq' = if locked && qrTrack cfg && good then freqFf + qrThKi cfg * phErr else rxFreq st
               theta' | not locked = th
                      | qrTrack cfg && good = wrapPi (th + freq' + qrThKp cfg * phErr)
                      | otherwise = wrapPi (th + freq')
@@ -500,7 +593,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- states, which is exactly why the Recommendation trains
               -- the equaliser with it and not with S.
               recent = take 8 (idx : rxRecent st)
-              varied = length (distinct recent) > 2
+              varied = length (distinct recent) >= qrAdaptAt cfg
               -- What the timing loop needs to steer on is weaker than
               -- what the equaliser needs to adapt on, and the difference
               -- is the conditioning signal.  S is an alternating pair:
@@ -510,7 +603,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- clock from.  Holding the timing loop to 'varied' as well
               -- froze it right through S, and the calling ladder then
               -- failed to recognise the conditioning signal at all.
-              moving = length (distinct recent) > 1
+              moving = length (distinct recent) >= qrSteerAt cfg
               lineP = max 1e-6 (VS.sum (VS.zipWith (\a b -> a * a + b * b) lineRe lineIm) / fromIntegral taps)
               -- Converged, as against merely adapting.  'qrEvmFreeze'
               -- is where the decisions stop being worth learning from at
@@ -543,6 +636,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               timing' = rxTiming st
                 || (qrTrackAt cfg > 0 && evm < qrTrackAt cfg && varied && rxSyms st >= 64)
               mu = if qrAdapt cfg && locked && evm < qrEvmFreeze cfg && varied && good
+                       && stepRun < qrAdaptRun cfg
                      then qrEqMu cfg / lineP else 0
               eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
               eqIm' = VS.zipWith3 (\w lr li -> w + mu * (errI * lr - errR * li)) (rxEqIm st) lineRe lineIm
@@ -556,7 +650,8 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- this a receiver handed a signal it cannot read -- the far
               -- end still finishing its start-up, say -- is ruined by it
               -- permanently rather than for as long as it lasts.
-              bad = if qrAdapt cfg && locked && evm > qrEvmFreeze cfg then rxBad st + 1 else 0
+              badAt = maybe (qrEvmFreeze cfg) id (qrEvmBad cfg)
+              bad = if qrAdapt cfg && locked && evm > badAt then rxBad st + 1 else 0
               st1 = st { rxTau = tau'
                        , rxSps = max (0.9 * nominalSps) (min (1.1 * nominalSps) sps')
                        , rxPrevSym = (yr, yi), rxPower_ = pw
@@ -565,15 +660,22 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                        , rxLineRe = lineRe, rxLineIm = lineIm
                        , rxEvm_ = evm, rxBad = bad, rxRecent = recent
                        , rxLocked = latched, rxSyms = rxSyms st + 1
-                       , rxTiming = timing' }
-              st2 = if bad >= qrEvmGiveUp cfg then qamRxReset p cfg st1 else st1
-          in go st2 (QamSym (ur, ui) idx err2 (yr, yi) : syms)
+                       , rxTiming = timing'
+                       , rxLastStep = step, rxStepRun = stepRun }
+              st2 = if bad >= qrEvmGiveUp cfg || qrRestartOn cfg (QamTap step stepRun evm (rxSyms st + 1))
+                      then qamRxReset p cfg st1 else st1
+          in go st2 (QamSym (ur, ui) idx err2 (yr, yi) step dev : syms)
 
     (stSym, symsOut) = go st0 []
     carry = VS.length (rxPrevRe st0)
     keepFrom = max 0 (len - carry)
+    -- What the matched filter put out this block, on average: the
+    -- handshake's evidence that anything is on this channel at all.
+    energy = if n == 0 then 0
+             else (VS.sum (VS.map (\v -> v * v) mfRe) + VS.sum (VS.map (\v -> v * v) mfIm)) / fromIntegral n
     st' = stSym
       { rxN = n0 + n
+      , rxEnergy = energy
       , rxHistRe = histRe', rxHistIm = histIm'
       , rxPrevRe = VS.drop keepFrom extRe, rxPrevIm = VS.drop keepFrom extIm
       , rxTau = rxTau stSym - fromIntegral keepFrom }
@@ -581,168 +683,3 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
 distinct :: [Int] -> [Int]
 distinct [] = []
 distinct (x : xs) = x : distinct (filter (/= x) xs)
-
--- | Finds the instant a steady tone reverses phase, to the sample.
---
--- The whole of V.32's start-up turns on phase reversals: the calling
--- modem's AA and CC are both a steady 1800 Hz tone and differ only by
--- 180 degrees, and the answering modem's AC and CA are the same trick at
--- 600 and 3000 Hz.  A magnitude tone bank cannot see any of it -- the
--- amplitude is identical either side of the event -- which is why V.32
--- signal detection does not go through "Modec.Detect" and why no 1800 Hz
--- bin is added to it.
---
--- Sample accuracy is not a refinement here but a requirement: §5.4.1
--- fixes the turnaround from hearing a reversal to sending one at
--- 64 +/- 2 symbol periods, which at 2400 baud is 26.67 +/- 0.83 ms,
--- and the handshake state machine only runs every 20 ms.  So the
--- receiver timestamps the event and the transmitter is given a sample
--- index to act on, rather than the tick being asked to do something it
--- cannot.
---
--- The method is a sliding coherent correlation against the tone.  Its
--- projection onto the phase established before the event runs from
--- strongly positive to strongly negative, and the crossing, interpolated
--- between the two straddling samples, is the reversal.
-data RevTracker = RevTracker
-  { rtW      :: !Double          -- ^ radians per sample at the tone
-  , rtN      :: !Int             -- ^ global sample index
-  , rtWin    :: !Int
-  , rtHist   :: [(Double, Double)]  -- ^ recent mixed samples, newest first
-  , rtAcc    :: !(Double, Double)   -- ^ running sum over the window
-  , rtRef    :: !(Maybe (Double, Double))  -- ^ phase before the event
-  , rtProj   :: !Double
-  , rtLevel  :: !Double
-  , rtPow    :: !Double          -- ^ tracked mean square of the input
-  , rtAge    :: !Int             -- ^ samples since the tracker was armed
-  , rtSeen   :: !Bool            -- ^ the tone has been steady in this phase
-  , rtHold   :: !Int             -- ^ samples to wait before reporting again
-  }
-
-revInit :: Double -> Double -> RevTracker
-revInit fs f = RevTracker
-  { rtW = 2 * pi * f / fs
-  , rtN = 0
-  -- A fixed 5 ms, not a fixed number of cycles.  Sizing the window by
-  -- the tone's own period gives the high tones too little frequency
-  -- resolution to reject the low ones: three cycles of 3000 Hz is 8
-  -- samples, over which a 2100 Hz answer tone does not average away at
-  -- all, and the tracker reads it as its own.
-  , rtWin = max 8 (round (fs / 200))
-  , rtHist = [], rtAcc = (0, 0)
-  , rtRef = Nothing, rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
-
--- | Forget what has been heard so far, but not what time it is.
---
--- The start-up hands a tracker a different signal several times over,
--- and the phase reference it established for the last one is worse than
--- useless for the next.  The sample counter has to survive, though: the
--- round trip is the difference between two reversal timestamps taken
--- either side of a re-arm, and restarting the clock between them
--- measures a negative delay.
-revRearm :: RevTracker -> RevTracker
-revRearm t = t
-  { rtHist = [], rtAcc = (0, 0), rtRef = Nothing
-  , rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
-
--- | How much of what is arriving is this tone, from 0 to about 0.71.
---
--- The measurement is the coherent correlation divided by the signal's
--- own root mean square, which is the only form of it that means
--- anything: an absolute threshold says \"this is loud\", and at any
--- realistic signal to noise ratio noise alone will clear it.  A single
--- tone reads about 0.71, either sideband of the alternating AC signal
--- about 0.5, and white noise about one over the square root of the
--- window length -- around 0.16 here.
-revLevel :: RevTracker -> Double
-revLevel = rtLevel
-
--- | The mean square of what the tracker is listening to.
---
--- 'revLevel' divides by this, so on a line with nothing on it the ratio
--- is noise over noise and can read anything at all.  Anyone using a
--- level as evidence that a particular tone is present has to check
--- there is a signal to have a tone in.
-revPower :: RevTracker -> Double
-revPower = rtPow
-
--- | Feed a block; returns the global sample indices at which the tone
--- reversed phase.
-revBlock :: Signal -> RevTracker -> (RevTracker, [Int])
-revBlock chunk st0 = go 0 st0 []
-  where
-    n = VS.length chunk
-    go !i st acc
-      | i >= n = (st, reverse acc)
-      | otherwise =
-          let t = rtN st
-              v = VS.unsafeIndex chunk i
-              c = cos (rtW st * fromIntegral t)
-              sn = sin (rtW st * fromIntegral t)
-              p = (v * c, negate v * sn)
-              hist' = take (rtWin st) (p : rtHist st)
-              (ar, ai) = foldl (\(x, y) (a, b) -> (x + a, y + b)) (0, 0) hist'
-              mag = sqrt (ar * ar + ai * ai) / fromIntegral (rtWin st)
-              pow = 0.995 * rtPow st + 0.005 * (v * v)
-              -- until there is something on the line at all, the ratio
-              -- is meaningless rather than large: an empty line divided
-              -- by an empty line must not read as a tone
-              lvl = if pow > 1e-12
-                      then 0.98 * rtLevel st + 0.02 * (mag / sqrt pow)
-                      else 0
-              -- everything below is gated on the band actually holding
-              -- this tone, not on the line being loud
-              -- A level is a correlation over the tracked mean square of
-              -- the input, and that average starts at nothing, so for
-              -- the first few milliseconds after the tracker is armed it
-              -- divides by almost zero and reads high whatever is on the
-              -- line.  Measured over a settled 50 ms window the
-              -- separation is not close -- the alternating pair reads
-              -- 0.32 and 0.63 on its two sidebands, and data, TRN and a
-              -- rate signal all read 0.07 or less -- so the threshold is
-              -- not the difficulty; the warm-up is.  A retrain builds
-              -- fresh trackers, and without this the first blocks of the
-              -- far end's data counted as the answering modem's tone,
-              -- which took this end through AA and CC and into the
-              -- silence of 5.4.1's fifth paragraph, where it stopped
-              -- transmitting the very signal 5.5.2 needs to see.
-              tone = rtAge st >= 4 * rtWin st && lvl > 0.25 && pow > 1e-10
-              full = length hist' >= rtWin st
-              -- the phase to measure against: whatever was established
-              -- before, adopted once the tone is steady
-              ref = case rtRef st of
-                Just r | rtHold st > 0 -> Just r
-                Just r -> Just r
-                Nothing | full && tone -> Just (ar / (mag * fromIntegral (rtWin st)), ai / (mag * fromIntegral (rtWin st)))
-                _ -> Nothing
-              proj = case ref of
-                Just (rr, ri) -> (ar * rr + ai * ri) / fromIntegral (rtWin st)
-                Nothing -> 0
-              -- The correlation does not step from one phase to the other:
-              -- the window slides across the event over its own length,
-              -- so the projection walks down through zero.  The event is
-              -- that crossing, and it only counts if the tone had been
-              -- steady in the old phase first -- which is what rtSeen
-              -- records, and what stops noise from ringing the bell.
-              seen = rtSeen st || (full && tone && proj > 0.5 * mag)
-              crossed = full && rtHold st == 0 && seen && tone
-                        && rtProj st > 0 && proj <= 0
-              st1 = st { rtN = t + 1, rtHist = hist', rtAcc = (ar, ai)
-                       , rtRef = if crossed then Nothing else ref
-                       , rtProj = proj, rtLevel = lvl, rtPow = pow
-                       , rtAge = rtAge st + 1
-                       , rtSeen = not crossed && seen && tone
-                       , rtHold = if crossed then rtWin st * 2 else max 0 (rtHold st - 1) }
-          in if crossed
-               -- the crossing lies between this sample and the last;
-               -- the correlation is linear across it, so interpolate
-               -- Interpolate between the two samples that straddle the
-               -- crossing.  Clamped: when both projections are close to
-               -- zero the ratio is numerically meaningless and would
-               -- place the event anywhere at all.
-               then let d = rtProj st - proj
-                        frac = if abs d < 1e-18 then 0.5
-                               else max 0 (min 1 (rtProj st / d))
-                        at = t - rtWin st `div` 2 + round frac
-                    in go (i + 1) st1 (at : acc)
-               else go (i + 1) st1 acc

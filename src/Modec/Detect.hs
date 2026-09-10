@@ -59,7 +59,7 @@ defaultToneBank :: ToneBankConfig
 defaultToneBank = ToneBankConfig
   -- 600 and 3000 are the answering V.32 modem's alternating pair.  A
   -- magnitude bank cannot see the phase reversals the start-up is built
-  -- from -- 'Modec.QAM.RevTracker' does that -- but it can see that the
+  -- from -- 'Modec.Reversal.RevTracker' does that -- but it can see that the
   -- pair is there at all, which is what 5.4.1 has the calling modem
   -- listen for before it commits to V.32.  Neither is within 300 Hz of
   -- anything else here.

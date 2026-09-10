@@ -16,7 +16,7 @@
 -- Nor does detection go through the tone bank.  AA and CC are the same
 -- 1800 Hz tone 180 degrees apart, and AC and CA the same pair at 600 and
 -- 3000 Hz: a bank that measures magnitude sees no event at any of the
--- four transitions the start-up is built from.  'Modec.QAM.RevTracker'
+-- four transitions the start-up is built from.  'Modec.Reversal.RevTracker'
 -- measures the phase instead.
 --
 -- The shape of Figure 4, and why it is shaped that way: the two modems
@@ -62,6 +62,7 @@ import Modec.Link
 import Modec.Standards (Role (..), answerToneItu)
 import Modec.DSP (Signal, blockOf, chunksOf)
 import Modec.QAM
+import Modec.Reversal
 import Modec.V32
 import Modec.V32Pump
 
