@@ -1,0 +1,4 @@
+# baresip registering to the bench PBX instead of a provider.  Copy over
+# ~/.baresip/accounts (see docs/baresip/accounts for the trunk version).
+# One codec, not two, so the SDP offer has nothing to choose between.
+<sip:2001@192.168.1.10>;auth_pass=CHANGEME-2001;audio_codecs=PCMU/8000/1;answermode=manual;regint=300;pubint=0
