@@ -148,21 +148,24 @@ data TxMode
   | TxSyncData          -- ^ raw synchronous bits, idling on HDLC flags (MNP framing mode 3)
   deriving (Eq, Show)
 
+-- | The V.22 transmitter: a QAM transmitter, plus the coder that says
+-- what the symbols are.
+--
+-- The pulse shaping, the symbol clock and the carrier were a copy of
+-- "Modec.QAM"'s, down to the expression that sums the pulse tails; what
+-- is here is Table 1's quadrant coding, the scrambler and the two
+-- queues feeding it.
 data V22TxState = V22TxState
-  { txSymClock :: !Double            -- ^ sample index (relative to the block) of the next symbol centre
-  , txSymT0    :: !Double            -- ^ centre of the first stored symbol
-  , txSymbols  :: [(Double, Double)] -- ^ stored symbols (unit-power complex), oldest first, sps apart from txSymT0
+  { txQam      :: !QamTxState
   , txQuadrant :: !Int
   , txScr      :: !Int
   , txS1Toggle :: !Bool
   , txBits     :: [Bool]
   , txQueue    :: [Word8]
-  , txCarrier  :: !Double
-  , txGuard    :: !Double
   }
 
 v22TxInit :: V22TxState
-v22TxInit = V22TxState 0 0 [] 0 0 False [] [] 0 0
+v22TxInit = V22TxState qamTxInit 0 0 False [] []
 
 -- | Octets still waiting to go on the line: queued bytes plus whatever
 -- part of the current character has not been shifted out yet.  A protocol
@@ -183,15 +186,21 @@ v22TxQueued = length . txQueue
 v22TxBlock :: Double -> V22Channel -> Framing -> Double -> Bool -> Rate -> TxMode -> [Word8] -> Int -> V22TxState -> (V22TxState, Signal)
 v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
   where
-    sps = fs / baud
-    fc = carrierOf ch
-    wc = 2 * pi * fc / fs
-    wg = 2 * pi * 1800 / fs
-    st1 = st0 { txQueue = txQueue st0 ++ newBytes }
-    stFilled = fill st1
-    fill st
-      | txSymClock st <= fromIntegral n + pulseSpan * sps = fill (emit st)
-      | otherwise = st
+    p = (v22Params fs ch)
+      { qpGuard = if guard && ch == HighChannel then Just (1800, 0.5) else Nothing }
+    -- Exactly the symbols this block has room for, and no more: the
+    -- coder must not be run speculatively -- every symbol it makes
+    -- advances the scrambler and the quadrant, and one made and not
+    -- sent is one the far end never sees the effect of.
+    want = qamTxSymbolsFor p n (txQam st0)
+    (stC, pts) = coded want (st0 { txQueue = txQueue st0 ++ newBytes }) []
+    coded 0 st acc = (st, reverse acc)
+    coded k st acc = let (st1, pt) = emit st in coded (k - 1 :: Int) st1 (pt : acc)
+    (qam', sig, _) = qamTxBlock p amp n pts (txQam stC)
+    st' = stC { txQam = qam' }
+
+    -- One symbol: a differential quadrant change from the first dibit,
+    -- and at 2400 bit/s a point within that quadrant from the second.
     emit st =
       let (b1, b2, stA) = case mode of
             TxS1 -> (txS1Toggle st, txS1Toggle st, st { txS1Toggle = not (txS1Toggle st) })
@@ -208,9 +217,7 @@ v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
             (R2400, TxSyncData) -> let (x, s1) = nextBit stA; (y, s2) = nextBit s1 in (x, y, s2)
             _ -> (False, True, stA)     -- 1200 bit/s and handshake signals use the "01" points
           (gx, gy) = gridPoint q b3 b4
-          t0 = if null (txSymbols st) then txSymClock st else txSymT0 st
-      in stB { txSymClock = txSymClock st + sps, txQuadrant = q, txSymT0 = t0
-             , txSymbols = txSymbols stB ++ [(gx * gridScale, gy * gridScale)] }
+      in (stB { txQuadrant = q }, (gx * gridScale, gy * gridScale))
     nextBit st = case mode of
       TxU11 -> (True, st)
       -- Synchronous: the bits arrive already framed from the protocol
@@ -234,31 +241,6 @@ v22TxBlock fs ch fr amp guard rate mode newBytes n st0 = (st', sig)
               [] -> scr True st { txQueue = q }
             [] -> scr True st
     scr b st = let (reg, s) = scrambleBit (txScr st) b in (s, st { txScr = reg })
-    symsRe = VS.fromList (map fst (txSymbols stFilled))
-    symsIm = VS.fromList (map snd (txSymbols stFilled))
-    nSyms = VS.length symsRe
-    t0s = txSymT0 stFilled
-    sig = VS.generate n $ \i ->
-      let t = fromIntegral i
-          kLo = max 0 (ceiling ((t - pulseSpan * sps - t0s) / sps))
-          kHi = min (nSyms - 1) (floor ((t + pulseSpan * sps - t0s) / sps))
-          accum !k !a !b
-            | k > kHi = (a, b)
-            | otherwise =
-                let p = rrcPulse rollOff ((t - (t0s + fromIntegral k * sps)) / sps)
-                in accum (k + 1) (a + p * VS.unsafeIndex symsRe k) (b + p * VS.unsafeIndex symsIm k)
-          (re, im) = accum kLo 0 0
-          th = txCarrier stFilled + wc * t
-          g = if guard && ch == HighChannel then 0.5 * sin (txGuard stFilled + wg * t) else 0
-      in amp * (re * cos th - im * sin th + g)
-    dropN = max 0 (floor ((fromIntegral n - (pulseSpan + 1) * sps - t0s) / sps)) :: Int
-    st' = stFilled
-      { txSymClock = txSymClock stFilled - fromIntegral n
-      , txSymT0 = t0s + fromIntegral dropN * sps - fromIntegral n
-      , txSymbols = drop dropN (txSymbols stFilled)
-      , txCarrier = wrapTwoPi (txCarrier stFilled + wc * fromIntegral n)
-      , txGuard = wrapTwoPi (txGuard stFilled + wg * fromIntegral n)
-      }
 
 -- | Pending data bits of a transmitter (for experiments and tests).
 txBitsOf :: V22TxState -> [Bool]

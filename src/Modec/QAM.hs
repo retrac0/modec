@@ -83,6 +83,16 @@ data QamParams = QamParams
   , qpCarrier :: !Double   -- ^ carrier frequency
   , qpRollOff :: !Double   -- ^ root-raised-cosine roll-off
   , qpSpan    :: !Double   -- ^ pulse span each side, in symbols
+  , qpGuard   :: Maybe (Double, Double)
+    -- ^ a guard tone added to the transmitted signal: its frequency in
+    -- Hz and its amplitude relative to the block's.  V.22's answering
+    -- modem puts 1800 Hz on the high channel at half amplitude
+    -- (§2.4\/V.22bis); V.32 has none.
+    --
+    -- It is summed inside the sample expression rather than added as a
+    -- second vector afterwards, which is not fussiness: the two differ
+    -- in the last bit, and this signal is compared against a recording
+    -- of what the code used to emit.
   } deriving (Eq, Show)
 
 samplesPerSymbol :: QamParams -> Double
@@ -203,10 +213,11 @@ data QamTxState = QamTxState
   , txSymT0    :: !Double
   , txSymbols  :: [(Double, Double)]
   , txCarrier  :: !Double
+  , txGuard    :: !Double   -- ^ guard tone phase, if 'qpGuard' asks for one
   }
 
 qamTxInit :: QamTxState
-qamTxInit = QamTxState 0 0 [] 0
+qamTxInit = QamTxState 0 0 [] 0 0
 
 -- | How many symbols a block of @n@ samples will consume.  Useful when
 -- the symbols are expensive to produce, or come from a coder that must
@@ -227,6 +238,9 @@ qamTxBlock p amp n syms0 st0 = (st', sig, rest)
     sps = samplesPerSymbol p
     wc = 2 * pi * qpCarrier p / qpFs p
     span_ = qpSpan p
+    wg = case qpGuard p of
+      Just (f, _) -> 2 * pi * f / qpFs p
+      Nothing -> 0
 
     -- pull symbols until the pulse tails of every sample in this block
     -- are covered
@@ -257,14 +271,18 @@ qamTxBlock p amp n syms0 st0 = (st', sig, rest)
                 in accum (k + 1) (a + g * VS.unsafeIndex symsRe k) (b + g * VS.unsafeIndex symsIm k)
           (re, im) = accum kLo 0 0
           th = txCarrier stF + wc * t
-      in amp * (re * cos th - im * sin th)
+          g = case qpGuard p of
+            Just (_, ga) -> ga * sin (txGuard stF + wg * t)
+            Nothing -> 0
+      in amp * (re * cos th - im * sin th + g)
 
     dropN = max 0 (floor ((fromIntegral n - (span_ + 1) * sps - t0s) / sps)) :: Int
     st' = stF
       { txSymClock = txSymClock stF - fromIntegral n
       , txSymT0 = t0s + fromIntegral dropN * sps - fromIntegral n
       , txSymbols = drop dropN (txSymbols stF)
-      , txCarrier = wrapTwoPi (txCarrier stF + wc * fromIntegral n) }
+      , txCarrier = wrapTwoPi (txCarrier stF + wc * fromIntegral n)
+      , txGuard = wrapTwoPi (txGuard stF + wg * fromIntegral n) }
 
 -- | One decided symbol.
 data QamSym = QamSym

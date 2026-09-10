@@ -81,7 +81,7 @@ v32RollOff = 0.25
 v32Params :: Double -> QamParams
 v32Params fs = QamParams
   { qpFs = fs, qpBaud = 2400, qpCarrier = 1800
-  , qpRollOff = v32RollOff, qpSpan = 12 }
+  , qpRollOff = v32RollOff, qpSpan = 12, qpGuard = Nothing }
 
 -- | The receiver's view of a rate.  On the trellis alternative the
 -- slicer here is the immediate one: it feeds the carrier and timing
