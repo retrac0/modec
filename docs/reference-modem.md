@@ -37,6 +37,29 @@ which is the signature of an acquisition outcome rather than an error
 process: one seed yields zero bytes on every run, another yields 42–49
 bytes for a 35-byte payload on every run.
 
+## 0a. Driving the bench: start the modem with the call, not before
+
+The first thing that will waste an hour. Over the SIP path, modec must
+be told about the call, not merely pointed at the audio:
+
+```
+modec modem --answer --sip 127.0.0.1:4444 --audio-sip-loop modec --hayes ...
+```
+
+with `ATS0=1` on the data side. `--sip` drives baresip over its
+`ctrl_tcp` module, so RING and ATA are real events and the modem starts
+at the instant the call is answered.
+
+Point modec at `--audio-sip-loop` *without* `--sip` and it starts
+listening the moment the process does, which is ten seconds or more
+before the ATA's INVITE arrives. V.22bis survives that -- its answering
+side waits indefinitely -- so the path looks fine. V.32 does not: its
+start-up is timed, and it gives up on a line that is still silent, with
+`connection failed: no calling modem` and a receive recording of
+digital zeroes. That reads exactly like broken audio routing and is
+not: check `pw-link -l` and you will find `baresip:output ->
+sip-to-modec` and `modec-line -> baresip:input` both correctly linked.
+
 ## 0. Topologies, and why you want both
 
 **A — through the ATA (SIP path).** Modem → ATA FXS → SIP → baresip →
@@ -82,7 +105,66 @@ ATS0=0                  do not auto-answer yet
 ```
 
 `\N0` matters more than it looks: with V.42/MNP left on you are testing
-the reference modem's error correction, not modec's modulation.
+the reference modem's error correction, not modec's modulation. On
+modec's side there is nothing to turn off: MNP is opt-in with `--mnp`,
+and `--no-mnp` is not an option the `modem` subcommand has.
+
+## The first sweep, 2026-09-10
+
+Every modulation the two implementations share, one call each, modec
+answering over SIP through an HT802V2, the reference a CX93001 pinned
+with `AT+MS=<mod>,0,<rate>,<rate>` and `AT\N0 AT%C0` so nothing but the
+modulation is under test.  A 496-byte pattern went modec to reference
+and a 464-byte one came back, compared byte for byte.
+
+| Standard | Rate | modec -> reference | reference -> modec |
+| --- | --- | --- | --- |
+| Bell 103 | 300 | clean (cut short by the harness) | **clean** 464/464 |
+| V.21 | 300 | clean (cut short by the harness) | **clean** 464/464 |
+| Bell 212A | 1200 | **clean** 496/496 | **clean** 464/464 |
+| V.22 | 1200 | **clean** 496/496 | **clean** 464/464 |
+| V.22bis | 2400 | **clean** 496/496 | **clean** 464/464 |
+| V.32 | 4800 | no connection | no connection |
+| V.32 | 9600 | no connection | no connection |
+| V.32bis | 7200 | `no rate signal R2` | — |
+| V.32bis | 9600 | **clean** 496/496 | **clean** 464/464 |
+| V.32bis | 12000 | 103 B of rubbish | nothing |
+| V.32bis | 14400 | 113 B of rubbish | nothing |
+
+The 300 bit/s rows are not failures: 496 bytes at 300 bit/s needs 16.5
+s and the harness read for 16, so what arrived was a clean prefix.
+Two rows needed a second run to settle -- V.22 showed one 8-byte burst
+at offset 287 and was clean on repeat, and V.32bis 9600 showed one
+corrupt receive and was clean on repeat -- so treat both as clean with
+an intermittent line event, and neither as a modulation fault.
+
+**What this answers.** The 12000 and 14400 failure is *not* modec
+talking to itself. Against a second implementation it fails the same
+way it fails in loopback, and modec says why:
+
+```
+CONNECT V32bis 14400 bit/s, 1800 Hz both ways, Answer, trellis coded
+retraining the link: this receiver could not read the line
+connection failed: no common rate
+NO CARRIER
+```
+
+It trains, cannot read what it trained on, asks for a retrain, and the
+retrain finds no common rate. So the "connects and delivers nothing"
+symptom is real, reproducible against hardware, and modec's own
+diagnosis of it points at the receive side -- while the transmit side
+is now proven good, because a Conexant read 496 bytes of modec's
+V.32bis 9600 without an error.
+
+**Newly open.** `--mode v32` (as against `v32bis`) never reached
+CONNECT at either 4800 or 9600, and logged *nothing at all* after `SIP
+call up, modem role Answer` -- a silent failure path worth a message
+before it is worth a fix. V.32bis at 7200 got as far as `no rate
+signal R2`.
+
+**Also settled here.** Bell 212A carried data both ways, against a
+genuine Bell answerer, which `bbslist.txt` records as never having been
+achieved against any of the twelve boards that were tried. T2.2 is done.
 
 ## Tier 1 — the questions that are open now
 
@@ -97,7 +179,8 @@ that breaks the symmetry.
 
 ```
 reference:  AT&F  AT\N0  AT+MS=V32B,0,14400,14400  ATS0=1
-modec:      cabal run modec -- answer --mode v32bis --v32-rate 14400 --no-mnp --listen 2323
+modec:      cabal run modec -- modem --answer --sip 127.0.0.1:4444 \
+              --audio-sip-loop modec --hayes --mode v32bis --v32-rate 14400 --listen 2323
 ```
 
 Dial in from the reference, then send a known pattern from the reference
@@ -180,7 +263,8 @@ For each of Bell 103, V.21, Bell 212A, V.22, V.22bis, V.32, V.32bis:
 
 ```
 reference:  AT&F  AT\N0  AT+MS=<carrier>,0,<rate>,<rate>   then dial modec
-modec:      cabal run modec -- answer --mode <mode> --no-mnp
+modec:      cabal run modec -- modem --answer --sip 127.0.0.1:4444 \
+              --audio-sip-loop modec --hayes --mode <mode>
 ```
 
 Then mint each one:
@@ -269,16 +353,21 @@ when modec and one reference disagree and neither is obviously wrong.
 
 ### T4.2 Voice mode as a transducer
 
-```
-AT+FCLASS=8
-AT+VTR                  full duplex?  ERROR here ends this line of work
-AT+VSM=?                sample formats
-```
+**Answered: yes, on a CX93001.** `AT+FCLASS=8`, then `+VSM`, `+VSD=0,0`,
+`+VIT=0`, `+VLS=1` and `+VTR` gives `CONNECT` and a duplex stream at
+exactly 8000 bytes/s, whose spectrum off an idle FXS port is dial tone
+(348.6 and 438.5 Hz at equal level, everything else 37 dB down).
 
-If `+VTR` errors, the modem is half-duplex in voice mode and cannot
-carry V.22 or V.32 for modec. Even then `+VRX` is a clean recording of
-the far end straight off the hybrid — corpus fixtures with no sound card
-and no transformer.
+Do **not** gate this on `AT+VTR=?`. It returns ERROR, and so do
+`AT+VRX=?` and `AT+VTX=?`, which are mandatory Class 8 commands: this
+firmware simply has no test form for action commands. Gating on it
+abandons a working transducer on a false negative. Issue `+VTR` itself,
+off hook, and see whether samples arrive.
+
+`--audio-serial` therefore works, in `ulaw`; see
+[asterisk.md](asterisk.md) for why not in `pcm14`. `+VRX` remains a
+clean recording of the far end straight off the hybrid — corpus fixtures
+with no sound card and no transformer.
 
 modec's native rate is 8 kHz (`app/Modem.hs:112`) and `Modec.G711`
 already has the µ-law codec, so a voice-mode backend needs no
