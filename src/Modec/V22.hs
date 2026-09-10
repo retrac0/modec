@@ -449,7 +449,33 @@ v22RxBlock fs ch chunk st0 = (st', out)
               (pr, pim) = rxPrevSym st
               -- Gardner timing error, normalised by signal power, clamped,
               -- and ignored while there is no signal
-              pw = 0.95 * rxPower st + 0.05 * (yr * yr + yi * yi)
+              --
+              -- The same estimate serves the timing loop's normalisation
+              -- and the AGC, and how fast it should follow the line
+              -- depends on what is on it.  At 1200 bit/s every point is
+              -- the same distance from the origin, so a twenty-symbol
+              -- mean of the symbol power is the signal power exactly and
+              -- there is nothing to gain by averaging longer.  V.22bis
+              -- spreads sixteen points over three amplitudes with a
+              -- squared magnitude of 2, 10 or 18, and a twenty-symbol
+              -- mean of that wanders 4.5 % from one symbol to the next
+              -- -- which the gain multiplies into every symbol, as a
+              -- decision error of 0.13 grid units on a constellation
+              -- whose points are 2 apart.  Measured with no channel at
+              -- all: 0.135 at 0.05, 0.055 at 0.01, 0.037 at 0.005, and
+              -- rising again below that as the gain starts to lag the
+              -- line rather than its own data.  A 30 dB telephone
+              -- channel moved the first of those to 0.141, which is the
+              -- shape of a receiver whose own noise is the whole of its
+              -- error.
+              --
+              -- No acquisition problem comes with it, because the rate
+              -- only becomes R2400 after S1 -- by which point the
+              -- estimate has spent the whole handshake converging at the
+              -- fast rate on a constant-amplitude signal, and the level
+              -- is already known.
+              agcRate = case rxRate st of { R1200 -> 0.05; R2400 -> 0.005 }
+              pw = (1 - agcRate) * rxPower st + agcRate * (yr * yr + yi * yi)
               eRaw = ((yr - pr) * hr + (yi - pim) * hi) / max 1e-9 pw
               e = if pw < 1e-5 then 0 else max (negate (rxClamp st)) (min (rxClamp st) eRaw)
               sps' = sps - ki * e

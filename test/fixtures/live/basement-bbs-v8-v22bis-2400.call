@@ -2,6 +2,10 @@
 # classic tone ladder, so the ANSam answer tone and the CM/JM menus are
 # in the path.  A Synchronet banner five years older than A-Net's, and
 # the board's own greeting behind it.
+#
+# Re-minted for the same reason as its neighbour: both expect: lines
+# come back untouched, and the four bytes of noise between the banner
+# and the prompt are now three.
 source:    recordings/20260906T004604-basement-bbs-v22bis-v8.wav
 seconds:   30
 role:      originate

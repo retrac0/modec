@@ -8,6 +8,12 @@
 # that the junk behind it stays the length it is now.  See
 # docs/robustness.md; 140 bytes became 60 when the decision-error gate
 # went in, and it should not go back up.
+#
+# Re-minted when the V.22bis receiver's gain stopped chasing its own
+# data (see Modec.V22): the banner is identical and the expect: line
+# above still holds, but the far end hangs up part way through repeating
+# it and what the receiver makes of the silence afterwards is different
+# rubbish from the rubbish it made before.  Fourteen bytes more of it.
 source:    recordings/20260906T004535-a-net-online-v22bis.wav
 seconds:   22
 role:      originate
