@@ -46,6 +46,7 @@ module Modec.V22
   , v22RxSetCoherentGains
   , rxSpsEstimate
   , rxEvmEstimate
+  , decisionMargin
   , rxOnes2400Run
   , rxRateOf
   , scrambleBit
@@ -347,6 +348,19 @@ v22RxSetRate r st = st { rxRate = r, rxOnes2400 = 0 }
 -- | Tracked coherent decision error power (for tracing).
 rxEvmEstimate :: V22RxState -> Double
 rxEvmEstimate = rxEvm
+
+-- | Half the distance to the nearest wrong answer, in the grid units the
+-- AGC normalises to and 'rxEvmEstimate' is squared in.
+--
+-- The two rates decide against different things and the same error means
+-- different things to them.  At 2400 the sixteen points sit on the odd
+-- grid two apart, so a symbol is wrong once it has moved 1.0.  At 1200
+-- only the four "01" points are transmitted, at a radius of sqrt 10 and
+-- a quarter turn apart, which puts the nearest wrong answer 2 * sqrt 5
+-- away and the boundary at sqrt 5.
+decisionMargin :: Rate -> Double
+decisionMargin R2400 = 1.0
+decisionMargin R1200 = sqrt 5
 
 -- | Consecutive 16-way-decided descrambled ones (for tracing).
 rxOnes2400Run :: V22RxState -> Int

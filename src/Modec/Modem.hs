@@ -825,7 +825,30 @@ modemStep cfg st0 rxBlock newBytes =
           -- worthless is worse than one that passes none, because nothing
           -- downstream can tell the difference.
           trust = rxEvmEstimate rxSt' < mcMaxEvm cfg
-          armed' = armed || (roOnesRun o >= 16 && trust)
+          -- Sixteen was shorter than the descrambler.  V.22's is
+          -- 1 + x^-14 + x^-17, so for its first seventeen bits it emits
+          -- whatever its register happened to hold, and a zero followed
+          -- by ones in there is a start bit and a character as far as
+          -- the framer can tell.  A run four times the register's length
+          -- is itself the evidence that the descrambler is in step,
+          -- because one that is not puts a zero in and starts the count
+          -- again.  There is room for it: the far end sends scrambled
+          -- ones at 1200 and again at 2400 before any data, and every
+          -- fixture in the corpus decodes byte for byte either way.
+          -- This is the same bar Modec.V32's framer already sets, for
+          -- the same reason and against a longer descrambler.
+          --
+          -- And a converged receiver rather than merely a usable one,
+          -- which is the ordinary split between acquiring a signal and
+          -- tracking it.  'mcMaxEvm' is where the decisions stop being
+          -- worth passing on at all; a quarter of the rate's own
+          -- decision margin is where the receiver is reading the line
+          -- properly.  The half second is for the line that never gets
+          -- that good, where passing bits with errors in them still
+          -- beats passing none.
+          acquired = rxEvmEstimate rxSt' < acqLimit || msSettled st > 0.5
+          acqLimit = (decisionMargin rate / 4) ^ (2 :: Int)
+          armed' = armed || (roOnesRun o >= 64 && trust && acquired)
           -- Once the protocol layer has switched to bit-oriented framing
           -- the start-stop framer is out of the way entirely: HDLC finds
           -- its own frames from the flags, so there is nothing to arm and
