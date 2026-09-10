@@ -46,8 +46,10 @@ data ReplayResult = ReplayResult
   , rrEvents :: [(Double, ModemEvent)]   -- ^ connects, drops, menus, with the time
   , rrPhases :: [(Double, String)]       -- ^ every phase change: the timeline a call log shows
   , rrLine   :: [(Double, Double, Double)]
-    -- ^ time, the V.22 receiver's decision error and its samples per
-    -- symbol, whenever 'rcEvery' asks and the receiver exists
+    -- ^ time, the receiver's decision error and its samples per symbol,
+    -- whenever 'rcEvery' asks and there is a receiver to ask.  Whichever
+    -- receiver is carrying the call: the V.22 one, or the V.32 data pump
+    -- once the start-up has handed over to it.
   }
 
 replay :: ReplayConfig -> Signal -> ReplayResult
@@ -68,8 +70,16 @@ replay rc x = go (modemInit cfg) 0 [] [] [] []
               t = secs i
               phs' = if modemPhase st' /= modemPhase st then (t, modemPhase st') : phs else phs
               evs' = [ (t, e) | e <- reverse es ] ++ evs
-              line' = case (every, fst (modemV22Rx st')) of
-                (Just k, Just (_, r)) | i `mod` k == 0 ->
-                  (t, rxEvmEstimate r, rxSpsEstimate r) : line
+              line' = case every of
+                -- The V.32 pump first: the V.22 receiver the automode
+                -- probe left behind is still there during a V.32 call,
+                -- and reporting it means reporting a receiver that is
+                -- not carrying the call and has not been fed since the
+                -- start-up began.
+                Just k | i `mod` k == 0 -> case modemV32Line st' of
+                  Just (e, sps) -> (t, e, sps) : line
+                  Nothing -> case fst (modemV22Rx st') of
+                    Just (_, r) -> (t, rxEvmEstimate r, rxSpsEstimate r) : line
+                    Nothing -> line
                 _ -> line
           in go st' (i + 1) (bs : bytes) evs' phs' line'

@@ -16,6 +16,7 @@ module Modec.Modem
   , V32Entry (..)
   , modemConnected
   , modemV32Evm
+  , modemV32Line
   , modemEchoErle
   , modemEchoDelay
   , modemPhase
@@ -34,6 +35,7 @@ module Modec.Modem
   , txBlock
   ) where
 
+import Numeric (showFFloat)
 import qualified Data.Vector.Storable as VS
 import Data.Maybe (isJust)
 import Data.Word (Word8)
@@ -46,8 +48,8 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateMargin, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
-import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataPower, v32DataRxState, v32DataTxState)
+import Modec.V32 (Direction (..), V32Rate (..), RateSeq (..), rateBitRate, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
+import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Mnp
@@ -444,13 +446,20 @@ modemV22Rx st = (msV22Rx st, msRxRate st)
 modemPhase :: ModemState -> String
 modemPhase st = case msMode st of
   Handshaking -> hsPhaseName (msHs st)
-  Starting32 s32 _ -> "Starting32 " ++ show (v32Phase s32)
+  Starting32 s32 _ -> "Starting32 " ++ show (v32Phase s32) ++ lineErr s32
   DataFsk s _ _ _ _ -> "Data " ++ show s
   DataV22 _ _ r _ _ -> "Data V22 " ++ show r
   DataV32 _ r _ _ _ -> "Data V32 " ++ show r
-  Retrain32 s32 h -> "Retraining V32 from " ++ show (hdRate h) ++ ", " ++ show (v32Phase s32)
+  Retrain32 s32 h -> "Retraining V32 from " ++ show (hdRate h) ++ ", " ++ show (hdWhy h) ++ ", " ++ show (v32Phase s32)
   Probe32 _ -> "Probing the echo path"
   Finished -> "Finished"
+  where
+    -- The rate is chosen out of this number, so a trace that shows the
+    -- rate signals without it shows the answer and not the reason.
+    lineErr s32
+      | v32Phase s32 `elem` [OR2, ACond2] =
+          "  line " ++ showFFloat (Just 4) (v32LineError s32) ""
+      | otherwise = ""
 
 -- | The echo canceller's return loss enhancement, for tracing: how much
 -- of what arrived it is taking out.  'Nothing' when no canceller is
@@ -481,6 +490,14 @@ modemV32Bits st = case msMode st of
 modemV32Evm :: ModemState -> Maybe Double
 modemV32Evm st = case msMode st of
   DataV32 _ _ pump _ armed -> Just (if armed then negate (v32DataEvm pump) else v32DataEvm pump)
+  _ -> Nothing
+
+-- | The V.32 receiver's decision error and samples per symbol, for a
+-- line trace: the same 'decisionError' the byte gate and the retrain
+-- timer are reading, so a trace and a retrain cannot disagree.
+modemV32Line :: ModemState -> Maybe (Double, Double)
+modemV32Line st = case msMode st of
+  DataV32 _ _ pump _ _ -> Just (sqrt (v32DataEvm pump), v32DataSps pump)
   _ -> Nothing
 
 modemConnected :: ModemState -> Bool
