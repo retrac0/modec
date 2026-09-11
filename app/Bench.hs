@@ -48,7 +48,7 @@ optsP = Opts
 -- | The FSK sweep keeps the bare options it always had, so
 -- @modec-bench --channel answer@ still means what it used to; the V.32
 -- surveys hang off subcommands beside it.
-data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | V32Bench | Loopback (Maybe String)
+data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | V32Bench | V32Aided | Loopback (Maybe String)
          | V32Echo (Maybe String)
 
 cmdP :: Parser Cmd
@@ -57,6 +57,7 @@ cmdP = hsubparser
   <> command "v32-carrier" (info (pure V32Carrier) (progDesc "V.32: carrier loop gains against the hard channels"))
   <> command "v32-trace"   (info (pure V32Trace)   (progDesc "V.32: the timing loop block by block through a clock offset"))
   <> command "v32-survey"  (info (pure V32Survey)  (progDesc "V.32: every impairment axis, per rate"))
+  <> command "v32-aided"   (info (pure V32Aided)   (progDesc "V.32: what training on known symbols instead of on decisions would be worth, per rate"))
   <> command "v32-bench"   (info (pure V32Bench)   (progDesc "V.32: the ATA bench's path -- mu-law, +47 ppm, +0.7 Hz -- by SNR, per rate"))
   <> command "loopback"    (info (Loopback <$> optional (strArgument (metavar "MODE")))
        (progDesc "Two whole modems calling each other through the channel simulator: the lowest SNR each mode still carries text at"))
@@ -77,6 +78,7 @@ main = do
     V32Trace   -> v32LoopTrace
     V32Survey  -> v32Survey
     V32Bench   -> v32Bench
+    V32Aided   -> v32Aided
     Loopback m -> loopbackSweep m
     V32Echo w  -> v32EchoSweep w
 
@@ -605,6 +607,32 @@ v32Survey :: IO ()
 -- there: G.711 mu-law, the far clock 47 ppm fast, the carrier 0.1 to
 -- 0.7 Hz off, and about 30 dB of noise once the answer-tone echo was
 -- taken out.
+-- | Decision-directed against data-aided, on the same signal and the
+-- same noise: the question 14400 is stuck on.
+--
+-- The aided receiver is handed the symbols the far end sent, which no
+-- real receiver has.  What it measures is the ceiling: how much of the
+-- residual error at a rate is the receiver training on its own mistakes,
+-- and therefore how much reconstructing those symbols on air -- from
+-- the scrambler, which is what V.32bis §5.4.2's B1 makes possible --
+-- could be worth.  If the two columns agree there is nothing there.
+v32Aided :: IO ()
+v32Aided = do
+  putStrLn "                    decision-directed      data-aided (oracle)"
+  putStrLn "rate    SNR      errors   settled EVM     errors   settled EVM"
+  forM_ [V32R9600T, V32R12000, V32R14400] $ \r ->
+    forM_ [30, 26, 24, 22, 20, 18 :: Double] $ \snr -> do
+      let payload = prbs (11, 9) 4000
+          truth = v32TrainedPoints Originate r payload
+          (clean, preSyms) = v32ModulateTrained 8000 Originate r 0.5 1400 payload
+          sig = applyChannel 8000 (telephoneChannel snr) clean
+          score got = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) got)))
+                              | o <- [0 .. 300] ]
+          (ddBits, ddEvm) = v32DemodulateTrainedEvm 8000 Answer r preSyms sig
+          (daBits, daEvm) = v32DemodulateAided 8000 Answer r preSyms truth sig
+      printf "%-7s %4.0f   %7d   %11.4f   %7d   %11.4f\n"
+        (drop 4 (show r)) snr (score ddBits) ddEvm (score daBits) daEvm
+
 v32Bench :: IO ()
 v32Bench =
   forM_ [V32R9600T, V32R12000, V32R14400] $ \r -> do

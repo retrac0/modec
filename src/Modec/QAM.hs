@@ -63,6 +63,9 @@ module Modec.QAM
   , quarterTurns
   , qamRxEnergy
   , qamRxPrevSym
+    -- * Training on symbols that are known rather than decided
+  , qamRxRef
+  , qamRxRefLeft
     -- * Starting a receiver somewhere other than at rest
   , QamRxSeed (..)
   , defaultSeed
@@ -344,6 +347,11 @@ data QamRxState = QamRxState
   , rxLastStep :: !Int   -- ^ the previous symbol's phase step
   , rxStepRun :: !Int    -- ^ symbols running the step has been the same
   , rxEnergy  :: !Double -- ^ mean matched-filter power over the last block
+  , rxRef     :: [(Double, Double)]
+    -- ^ Points the far end is known to have sent, oldest first, one per
+    -- symbol, consumed as they are used.  Empty is the ordinary
+    -- decision-directed receiver and is bit for bit what it always was.
+    -- See 'qamRxRef'.
   , rxSeed    :: QamRxSeed  -- ^ where 'qamRxReset' returns to
   }
 
@@ -377,7 +385,7 @@ qamRxInitWith p cfg seed = QamRxState
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
   , rxEvm_ = srEvm0 seed, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
   , rxTiming = False
-  , rxLastStep = 0, rxStepRun = 0, rxEnergy = 0, rxSeed = seed }
+  , rxLastStep = 0, rxStepRun = 0, rxEnergy = 0, rxSeed = seed, rxRef = [] }
   where
     sps = samplesPerSymbol p
     taps = qrEqTaps cfg
@@ -411,6 +419,20 @@ qamRxUnlock st = st { rxLocked = False, rxSyms = 0 }
 
 kernel :: QamParams -> VS.Vector Double
 kernel p = rrcKernel (qpFs p) (qpBaud p) (qpRollOff p) (qpSpan p)
+
+-- | Hand the receiver the points the far end is known to be sending,
+-- oldest first.  They are consumed one per symbol and replace the
+-- receiver's own decision as what the carrier loop and the equaliser
+-- train against; when they run out it is decision-directed again.
+--
+-- Appended, not replaced: a caller topping the queue up each block
+-- cannot lose the ones the last block did not reach.
+qamRxRef :: [(Double, Double)] -> QamRxState -> QamRxState
+qamRxRef ps st = st { rxRef = rxRef st ++ ps }
+
+-- | How many known points are still queued.
+qamRxRefLeft :: QamRxState -> Int
+qamRxRefLeft = length . rxRef
 
 qamRxEvm :: QamRxState -> Double
 qamRxEvm = rxEvm_
@@ -589,9 +611,26 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
 
               idx = qrSlice cfg (ur, ui)
               (px, py) = qrPoint cfg idx
-              phErr = atan2 (ui * px - ur * py) (ur * px + ui * py)
-              errR = px - ur; errI = py - ui
-              err2 = errR * errR + errI * errI
+              -- What the loops train against.  Decision-directed, that
+              -- is the nearest point -- which is also the thing being
+              -- measured, so on a constellation dense enough for the
+              -- decisions to be wrong the error that steers the carrier
+              -- and the equaliser is partly the receiver's own mistakes,
+              -- and the loops settle around them.  Where the far end's
+              -- symbols are known -- §5.4.2's B1 is 128 of them, and a
+              -- far end idling sends thousands -- training on the truth
+              -- instead removes that term.  'rxRef' carries them.
+              (ax, ay, ref') = case rxRef st of
+                (q : qs) -> (fst q, snd q, qs)
+                []       -> (px, py, [])
+              phErr = atan2 (ui * ax - ur * ay) (ur * ax + ui * ay)
+              errR = ax - ur; errI = ay - ui
+              -- The decision error stays the decision's, so everything
+              -- that reads it -- the lock, the gates, the byte gate and
+              -- the retrain timer above this module -- is asking the
+              -- same question it was before.  Only the training is aided.
+              dErrR = px - ur; dErrI = py - ui
+              err2 = dErrR * dErrR + dErrI * dErrI
               evm = 0.98 * rxEvm_ st + 0.02 * err2
               locked = pw > 1e-5
               -- 'qrTrack' holds the carrier loop where 'qrAdapt' holds
@@ -712,7 +751,8 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                        , rxEvm_ = evm, rxBad = bad, rxRecent = recent
                        , rxLocked = latched, rxSyms = rxSyms st + 1
                        , rxTiming = timing'
-                       , rxLastStep = step, rxStepRun = stepRun }
+                       , rxLastStep = step, rxStepRun = stepRun
+                       , rxRef = ref' }
               st2 = if bad >= qrEvmGiveUp cfg || qrRestartOn cfg (QamTap step stepRun evm (rxSyms st + 1))
                       then qamRxReset p cfg st1 else st1
           in go st2 (QamSym (ur, ui) idx err2 (yr, yi) step dev : syms)

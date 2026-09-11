@@ -44,6 +44,8 @@ module Modec.V32Pump
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
+  , v32TrainedPoints
+  , v32DemodulateAided
   , v32Demodulate
   , v32DemodulateWith
   , v32DemodulateTrained
@@ -443,6 +445,13 @@ v32ModulateTrained fs dir r amp trn bits = (modulatePoints fs amp (pre ++ pts), 
     pre = conditioningSymbols dir trn
     (_, pts) = encodeSymbols dir r bits txCoderInit
 
+-- | The points 'v32ModulateTrained' put on the line for the data part,
+-- which is what the far end actually sent: the oracle a data-aided
+-- receiver is trying to reconstruct, for measuring what reconstructing
+-- it would be worth.
+v32TrainedPoints :: Role -> V32Rate -> [Bool] -> [Point]
+v32TrainedPoints dir r bits = snd (encodeSymbols dir r bits txCoderInit)
+
 -- | Points on the line at the usual level, for tests and for
 -- generating the start-up signals offline.
 modulatePointsFor :: Double -> [Point] -> Signal
@@ -516,6 +525,64 @@ v32DemodulateTrainedWith tune fs dir r preSyms sig =
 -- -- because a receiver acquiring is not a receiver's floor.
 v32DemodulateTrainedEvm :: Double -> Role -> V32Rate -> Int -> Signal -> ([Bool], Double)
 v32DemodulateTrainedEvm = v32DemodulateTrainedEvmWith id
+
+-- | The trained demodulator, told what the far end sent.
+--
+-- This is not a receiver anyone can build: it is handed the symbols it
+-- is trying to recover.  It exists to separate two questions that the
+-- bench could not tell apart -- whether training the carrier loop and
+-- the equaliser on known symbols instead of on their own decisions
+-- lowers the floor at a given rate, and whether those symbols can be
+-- reconstructed on air.  The second is only worth the work if this
+-- says yes to the first.
+v32DemodulateAided :: Double -> Role -> V32Rate -> Int -> [Point] -> Signal -> ([Bool], Double)
+v32DemodulateAided fs dir r preSyms truth sig =
+  (snd (decodeSymbols dir r syms rxCoderInit), settledEvm syms)
+  where
+    p = v32Params fs
+    trainCfg = v32RxCfg V32R4800
+    dataCfg = v32RxCfg r
+    preN = ceiling (fromIntegral preSyms * samplesPerSymbol p)
+    (pre, dat) = VS.splitAt preN sig
+    stAfter = snd (runBlocks p trainCfg pre (qamRxInit p trainCfg))
+    -- Which received symbol is the far end's first data symbol is not
+    -- known in advance: the prefix is cut on a sample boundary and the
+    -- receiver's own timing decides where the symbols fall.  Training on
+    -- a reference that is one symbol out is worse than not training at
+    -- all -- every point wrong, confidently -- so the alignment is found
+    -- first, from a decision-directed pass, and only then handed back.
+    (dd, _) = runBlocks p dataCfg dat stAfter
+    -- And in which of four frames.  V.32 encodes differentially because
+    -- the absolute carrier phase is not knowable, so the receiver settles
+    -- into the constellation turned by some multiple of a quarter turn
+    -- and the differential decoding takes the ambiguity out at the bit
+    -- level.  Absolute points therefore do not match what the receiver
+    -- sees until they are turned the same way.  A real data-aided
+    -- receiver has this problem too, and has to resolve the quadrant
+    -- once before it can use anything it predicts.
+    -- Eight frames, not four: the receiver mixes down with the
+    -- conjugate carrier, so as well as the quarter turn it may be
+    -- looking at the mirror of what was sent.
+    frame k (x, y) =
+      let (u, v) = if k >= 4 then (x, negate y) else (x, y)
+      in case k `mod` (4 :: Int) of
+           0 -> (u, v); 1 -> (negate v, u); 2 -> (negate u, negate v); _ -> (v, negate u)
+    -- Far enough to cover the channel's group delay: a band-pass is a
+    -- filter and the data does not begin where the sample count says it
+    -- does.  Eight symbols was not nearly enough and the search found
+    -- nothing, at a cost per symbol indistinguishable from noise.
+    (_, (align, rot)) = minimum [ (cost o k, (o, k)) | o <- [0 .. 64 :: Int], k <- [0 .. 7 :: Int] ]
+    cost o k = sum [ (a - c) * (a - c) + (b - d) * (b - d)
+                   | (s, t) <- take 200 (zip (drop o dd) truth)
+                   , let (a, b) = qsPoint s, let (c, d) = frame k t ]
+    truth' = map (frame rot) truth
+    -- The padding is the decision-directed pass's own decisions, which
+    -- is the same as not aiding those symbols.  Padding with the origin
+    -- instead trains the equaliser towards zero and destroys it, which
+    -- is what a first attempt measured and reported as "aiding does not
+    -- help".
+    (syms, _) = runBlocks p dataCfg dat
+                  (qamRxRef (map qsPoint (take align dd) ++ truth') stAfter)
 
 v32DemodulateTrainedEvmWith :: (QamRxCfg -> QamRxCfg) -> Double -> Role -> V32Rate -> Int -> Signal
                             -> ([Bool], Double)

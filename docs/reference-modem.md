@@ -471,13 +471,56 @@ correct bits, which no receiver decoding at random produces -- with
 ten kilobytes of wrong characters around it. So the 14400 receiver is
 marginal and not systematically wrong: it holds the trellis path for
 stretches and loses it, and what it needs is margin, not a correction.
-What
-the receiver lacks is the thing §5.4.2 hands
-it for free: B1, 128 symbols of scrambled ones at the data rate and
-coding, a known sequence at the data constellation. This receiver waits
-for 64 ones before arming the framer and does not adapt on them; a
-receiver that trains data-aided on B1 before trusting its own decisions
-is the standard way to close exactly this gap.
+What the receiver lacks is the thing §5.4.2 hands it for free: B1, 128
+symbols of scrambled ones at the data rate and coding, a known sequence
+at the data constellation. This receiver waits for 64 ones before
+arming the framer and does not adapt on them.
+
+**And that is worth about two decibels, measured.** `modec-bench
+v32-aided` runs the same signal and the same noise through the trained
+pump twice: once decision-directed, once handed the symbols the far end
+actually sent. No real receiver has those -- the point is to measure
+the ceiling before building the machinery to reconstruct them.
+
+| rate | SNR | decision-directed | data-aided |
+| --- | --- | --- | --- |
+| 14400 | 22 dB | 0 errors | 0 |
+| 14400 | 20 dB | **52 errors** | **0** |
+| 14400 | 18 dB | **1153 errors** | **439** |
+| 12000 | 18 dB | 12 errors | 12, EVM 0.0107 -> 0.0094 |
+
+So training on truth moves 14400's threshold from "fails at 20" to
+"clean at 20", and the settled decision error at 18 dB from 0.0093 to
+0.0070. That is the margin the bench is short of: it measured about
+20.5 dB effective where 14400 wants 22. At 9600t and at high SNR there
+is nothing in it, which is the expected shape -- a receiver that is
+already right has nothing to learn from being told it is right.
+
+`Modec.QAM` now has the hook: `qamRxRef` queues points the far end is
+known to have sent, and while the queue lasts the carrier loop and the
+equaliser train against those instead of against the receiver's own
+decisions. The decision error keeps its old meaning -- everything above
+that module is asking the same question it was -- and with an empty
+queue the receiver is bit for bit what it always was, which the whole
+suite checks.
+
+**What remains is reconstructing the symbols on air, and the oracle
+harness has already found the traps.** Three of them cost an hour each
+and all three apply to the real thing: the reference has to be aligned
+in time (the channel's band-pass has group delay, so the data does not
+begin where the sample count says -- an eight-symbol search found
+nothing, at a cost per symbol indistinguishable from noise, and it took
+sixty-four); it has to be in the receiver's frame (V.32 is
+differentially encoded because absolute phase is unknowable, so the
+receiver settles into the constellation turned by some quarter turn,
+and possibly mirrored, and a real data-aided receiver must resolve that
+before it can use anything it predicts); and where the reference is
+absent it must fall back to the decision, because padding with the
+origin trains the equaliser towards zero and destroys it. The
+prediction itself is the easy part: the far end's scrambler register is
+the line-bit history this end already holds, its convolutional encoder
+starts from zero at E, and B1's input is all ones -- so every point is
+computable without any feedback from a noisy decision.
 
 One of the flakes showed its mechanism on the way: a call where
 baresip's RTP stayed at `audio=0/0` for seven seconds after the SIP
