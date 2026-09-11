@@ -135,18 +135,28 @@ def chart(mode, rows, surv):
 def main(out):
     rows = load_csv('ber.csv', ('mode', 'snr')); surv = survey_points(); dist = load_csv('distort.csv', ('mode', 'cond'))
     modes = [m for m in ORDER if any(r['mode'] == m for r in rows)]
-    # summary: SNR at 1 % character errors
+    # summary: the SNR at which a direction collapses -- one character
+    # in five wrong, or nothing arriving at all -- rather than where it
+    # crosses 1 %, because the bench throws bursts of its own and one
+    # damaged line in twenty-four is already 4e-2.  The same level for
+    # the textbook and the survey, so the deltas mean one thing.
+    LEVEL = 0.2
     summ = []
     for m in modes:
         rs = [r for r in rows if r['mode'] == m and r['ref'] == 'CONNECT']
-        th = theory.snr_for(m, 1e-3)   # CER 1e-2 ~ BER 1e-3
+        th = theory.snr_for(m, LEVEL / 10)   # CER ~ 10 x BER
         def meas(side):
-            pts = [(fnum(r['snr']), fnum(r.get(f'{side}_cer'))) for r in rs if not math.isnan(fnum(r.get(f'{side}_cer')))]
-            pts = [(s, c) for s, c in pts if s < 40]
-            return cross(pts, 1e-2), pts
+            pts = []
+            for r in rs:
+                s = fnum(r['snr'])
+                if s >= 40: continue
+                c = fnum(r.get(f'{side}_cer'))
+                if math.isnan(c): c = 1.0 if fnum(r.get(f'{side}_lines')) > 0 else None
+                if c is not None: pts.append((s, c))
+            return cross(sorted(pts), LEVEL), pts
         rx, rpts = meas('ref'); mx, mpts = meas('modec')
         sv = surv.get(SURVEY.get(m, ''), [])
-        svx = cross([(s, 10 * b) for s, b in sv], 1e-2) if sv else None
+        svx = cross([(s, 10 * b) for s, b in sv], LEVEL) if sv else None
         summ.append((m, th, rx, mx, svx, rpts, mpts))
     def fmt(v, th=None):
         if v is None: return '<td class="num">—</td>'
@@ -261,8 +271,8 @@ svg {{ width:100%; height:auto; display:block; font-family:"IBM Plex Mono", mono
 <h1>Waterfall Curves, Live</h1>
 <p class="lede">Every mode both modems share, driven down through white noise on a real call, with error control off and a known text going each way. The reference modem reads what modec sends; modec reads what the reference sends. Beside each: the textbook curve for the modulation, and — for the V.32 rates — modec's own receiver on the simulator's ideal line.</p>
 <div class="key"><span class="t">textbook (AWGN, ideal receiver)</span><span class="r">reference modem reading modec</span><span class="m">modec reading the reference</span><span class="s">modec, offline survey</span></div>
-<h2>Where 1 % of characters go wrong</h2>
-<p>The signal-to-noise ratio at which one character in a hundred arrives wrong, read off each curve; the small number is the distance from the textbook, which is the implementation loss of that direction's receiver plus what the line itself adds. A dash means the curve never crossed inside the range tried.</p>
+<h2>Where each direction collapses</h2>
+<p>The signal-to-noise ratio at which a direction falls over — one character in five wrong, or nothing arriving at all — read off each curve; the small number is the distance from the textbook curve's own collapse, which is the implementation loss of that direction's receiver plus what the line itself adds. Collapse rather than 1 %, because the bench throws occasional bursts of its own and one damaged line in twenty-four is already 4 × 10⁻². A dash means it never collapsed inside the range tried.</p>
 <div class="tbl"><table class="summary"><thead><tr><th>mode</th><th>modulation</th><th>textbook</th><th>reference reads modec</th><th>modec reads reference</th><th>modec, simulator</th></tr></thead><tbody>{summary_rows}</tbody></table></div>
 <p>The noise is white over 0–4 kHz and set against the signal's level, the convention <code>Modec.Channel</code> and <code>modec-bench</code> use, so Eb/N0 is the SNR plus 10 log₁₀(4000 / bit rate). Textbook CER is taken as ten times the bit error rate, one wrong bit per wrong ten-bit character; the start-stop framer makes it worse than that in practice, on both modems, because one wrong bit can misalign the characters after it.</p>
 {"".join(sections)}

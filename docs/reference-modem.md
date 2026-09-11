@@ -871,6 +871,75 @@ asks for a retrain about 27 seconds into every 12000 call, on either
 setting of the canceller: its judgement of modec's transmission, not
 of the line.
 
+### Every other impairment, live (2026-09-11)
+
+`scripts/bench/distort.py` puts one impairment at a time on both
+directions of a call, from the first ring, with no added noise, and
+scores the same payload each way. Where the offline survey sweeps the
+same axis the value is the survey's. *clean* is every line intact;
+*nothing* is a call that connected and carried no readable line;
+*no link* is a call that never reached CONNECT at both ends. Read each
+cell as "the reference reading modec / modec reading the reference".
+
+| condition | V.22bis: ref / modec | V.32 9600: ref / modec | 9600 trellis: ref / modec | 12000: ref / modec | V.21: ref / modec |
+|---|---|---|---|---|---|
+| clean `` | clean / clean | clean / 1e-03 | clean / 5e-01 (21 lost) | clean / nothing | clean / clean |
+| jit-s1 `sinejit=1` | nothing / clean | no link / no link | no link / no link | no link / no link | · / · |
+| jit-s3 `sinejit=3` | nothing / nothing | no link / no link | no link / no link | no link / no link | clean / clean |
+| jit-walk `jitter=0.5` | no link / no link | no link / no link | no link / no link | no link / no link | · / · |
+| slips2 `slips=2` | 3e-01 (14 lost) / nothing | no link / no link | nothing / nothing | no link / no link | 3e-02 (6 lost) / 3e-03 |
+| wow `wow=0.3` | nothing / clean | no link / no link | no link / no link | no link / no link | clean / clean |
+| flutter `flutter=0.1` | clean / nothing | clean / 1e-01 (12 lost) | clean / nothing | clean / nothing | · / · |
+| clock1 `rate=0.01` | 8e-01 (23 lost) / 1e-01 (6 lost) | no link / no link | no link / no link | no link / no link | · / · |
+| carrier15 `freq=15` | clean / clean | no link / no link | nothing / clean | nothing / clean | no link / no link |
+| delay2 `delaydist=2` | no link / no link | no link / no link | no link / no link | no link / no link | · / · |
+| wobble `wobble=2` | nothing / no link | 3e-01 (15 lost) / 2e-02 (5 lost) | 4e-01 (19 lost) / nothing | nothing / nothing | · / · |
+| phasejit `phasejit=10` | clean / clean | clean / 3e-01 (13 lost) | clean / clean | clean / nothing | · / · |
+| softclip `softclip=3` | clean / clean | no link / no link | no link / no link | no link / no link | · / · |
+| harm2 `harm2=0.1` | clean / clean | clean / 1e-03 | clean / clean | clean / clean | · / · |
+| hum `hum=0.03` | clean / clean | clean / 6e-02 (8 lost) | clean / clean | clean / clean | nothing / clean |
+| impulse `impulse=5` | clean / 8e-02 (16 lost) | 5e-02 (1 lost) / 1e-01 (15 lost) | 4e-02 (2 lost) / 1e-01 (11 lost) | 9e-02 (5 lost) / nothing | clean / 1e-01 (8 lost) |
+| hits `hits=2` | 1e-01 (5 lost) / 2e-01 (15 lost) | 1e-01 (2 lost) / 2e-01 (17 lost) | 4e-02 (3 lost) / 5e-02 (3 lost) | no link / no link | · / · |
+| dropout `dropout=0.02` | 8e-02 (4 lost) / 2e-01 (15 lost) | no link / no link | no link / no link | no link / no link | · / · |
+| biterr `ulaw=1 biterr=0.001` | nothing / no link | 3e-02 (2 lost) / 2e-01 (11 lost) | 2e-02 / 5e-02 (15 lost) | 2e-02 (1 lost) / 1e-01 (14 lost) | · / · |
+| loss `loss=0.02` | 5e-02 (8 lost) / 3e-01 (17 lost) | no link / no link | no link / no link | no link / no link | 6e-01 (18 lost) / 2e-01 (10 lost) |
+| echo `echo=0.2` | 2e-02 / nothing | no link / no link | no link / no link | no link / no link | · / · |
+
+Three things stand out, and none of them is what the survey said.
+
+**The V.32 start-up is the fragile part, not the data pump.** The
+survey said the trained pump reads through 1 % clock offset, 15 Hz of
+carrier, 1 ms of delay distortion and light soft clipping. Live, from
+the first ring, every V.32 rate fails to *connect* under sine jitter,
+a random walk, wow, 1 % clock, 2 ms of delay distortion, soft clipping,
+dropouts and frame loss -- the start-up ends in `no common rate` or
+never completes -- where V.22bis and V.21 connect and carry data under
+most of the same. The survey never exercised the start-up. That is the
+next thing to measure offline, and the impairment schedule that
+`--line-snr` already has (clean through the handshake, then the
+impairment) is how to separate the two live.
+
+**The two receivers fail on different timing impairments.** With the
+same warp on both directions, ±1 sample of sine jitter at 2 Hz and
+0.3 % wow at 1 Hz leave the reference reading *nothing* of modec while
+modec reads the reference clean; 0.1 % flutter at 25 Hz does the
+reverse at every rate. A slow, wide warp is inside modec's timing loop
+and outside the Conexant's; a fast one is the other way round. The
+same at 15 Hz of carrier offset -- twice what V.32 §2.1 requires -- and
+at 2 Hz of carrier wobble: modec's carrier loop follows, the
+reference's does not. Those are design choices in loop bandwidth, and
+modec's are the wider ones.
+
+**Transients and the digital span hurt modec more.** Impulse noise,
+gain hits, dropouts, G.711 bit errors and frame loss all cost modec two
+to five times the reference's character error rate, with many more
+lines lost -- and a lost line here is the start-stop framer losing its
+alignment and not finding it again for a while. The reference recovers
+character alignment after a burst faster than modec does. That is the
+framer, not the modem, and it is cheap to fix.
+
+The whole of it is on the page, beside the noise curves.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores
