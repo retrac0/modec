@@ -62,19 +62,22 @@ data EchoConfig = EchoConfig
 -- | The configuration for a sample rate.  32 ms of taps is far wider
 -- than the few milliseconds a hybrid smears its return over, because
 -- the bulk delay is not known nearly as well as it looks; see
--- 'echoSetFar'.  The search reaches 500 ms because a real one does.
+-- 'echoSetFar'.  The search reaches 1.5 s because a real one does.
 -- Dialling the voip.ms echo test, which returns everything it is sent,
 -- put our own signal back at 116 ms: a filter spanning 20 to 52 ms --
 -- which is what ecDelay and ecTaps came to on their own -- never had a
--- chance at it.  Half a second of reference history is 32 kB at 8 kHz,
--- which is not worth being clever about.
+-- chance at it.  Then an HT802V2 behind baresip put the hybrid's
+-- return of our own signal at 1159 ms and -28 dB, which a 500 ms
+-- search could not see either.  A second and a half of reference
+-- history is 96 kB at 8 kHz; the search is kept at the old cost by
+-- striding, below.
 --
 -- These were 256, 160, 4000 and 64 samples, which are those times at
 -- 8 kHz and nothing in particular at any other rate.
 echoConfigAt :: Double -> EchoConfig
 echoConfigAt fs = EchoConfig
   { ecTaps = ms 32, ecDelay = ms 20, ecMu = 0.3, ecLeak = 1e-7
-  , ecSearch = ms 500, ecPre = ms 8, ecPeak = 4, ecOnRatio = 0.01 }
+  , ecSearch = ms 1500, ecPre = ms 8, ecPeak = 4, ecOnRatio = 0.01 }
   where
     ms t = round (t * fs / 1000)
 
@@ -292,8 +295,12 @@ echoSearch cfg st
   -- 499 ms -- one millisecond inside a 500 ms window -- for the whole
   -- of a call, at a return loss of 0.0 dB.
   | bestLag <= lo + edge || bestLag >= ecSearch cfg - edge = Nothing
-  | best > ecPeak cfg * avg, avg > 0
-  , best > 2 * rival = Just (bestLag, best / avg)
+  -- The tests are on the coarse grid against the coarse grid.  A comb
+  -- of peaks -- the echo of a signal that repeats -- is undersampled by
+  -- the stride exactly as much for the rival as for the winner, so the
+  -- comparison holds; the refined peak is only for where to aim.
+  | coarse > ecPeak cfg * avg, avg > 0
+  , coarse > 2 * rival = Just (bestLag, coarse / avg)
   | otherwise = Nothing
   where
     ref = esRef st
@@ -308,8 +315,15 @@ echoSearch cfg st
     startOf l = (rxFrom - l) - (esRefEnd st - refLen)
     -- an echo cannot come back sooner than our own transmit is old
     lo = max 0 (esRxAt st - esRefEnd st)
-    lags = [ l | l <- [lo .. ecSearch cfg]
-               , let o = startOf l, o >= 0, o + w <= refLen ]
+    -- Every fourth lag, then the neighbours of the winner.  Twelve
+    -- thousand lags at full resolution is three times what this loop
+    -- can afford in a block interval -- three calls in a row lost their
+    -- start-up at R2 with the loop starved -- and a coherent peak at
+    -- 1800 Hz is 4.4 samples wide, so a stride of four never lands more
+    -- than a sample and a half from it, and the refinement recovers the
+    -- exact lag the aiming wants.
+    valid l = let o = startOf l in o >= 0 && o + w <= refLen
+    lags = [ l | l <- [lo, lo + 4 .. ecSearch cfg], valid l ]
     scores = [ (score l, l) | l <- lags ]
     -- Two accumulator passes over the window, rather than five passes and
     -- three thousand-element vectors.  The vector form was the whole cost
@@ -347,8 +361,9 @@ echoSearch cfg st
           nrm = sqrt nsq'
       in if nrm <= 0 || rxNorm <= 0 then 0
          else abs dt' / (nrm * rxNorm)
-    best = maximum (map fst scores)
-    bestLag = snd (head [ p | p <- scores, fst p == best ])
+    coarse = maximum (map fst scores)
+    coarseLag = snd (head [ p | p <- scores, fst p == coarse ])
+    (_, bestLag) = maximum [ (score l, l) | l <- [coarseLag - 4 .. coarseLag + 4], l >= lo, valid l ]
     avg = sum (map fst scores) / fromIntegral (length scores)
     -- The best peak anywhere but next to the winner.  A reflection is
     -- one place on the line and correlates nowhere else; a signal that
@@ -359,7 +374,7 @@ echoSearch cfg st
     -- by the line, aims the filter there, and drops the taps that were
     -- converging.  Comparing against the mean does not catch it -- a
     -- comb of peaks lifts the mean too -- and this does.
-    rival = maximum (0 : [ c | (c, l) <- scores, abs (l - bestLag) > 160 ])
+    rival = maximum (0 : [ c | (c, l) <- scores, abs (l - coarseLag) > 160 ])
     edge = 2 * ecPre cfg
 
 -- | Point the filter at a delay the search found, reaching 'ecPre' in
