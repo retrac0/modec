@@ -355,22 +355,22 @@ non-trellis worse (no coding gain: corrupt receive twice), and 12000 and
 1.2 s echo any more than modec's could, which is why the failure was
 symmetric.
 
-`Modec.Echo` searched 500 ms for its echo, because voip.ms had put one
-at 116 ms. It now reaches 1.5 s at the old cost -- a stride-four grid
-with the acceptance tests kept on that grid, and a refinement only for
-the lag -- which on this bench neither aims nor harms: a live 9600t
-call under it is clean both ways at the same 0.012-0.017 floor, and the
-untouched recordings replay unchanged. Two stronger ideas were tried
-live and withdrawn. A full-resolution 1.5 s search, run every block
-until something is found, starved the real-time loop: three start-ups
-in a row lost at R2. Letting the search run while the far end talked
-aimed at **85 ms** instead of 1159, cancelled nothing, and a filter
-adapting at the wrong delay against a signal it cannot predict took
-9600t's decision error from 0.015 to 0.033. The shape of the real fix
-is clear and is not a bench evening: on a path this late the
-reflection of the aperiodic TRN never arrives inside a quiet window,
-so the canceller would have to be aimed and trained in data mode,
-decision-directed, after the start-up.
+`Modec.Echo` searches 500 ms for its echo, because voip.ms had put one
+at 116 ms, and it stays at 500 ms. Two ways of reaching this one were
+tried tonight and both withdrawn on live evidence. A full-resolution
+1.5 s search, run every block until something is found, starved the
+real-time loop: three start-ups in a row lost at R2. Letting the search
+run while the far end talked aimed at **85 ms** instead of 1159,
+cancelled nothing, and a filter adapting at the wrong delay against a
+signal it cannot predict took 9600t's decision error from 0.015 to
+0.033. A cheaper wide search confined to the quiet windows was built
+but never validated -- the recording it was judged on turned out to be
+of a call that had already failed -- so it is withdrawn for want of
+evidence, not disproven. The shape of the real fix is clear and is not
+a bench evening: on a path this late the reflection of the aperiodic
+TRN never arrives inside a quiet window, so the canceller would have to
+be aimed and trained in data mode, decision-directed, after the
+start-up.
 
 (And a third harness lesson: the sweep overwrites `sweep-<tag>-rx.wav`
 on every run of a tag. Replay the per-call recordings under
