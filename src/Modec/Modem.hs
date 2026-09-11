@@ -851,6 +851,23 @@ modemStep cfg st0 rxBlock newBytes =
         -- one time what arrives /is/ the echo.  Once, and only until
         -- something is found: aiming drops the taps, so doing it again
         -- half way through a training window throws away the training.
+        --
+        -- Tried and withdrawn: looking in every phase.  Through an ATA
+        -- and a softphone the reflection of our conditioning signal
+        -- comes back 1159 ms after it was sent, by which time the far
+        -- end has been talking for half a second and this modem has
+        -- stopped adapting to train on it, so the quiet windows only
+        -- ever hold the echo of a signal that repeats every two
+        -- symbols, which the search rightly refuses.  Searching while
+        -- the far end talked found a peak at 85 ms instead, aimed there,
+        -- and a filter adapting at the wrong delay against a signal it
+        -- cannot predict took 9600t's decision error from 0.015 to
+        -- 0.033.  On a path that late the reflection of the aperiodic
+        -- TRN never arrives inside a quiet window at all, so the
+        -- canceller would have to be aimed and trained in data mode,
+        -- decision-directed, which this does not do; and the ATA's own
+        -- canceller sits at the hybrid where the reflection is born.
+        -- See docs/reference-modem.md.
         aimed e
           | not adapt = e
           | Just _ <- echoDelay e = e

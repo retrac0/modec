@@ -574,13 +574,26 @@ detectRate bits =
 -- signal repeats and E does not, so a bit error in E is a bit error in
 -- the only copy there will ever be.
 -- Returns how many bits have arrived since E ended, along with it.
+--
+-- The anchor is read the same way, and for the same reason.  Against a
+-- CX93001 at 4800 the answering receiver's bits in AR3 are the caller's
+-- R2 repeating with about one error in every sixteen to thirty-two,
+-- and an anchor that had to /decode/ -- four leading zeros, B7, B11
+-- and B15 all exact, and then equal the R2 read earlier -- was refused
+-- on most passes, so the one E was missed and the start-up sat in AR3
+-- until the far end gave up.  Two bits of slack in sixteen still leave
+-- the anchor eleven bits from an E and eight from any other rate
+-- sequence's structure, which is more than the E half itself gets.
 detectE :: Maybe RateSeq -> [Bool] -> Maybe (Int, RateSeq)
 detectE peer bits =
   listToMaybe [ (off, e)
               | (off, w) <- seqWindows bits
-              , Just r <- [decodeRateSeq (take 16 w)]
-              , maybe True (r ==) peer
+              , anchored (take 16 w)
               , Just e <- [decodeESeqNear (drop 16 w)] ]
+  where
+    anchored h = case peer of
+      Just p -> length (filter id (zipWith (/=) h (rateSeqBits p))) <= 2
+      Nothing -> decodeRateSeq h /= Nothing
 
 -- | Points for one of the repeating sources.
 srcPoints :: V32Start -> TxSrc -> Int -> (V32Start, [Point])
@@ -894,8 +907,21 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
             enter AWaitMT s { vsSrc = TxNothing, vsSeenS = True }
         | tooLong 80000 s -> enter (V32Fail "no conditioning signal from the caller") s
         | otherwise -> s
+      -- §6.2: cease transmitting on the caller's S, wait MT, then train
+      -- on the S that persists or reappears.  MT is there so the
+      -- answerer's own echo of R1 has died away before its receiver is
+      -- restarted, and the Recommendation is written for an MT of tens
+      -- of milliseconds against a TRN of at least 533.  Through an ATA
+      -- and a softphone MT measures two seconds -- CA sent at 12.84 s,
+      -- CC heard at 14.86 -- so waiting it out means training 1.3 s
+      -- after the caller's TRN has ended, on whatever it is sending
+      -- by then, and living on how long it keeps repeating R2 before
+      -- it gives up.  A CX93001 pinned to 7200 gave up 40 ms after this
+      -- state ended.  The cap trains inside TRN on any terrestrial
+      -- path; a longer real echo still has the taps ACond adapted.
       AWaitMT
-        | vsSince s >= maybe (sym 64) id (vsTrip s) -> enter ATrainR2 (restart s)
+        | vsSince s >= min (sym 512) (maybe (sym 64) id (vsTrip s)) ->
+            enter ATrainR2 (restart s)
         | otherwise -> s
       -- No 'ratesForError' here, unlike the caller's R2.  The answering
       -- modem's look at the line is taken where its receiver has just

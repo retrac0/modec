@@ -269,15 +269,9 @@ trellis sets partitions into **8 subsets with a 9.0 dB partition gain**,
 12000 and 14400 included. Whatever is wrong is not a mistyped point and
 not a broken Ungerboeck partition.
 
-What is left is narrow: the three rates that fail against hardware --
-7200, 12000, 14400 -- are exactly the three the V.32bis figures add,
-and the ones that work are exactly the V.32 ones. Within a correct
-subset partition the remaining freedom is which *uncoded* bits (Q4, Q5,
-Q6) pick which point inside a subset. Get that wrong and a modem talking
-to itself agrees perfectly while a conformant peer reads noise, which
-is the symmetric both-directions-corrupt failure actually observed.
-That is the next thing to check, against the figures rather than
-against modec.
+(The guess that followed here -- that the uncoded-bit labelling was
+the remaining suspect -- did not survive the Recommendations; see
+"Read against the Recommendations" below.)
 
 **7200 fails earlier, and differently.** `scripts/diag/v32bits.hs`
 prints the descrambled bits the rate-signal detector is reading. At
@@ -286,21 +280,117 @@ receiver produces. At 7200 they are `1010101010101010`, unchanging, for
 the whole 33 s of `ATrainR2` -- a constant alternation, not a signal.
 The receiver never locks onto the caller's TRN at all, so R2 is on the
 line (`v32trace` finds `rate signal 7200 tcm (V.32bis)` at 17.36 s) and
-cannot be read. Whatever 7200 does differently, it does it before the
-rate signal, and the 16-point odd/odd lattice it uses instead of the
-checkerboard is the obvious suspect.
+cannot be read. (The lattice was not it; the answerer was starting
+to train two seconds late, and the caller had given up. Below.)
 
-**Plain V.32 stalls waiting for a signal that may not be coming.**
-Replaying either recording: `AR1` 16.5 s, `ATrainR2` 18.7, `ACond2`
-21.6, **`AR3` 22.3, and nothing after.** `AR3` has exactly two exits,
-signal E or an 80000-symbol timeout, and `detectE` additionally
-requires the sixteen bits *before* E to equal the peer's own rate
-sequence. The reference's S7 gives up before modec's timeout does, so
-the call reads as a silent failure. Whether a V.32 caller sends E at
-all -- §5.3.2 is a V.32bis section -- decides whether the fix is to
-accept a caller that goes straight from R3 to data, or to loosen what
-`detectE` will anchor against. Not yet fixed; the two recordings are
-`sweep-v32-4800-rx.wav` and `sweep-v32-9600-rx.wav`.
+**Plain V.32 stalled in AR3** -- replaying either recording reaches
+`AR3` at 22.3 s and never leaves. The reading at the time was that a
+V.32 caller might send no E. It does (§5.3.2/V.32); the fault was the
+anchor `detectE` demanded. Below.
+
+### Read against the Recommendations (2026-09-10, night)
+
+V.32 (03/93) and V.32bis (02/91) were fetched from the ITU and read
+rather than remembered, and the four were re-examined against them.
+Everything static in the V.32bis path checks out, item by item:
+
+- **Signal E is in V.32 too.** §5.3.2/V.32: "any rate signal other
+  than R1" ends with one E; Figure 4/V.32 shows `R2 | E | B1` on the
+  call side. The "plain V.32 sends no E" reading above was wrong.
+- **Figures 2-1, 2-2, 2-3 and 2-4/V.32bis are `points128`, `points64`,
+  `points32` and `points16at7200` exactly** -- every label extracted
+  from the figures' text layer with its coordinates and diffed, 128/128,
+  64/64, 32/32, 16/16, the method validated on the 9600 set that
+  hardware had already passed.
+- All four trellis sets partition into 8 subsets at 9.0 dB; the uncoded
+  bits are invariant under every rotation, and the subset permutation
+  under rotation is the same one in all four sets.
+- Bits per symbol, uncoded bits, and the packing order `Y0 Y1 Y2 Q3 ..`
+  match §2.3 and the figures' labels for every rate.
+- Levels: the figures draw A, B, C, D at (±6, ±2) for 12000 and 14400
+  and (±3, ±1) for the rest, against set mean powers of 42, 41 and 10,
+  so training and data sit within 0.2 dB at every rate -- which is
+  what normalising both to unit power assumes.
+- Clocks: modec's carrier measures 1800.003 Hz and its symbol rate
+  2400.0000 Bd off its own transmit recording (§2.1: ±1 Hz, ±0.01 %);
+  the reference arrives at +0.1 Hz and +47 ppm through the ATA's clock
+  chain, inside spec both.
+
+**1. Plain V.32 -- fixed, and it was the anchor.** With E in V.32, the
+bit dumps in `AR3` show the caller's R2 repeating with about one error
+in every sixteen to thirty-two bits, and `detectE` required the sixteen
+bits before E to decode exactly and equal the R2 read earlier. E comes
+once. The anchor now tolerates two bits, which leaves it eleven from an
+E and eight from any other sequence's structure. All three stalled
+recordings connect in replay, and on the bench 4800 (both ways of
+pinning it) and 9600 non-trellis now connect and carry data.
+
+**3. 7200 -- fixed, and it was MT.** §6.2 has the answerer cease on the
+caller's S, wait MT, then train on the S that persists. MT is there so
+the answerer's own echo of R1 has died before its receiver restarts,
+and the text assumes an MT of tens of milliseconds against a TRN of at
+least 533. Here MT measures two seconds, so modec trained 1.3 s after
+the caller's TRN had ended, on whatever it was sending by then, and
+lived on how long the caller kept repeating R2. A CX93001 pinned to
+7200 gave up 40 ms after modec finally started listening. The wait is
+now capped at 512 symbols (213 ms) -- inside TRN on any terrestrial
+path, with the taps ACond adapted covering a real echo -- and **7200
+connects and carries the payload both ways.** The cap also moves every
+other start-up's training into TRN where it belongs.
+
+**4. 12000 and 14400 -- it is the echo, and it is quantified.** Nothing
+in the coding is wrong; see the list above. What the bench does have is
+a reflection of modec's own transmission off the ATA's hybrid,
+returning through the softphone **1159 ms later at −28 dB** (found by
+correlating the transmitted answer tone with what came back: the
+"hum" first blamed for a 23 dB tone SNR was modec's own 2100 Hz,
+delayed). The far end arrives 8 dB below modec's transmit level, so the
+uncancelled echo sits 20 dB under the wanted signal, predicting a
+decision-error floor of 0.010; every V.32 call on the bench measures
+0.012 to 0.020 regardless of rate. Against the offline thresholds --
+32-point trellis about 18 dB, 12000 about 20, 14400 about 26 -- that
+floor carries 9600t marginally (the one-in-seven flakes), 9600
+non-trellis worse (no coding gain: corrupt receive twice), and 12000 and
+14400 not at all. The reference modem's own canceller cannot reach a
+1.2 s echo any more than modec's could, which is why the failure was
+symmetric.
+
+`Modec.Echo` searches 500 ms for its echo, because voip.ms had put one
+at 116 ms, and it stays at 500 ms. Two ways of reaching this one were
+tried tonight and both withdrawn on live evidence. A full-resolution
+1.5 s search, run every block until something is found, starved the
+real-time loop: three start-ups in a row lost at R2. Letting the search
+run while the far end talked aimed at **85 ms** instead of 1159,
+cancelled nothing, and a filter adapting at the wrong delay against a
+signal it cannot predict took 9600t's decision error from 0.015 to
+0.033. A cheaper wide search confined to the quiet windows was built
+but never validated -- the recording it was judged on turned out to be
+of a call that had already failed -- so it is withdrawn for want of
+evidence, not disproven. The shape of the real fix is clear and is not
+a bench evening: on a path this late the reflection of the aperiodic
+TRN never arrives inside a quiet window, so the canceller would have to
+be aimed and trained in data mode, decision-directed, after the
+start-up.
+
+(And a third harness lesson: the sweep overwrites `sweep-<tag>-rx.wav`
+on every run of a tag. Replay the per-call recordings under
+`recordings/`, which are never overwritten, when the question is what
+a change did.)
+
+**The bench-side fix is the ATA's own echo canceller.** The doc above
+says to disable it, to keep two adaptive filters off one path. That
+advice assumed modec's could reach the echo; through a softphone it
+cannot, and the HT802V2's LEC sits at the hybrid where the reflection
+is born. Enable it, re-run `v32b-9600t`, and the decision error should
+fall from 0.015 toward the 0.001 the 30 dB noise floor allows -- at
+which point 12000 and 14400 become a real test of modec rather than of
+the line. That is the next thing to do.
+
+**Two lessons for the harness.** Never run the test suite while a bench
+call is in progress: the real-time audio path starves and every
+start-up fails at R2, which looked like a regression for twenty
+minutes. And the recordings begin at process start, not at the call:
+the call arrives around 11 s in, and modec's answer tone runs to 14 s.
 
 ### Roles reversed: blocked at the ATA
 
