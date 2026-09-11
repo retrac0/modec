@@ -56,12 +56,14 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
     nonblock(mo.stdout)
     time.sleep(3)
-    mo.stdin.write(b'ATS0=1\r'); mo.stdin.flush()
-    read_for(mo.stdout, 1.5)
-
     result = {'tag':tag,'mode':mode,'ms':ms}
     m = AT(PORT)
     try:
+        # inside the try: if modec has already died (an option it does not
+        # know, say) this raises, and the far end and baresip still get
+        # cleaned up rather than left off hook
+        mo.stdin.write(b'ATS0=1\r'); mo.stdin.flush()
+        read_for(mo.stdout, 1.5)
         for c in ['AT&F','AT&K0','AT%C0','AT\\N0','ATX4','ATS7=40', ms] + ref_extra:
             m.cmd(c,3,quiet=True)
         r = m.cmd('ATDT2001',45,stop=[b'CONNECT',b'NO CARRIER',b'BUSY',b'NO ANSWER',b'ERROR'],quiet=True)
@@ -99,10 +101,6 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     return result
 
 MODES = [
-    # plain answer tone: the ATA's echo canceller stays on
-    ('v32b-9600t-plain', 'v32bis', 'AT+MS=V32B,0,9600,9600',   ['--v32-rate','9600t','--ans-plain'], [], 16),
-    ('v32b-12000-plain', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--ans-plain'], [], 16),
-    ('v32b-14400-plain', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--ans-plain'], [], 16),
     # trellis or constellation?  9600 non-trellis passed; every trellis rate failed
     ('v32b-9600t', 'v32bis', 'AT+MS=V32B,0,9600,9600', ['--v32-rate','9600t'], [], 16),
     ('v32b-4800',  'v32bis', 'AT+MS=V32B,0,4800,4800', ['--v32-rate','4800'],  [], 16),

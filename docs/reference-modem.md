@@ -393,9 +393,17 @@ the reversals. Measured, same evening, same bench: the reflection of
 the answer tone goes from **−27.6 dB at 1140 ms to −53 dB with no
 correlation at all**; 9600t sits at 0.009–0.016; **12000 connects and
 carries the payload both ways at a decision error of 0.005–0.006**,
-about 22.5 dB, for the first time on any hardware; 14400 connects and
-still cannot read the line, which at 22.5 dB against a 26 dB threshold
-is what the offline sweep said it would do. What is left between 22.5
+about 22.5 dB, for the first time on any hardware -- and again on a
+second call at 0.010-0.011, payload delivered both ways, then a
+retrain once the far end went idle, so it is real and it is marginal;
+14400 connects and still cannot read the line, which at 22.5 dB
+against a 26 dB threshold is what the offline sweep said it would do.
+
+One of the flakes showed its mechanism on the way: a call where
+baresip's RTP stayed at `audio=0/0` for seven seconds after the SIP
+answer. The caller's AA was on the line and never reached modec, and
+the start-up ended `no answer`. When a call fails to train at all,
+look there before looking at the modem. What is left between 22.5
 and the ~30 dB the line's noise floor allows is receiver implementation
 loss -- timing and carrier jitter, equaliser misadjustment -- and that
 is the next thing, and a modec thing.
