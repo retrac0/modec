@@ -54,6 +54,7 @@ module Modec.V32Start
   , chosen
   , v32Bits
   , v32AnsReversals
+  , v32AidB1
   ) where
 
 import Data.Maybe (listToMaybe)
@@ -163,6 +164,8 @@ data V32Start = V32Start
   , vsTrip    :: Maybe Int       -- ^ NT or MT, in samples
   , vsTurns   :: [Int]           -- ^ recent quadrant changes, newest first
   , vsPrevSym :: (Double, Double) -- ^ last raw symbol, for the difference
+  , vsPts     :: [(Double, Double)] -- ^ recent equalised points, newest first, for 'aidB1'
+  , vsAidB1   :: !Bool           -- ^ train the receiver on B1's known symbols; see 'aidB1'
   , vsDescr   :: !Scrambler
   , vsBits    :: [Bool]          -- ^ recent descrambled bits, newest first
   , vsSeenS   :: !Bool
@@ -258,6 +261,97 @@ v32Bits = vsBits
 -- our own canceller can do the job.
 v32AnsReversals :: Bool -> V32Start -> V32Start
 v32AnsReversals b st = st { vsAnsRev = b }
+
+-- | Whether the receiver trains on B1's known symbols; see 'aidB1'.
+v32AidB1 :: Bool -> V32Start -> V32Start
+v32AidB1 b st = st { vsAidB1 = b }
+
+-- | Train the receiver on the far end's B1, whose symbols are known.
+--
+-- §5.4.2 puts 128 symbol intervals of scrambled binary ones, at the
+-- agreed rate and coding, between the far end's E and its data.  Until
+-- now the receiver read them decision-directed, on a constellation it
+-- had just been pointed at: which is the moment the loops most need
+-- the truth and have least of it, and what the handoff's luck was made
+-- of -- 12000 at a decision error of 0.002 on one call and 0.02 on the
+-- next, a minute apart on the same line.
+--
+-- The symbols are predictable because the scrambler is
+-- self-synchronising: its register is the last 23 line bits, and this
+-- end has received them.  From the register at the start of the far
+-- end's E, that E is re-encoded exactly as the far end encoded it, and
+-- the coder state it leaves -- register and quadrant -- with the
+-- convolutional encoder started from zero as §5.4.1 says, encodes 128
+-- symbols of ones into the points the far end put on the line.
+--
+-- Two things stand between those points and the receiver.  The frame:
+-- V.32 is differentially encoded because absolute carrier phase is
+-- unknowable, so the receiver holds the constellation turned by some
+-- quarter turn, and a differentially encoded sequence begun from any
+-- quadrant is the true one turned by a constant -- so the turn is one
+-- unknown, and the eight symbols of E the receiver has just read settle
+-- it against the eight predicted, or refuse to.  And time: the
+-- detector says how many bits past E it fired, so how many of B1's
+-- symbols have already gone by, and the reference begins at the next.
+-- A reference one symbol out is worse than none, and the E comparison
+-- is the check on that too: a misaligned E does not match at any turn.
+aidB1 :: Int -> RateSeq -> V32Start -> V32Start
+aidB1 off e s
+  | not (vsAidB1 s) = s
+  | Nothing <- vsRate s = s
+  | n < 16 || length lineBits < off + 16 + 23 = s
+  | best > 0.02 = s                       -- E not found in the point history
+  | received < 16 || agree * 10 < received * 9 = s  -- the prediction is checked against B1 already in hand
+  | otherwise = s { vsRx = qamRxRef (map (turn k) (drop received b1)) (vsRx s) }
+  where
+    Just rate = vsRate s
+    far = vsFar s
+    -- The far end's B1 -- 128 symbol intervals of scrambled ones at the
+    -- agreed rate and coding (§5.4.2) -- is predictable, because the
+    -- scrambler is self-synchronising: its register is the last 23 line
+    -- bits, and this end has received them.  So the E that precedes B1
+    -- is re-encoded from that register, and the coder state it leaves
+    -- encodes the 128 ones into the points the far end put on the line.
+    --
+    -- Two unknowns stand between those points and the receiver, and both
+    -- are settled by evidence rather than computed, because a constant
+    -- that is merely computed is the kind that is right on this receiver
+    -- and wrong on the next.  The frame: V.32 is differentially encoded
+    -- because absolute phase is unknowable, so the constellation is held
+    -- turned by some quarter turn.  And where E sits among the received
+    -- points: the detector's offset gives the register but not the
+    -- point index, which lags it by a handful of symbols.  So the
+    -- predicted E is searched for in the points near where the offset
+    -- says, at every turn -- a real E match is unmistakable, 1e-5 per
+    -- symbol against 2 for anything else -- and that settles both.
+    --
+    -- Then the prediction is checked before it is trusted: the B1
+    -- symbols the far end has *already* sent are in hand, and the
+    -- predicted B1 must agree with them by quadrant.  A false E match --
+    -- the point search landing on a scrambler phase the register does
+    -- not correspond to -- predicts B1 that disagrees completely (0 of
+    -- 57 one call, 57 of 57 the next), and injecting the wrong points
+    -- wrecks the very loops this is meant to help.  Checked, it only
+    -- ever helps.
+    lineBits = concat [ let (a, b) = dibitOfTurn t in [b, a] | t <- vsTurns s ]
+    regBefore = scramblerFromBits (take 23 (drop (off + 16) lineBits))
+    (sc', q', ePts) = codedPoints far regBefore (False, False) (eSeqBits e)
+    (_, b1) = encodeSymbols far rate (replicate (128 * rateBitsPerSymbol rate) True) (txCoderFrom sc' q')
+    pts = reverse (vsPts s)              -- oldest first
+    n = length pts
+    expectO = n - off `div` 2 - 8
+    turn j (x, y) = case j `mod` (4 :: Int) of
+      0 -> (x, y); 1 -> (negate y, x); 2 -> (negate x, negate y); _ -> (y, negate x)
+    costAt o j = sum [ (a - c) * (a - c) + (b - d) * (b - d)
+                     | ((a, b), p) <- zip (drop o pts) ePts, let (c, d) = turn j p ] / 8
+    (best, o0, k) = minimum [ (costAt o j, o, j)
+                            | o <- [max 0 (expectO - 16) .. min (n - 8) (expectO + 16)], j <- [0 .. 3] ]
+    -- B1's symbols already received: everything after the E that was
+    -- found, checked by quadrant against the prediction
+    gotB1 = drop (o0 + 8) pts
+    received = length gotB1
+    quad (x, y) = (x >= 0, y >= 0)
+    agree = length [ () | (g, p) <- zip gotB1 (map (turn k) b1), quad g == quad p ]
 
 -- | Whether this turned out to be a V.32bis call: Table 5 Note 1 makes
 -- it V.32bis only if both rate signals announce it, so both halves of
@@ -391,7 +485,7 @@ v32StartInit fs dir offer = V32Start
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
   , vsMark = Nothing, vsTrip = Nothing
-  , vsTurns = [], vsPrevSym = (0, 0)
+  , vsTurns = [], vsPrevSym = (0, 0), vsPts = [], vsAidB1 = True
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
   , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0
@@ -445,6 +539,7 @@ observe st rx = st
   , vs1800Run = if tone1800 then vs1800Run st + VS.length rx else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
   , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsDescr = descr', vsBits = bits'
+  , vsPts = take 128 (reverse (map qsPoint syms) ++ vsPts st)
   -- The best look at the far end's training, not the last one.  The
   -- error is an exponential mean, so anything that disturbs it -- the
   -- receiver still converging when TRN starts, a click, the turn-around
@@ -513,7 +608,7 @@ observe st rx = st
     -- the change rather than the position costs nothing and owes
     -- nothing to a carrier loop that has no absolute reference anyway.
     (turns, prev') = quarterTurns syms (vsPrevSym st)
-    turns' = take 64 (reverse turns ++ vsTurns st)
+    turns' = take 128 (reverse turns ++ vsTurns st)
     dibits = concat [ [a, b] | k <- turns, let (a, b) = dibitOfTurn k ]
     (descr', got) = descrambleRun (vsFar st) (vsDescr st) dibits
     bits' = take 512 (reverse got ++ vsBits st)
@@ -865,7 +960,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- because the far end's real data then arrives just as we open.
       -- Worth fixing, and a separate thing from Figure 4.
       OB1 -> case detectE (vsPeer s) (vsBits s) of
-        Just _ | Just rate <- vsRate s -> enter (V32Up rate) s
+        Just (off, e) | Just rate <- vsRate s -> enter (V32Up rate) (aidB1 off e s)
         _ | tooLong 80000 s -> enter (V32Fail "no E from the answering modem") s
           | otherwise -> s
 
@@ -971,8 +1066,8 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | otherwise -> s
       AR3 | vsSince s < sym 128 -> s
       AR3 -> case detectE (vsPeer s) (vsBits s) of
-        Just (_, _) | Just rate <- vsRate s ->
-          enter AE (unlockRx s) { vsSrc = TxCoded (eSeqBits (chosen rate))
+        Just (off, e) | Just rate <- vsRate s ->
+          enter AE (aidB1 off e (unlockRx s)) { vsSrc = TxCoded (eSeqBits (chosen rate))
                      , vsAfterE = Just rate, vsSince = 0 }
         _ | tooLong 80000 s -> enter (V32Fail "no E from the calling modem") s
           | otherwise -> s

@@ -1,7 +1,8 @@
 -- | V.22 and V.22bis: 600 Bd PSK and QAM on 1200/2400 Hz.
-module Suite.V22 (v22Tests) where
+module Suite.V22 (v22Tests, framerTests) where
 
 import Control.Monad (forM_)
+import Data.Bits (testBit)
 import Data.List (isSuffixOf)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
@@ -16,6 +17,34 @@ import Modec.FSK
 
 -- | V.22 data pump: bits through the channel, ignoring the start-up
 -- bits before the descrambler has synchronised.
+-- | A character stream with one bit missing, fed a block at a time.
+-- The framer must realign -- taking any space as a start bit, it never
+-- did, and put out high-bit garbage for the rest of the stream.
+framerTests :: TestTree
+framerTests = testGroup "start-stop framing"
+  [ testCase "the framer realigns after a lost bit" $ do
+      let text = map (fromIntegral . fromEnum) (concat (replicate 20 "the quick brown fox jumps over the lazy dog 0123456789\r\n"))
+          bitsOf w = False : [ testBit w i | i <- [0 .. 7] ] ++ [True]
+          stream = concatMap bitsOf text
+          lost = take 1000 stream ++ drop 1001 stream
+          feed st [] acc = (st, acc)
+          feed st bs acc = let (now, rest) = splitAt 160 bs
+                               (st', out) = asyncRxBits st now
+                           in feed st' rest (acc ++ out)
+          (_, got) = feed (asyncRxInit framing8N1) lost []
+          tailOf n = reverse . take n . reverse
+      assertEqual "the last forty characters" (tailOf 40 text) (tailOf 40 got)
+  , testCase "a valid stream comes through unchanged, block by block" $ do
+      let text = map (fromIntegral . fromEnum) "pack my box with five dozen liquor jugs 9876543210\r\n"
+          bitsOf w = False : [ testBit w i | i <- [0 .. 7] ] ++ [True]
+          stream = replicate 30 True ++ concatMap bitsOf text ++ replicate 30 True
+          feed st [] acc = (st, acc)
+          feed st bs acc = let (now, rest) = splitAt 37 bs
+                               (st', out) = asyncRxBits st now
+                           in feed st' rest (acc ++ out)
+      assertEqual "bytes" text (snd (feed (asyncRxInit framing8N1) stream []))
+  ]
+
 v22Tests :: TestTree
 v22Tests = testGroup "V.22 data pump" $
   [ testCase (show ch ++ ": " ++ name) $ do

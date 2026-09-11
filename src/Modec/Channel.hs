@@ -20,6 +20,7 @@ module Modec.Channel
   , tapeArchive
   , noisySwitched
   , profile
+  , impairments
   , applyChannel
   , mixAt
   , echoPath
@@ -633,3 +634,70 @@ erfApprox z =
   let t = 1 / (1 + 0.3275911 * abs z)
       y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp (-z * z)
   in if z >= 0 then y else -y
+
+-- | The simulator, driven from a named profile and repeated
+-- @--impair K=V@ options: what @modec replay@, @modec modem@ and the
+-- bench all take, so a line can be named the same way everywhere.
+--
+-- An unknown key is an error rather than a shrug.  It used to be
+-- ignored silently, which meant a misspelt sweep reported the numbers
+-- for an unimpaired line and looked like very good news.
+impairments :: Maybe String -> [String] -> Channel
+impairments name = foldl one base
+  where
+    base = case name of
+      Nothing -> idealChannel
+      Just n -> case profile n of
+        Just c -> c
+        Nothing -> error ("no such channel: " ++ n)
+    one ch kv = case break (== '=') kv of
+      (k, '=' : v) -> set ch k (read v :: Double)
+      _ -> error ("--impair wants KEY=VALUE, got " ++ show kv)
+    set ch k val = case k of
+      -- the line
+      "snr"     -> ch { chSnrDb = Just val }
+      "freq"    -> ch { chFreqOffsetHz = val }
+      "rate"    -> ch { chRateOffset = val }
+      "gain"    -> ch { chGain = fromDb val }
+      "dc"      -> ch { chDcOffset = val }
+      "band"    -> ch { chBandpass = Just (val, 3400) }
+      "clip"    -> ch { chClip = Just val }
+      "hum"     -> ch { chHum = Just (50, val) }
+      "seed"    -> ch { chSeed = round val }
+      "dropout" -> ch { chDropout = Just (0.02, val) }
+      "echo"    -> ch { chEcho = Just (0.02, val) }
+      -- analogue
+      "softclip" -> ch { chNonlin = Just (SoftClip val) }
+      "harm2"   -> ch { chNonlin = Just (Polynomial val (a3Of ch)) }
+      "harm3"   -> ch { chNonlin = Just (Polynomial (a2Of ch) val) }
+      "sing"    -> ch { chSing = Just (val, snd (singOf ch)) }
+      "wobble"  -> ch { chWobble = Just (val, 4) }
+      "phasejit" -> ch { chPhaseJitter = Just (val, 60) }
+      "singgain" -> ch { chSing = Just (fst (singOf ch), val) }
+      -- time
+      "jitter"  -> ch { chJitter = WalkJitter val (4 * val) }
+      -- the survey's sine jitter, and its delay distortion: the axes
+      -- modec-bench v32-survey sweeps, so a live line can be set to
+      -- the same point and the two compared
+      "sinejit" -> ch { chJitter = SineJitter val 2 }
+      "delaydist" -> ch { chDelayDist = val }
+      "slips"   -> ch { chJitter = Slips 1.0 val }
+      "wow"     -> ch { chJitter = WowFlutter [(val / 100, 1)] }
+      "flutter" -> ch { chJitter = WowFlutter [(val / 100, 25)] }
+      -- the digital span
+      "ulaw"    -> ch { chCodec = if val /= 0 then Just Ulaw else Nothing }
+      "alaw"    -> ch { chCodec = if val /= 0 then Just Alaw else Nothing }
+      "biterr"  -> ch { chBitError = Just val }
+      "loss"    -> ch { chLoss = Just (Loss 0.02 (val * 2) 0.5 RepeatFrame) }
+      "burst"   -> ch { chLoss = Just (lossOf ch) { lsToGood = 1 / max 1 val } }
+      "stuck"   -> ch { chStuck = Just (Stuck val 0.02 0xFF) }
+      -- transient
+      "impulse" -> ch { chImpulse = Just (Impulse val 0.3 1400 0.002) }
+      "hits"    -> ch { chHits = Just (Hits val 0.006 (-6)) }
+      _         -> error ("no such impairment: " ++ k)
+    a2Of ch = case chNonlin ch of { Just (Polynomial a _) -> a; _ -> 0 }
+    a3Of ch = case chNonlin ch of { Just (Polynomial _ a) -> a; _ -> 0 }
+    singOf ch = case chSing ch of { Just p -> p; Nothing -> (0.004, 0.7) }
+    lossOf ch = case chLoss ch of
+      Just l -> l
+      Nothing -> Loss 0.02 0.0005 0.5 RepeatFrame

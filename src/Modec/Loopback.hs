@@ -29,6 +29,7 @@ import qualified Data.Vector.Storable as VS
 import Data.Word (Word8)
 
 import Modec.Channel
+import Modec.Channel.Live
 import Modec.DSP (Signal, fromDb)
 import Modec.Standards (Role (..), Standard)
 import Modec.Modem
@@ -36,7 +37,16 @@ import Modec.Modem
 data LoopConfig = LoopConfig
   { lcOrig    :: ModemConfig
   , lcAnswer  :: ModemConfig
-  , lcLine    :: Channel   -- ^ applied to each direction, per block
+  , lcLine    :: Channel
+    -- ^ applied to each direction, a block at a time with its state
+    -- carried across blocks ('Modec.Channel.Live').  It was
+    -- 'applyChannel' per block with a fresh seed each time, which is
+    -- fine for noise and meaningless for anything with memory: a filter
+    -- restarted every twenty milliseconds splatters at every seam, a
+    -- warp can only read inside its block, and a 1 % clock offset was a
+    -- splice every block rather than a drift.  The start-up's fragility
+    -- under timing impairments, plain on the bench, could not have shown
+    -- here.
   , lcEcho    :: [(Double, Double)]
     -- ^ Near-end echo: each modem's own transmit, reflected back into its
     -- own receiver as @(delay seconds, linear gain)@ taps.  This is the
@@ -82,6 +92,9 @@ data LoopResult = LoopResult
   , lrDelayAnswer :: Maybe Int
   , lrEvmOrig :: Maybe Double   -- ^ slicer error at the end, negative once armed
   , lrEvmAnswer :: Maybe Double
+  , lrEvmAt :: [(Double, Double, Double)]
+    -- ^ every half second of data mode: time, the calling modem's slicer
+    -- error, the answering modem's -- the handoff, watched
   }
 
 -- | Place the call, send @textO@ one way and @textA@ the other, and stop
@@ -89,6 +102,7 @@ data LoopResult = LoopResult
 loopback :: LoopConfig -> [Word8] -> [Word8] -> LoopResult
 loopback lc textO textA =
     go 0 (modemInit cfgO) (modemInit cfgA) quiet quiet VS.empty VS.empty False False Nothing [] [] [] []
+       (liveInit fs (lineFor 1)) (liveInit fs (lineFor 2)) []
   where
     cfgO = lcOrig lc
     cfgA = lcAnswer lc
@@ -110,13 +124,11 @@ loopback lc textO textA =
     mix a b = VS.generate (VS.length a) $ \i ->
       a VS.! i + (if i < VS.length b then b VS.! i else 0)
     -- Each direction gets its own seed so the two are not the same
-    -- noise, and each block its own so a longer call is not the same
-    -- noise repeated.
-    line :: Int -> Int -> Signal -> Signal
-    line k i x =
-      let ch = lcLine lc
-      in applyChannel fs ch { chSeed = chSeed ch * 1000003 + k * 7919 + i } (VS.map (* gain) x)
-    go t so sa fromA fromO hO hA sentO sentA fullAt rxO rxA evO evA
+    -- noise; the live channel moves the seed itself from block to block.
+    lineFor k = let ch = lcLine lc in ch { chSeed = chSeed ch * 1000003 + k * 7919 }
+    line :: Int -> LiveChannel -> Signal -> (LiveChannel, Signal)
+    line k st x = liveStep fs (lineFor k) st (VS.map (* gain) x)
+    go t so sa fromA fromO hO hA sentO sentA fullAt rxO rxA evO evA lineO lineA evmAt
       | t >= lcMaxT lc = out
       | Just t0 <- fullAt, t - t0 >= 2 = out
       | otherwise =
@@ -125,8 +137,10 @@ loopback lc textO textA =
               queueA = if modemConnected sa && not sentA then textA else []
               hO' = push hO fromO
               hA' = push hA fromA
-              (so', audioO, bytesO, eO) = modemStep cfgO so (mix (line 1 i fromA) (reflect hO')) queueO
-              (sa', audioA, bytesA, eA) = modemStep cfgA sa (mix (line 2 i fromO) (reflect hA')) queueA
+              (lineO', toO) = line 1 lineO fromA
+              (lineA', toA) = line 2 lineA fromO
+              (so', audioO, bytesO, eO) = modemStep cfgO so (mix toO (reflect hO')) queueO
+              (sa', audioA, bytesA, eA) = modemStep cfgA sa (mix toA (reflect hA')) queueA
               rxO' = reverse bytesO ++ rxO
               rxA' = reverse bytesA ++ rxA
               sentO' = sentO || not (null queueO)
@@ -136,14 +150,17 @@ loopback lc textO textA =
               fullAt' = case fullAt of
                 Just _ -> fullAt
                 Nothing -> if full then Just t else Nothing
+              evmAt' = case (modemV32Evm so', modemV32Evm sa') of
+                (Just eo, Just ea) | i `mod` 25 == 0 -> (t, abs eo, abs ea) : evmAt
+                _ -> evmAt
           in go (t + fromIntegral blk / fs) so' sa' audioA audioO hO' hA' sentO' sentA' fullAt'
-                rxO' rxA' (reverse eO ++ evO) (reverse eA ++ evA)
+                rxO' rxA' (reverse eO ++ evO) (reverse eA ++ evA) lineO' lineA' evmAt'
       where
         out = LoopResult (reverse rxO) (reverse rxA) (reverse evO) (reverse evA)
                 (any isUp evO && any isUp evA)
                 (modemEchoErle so) (modemEchoErle sa)
                 (modemEchoDelay so) (modemEchoDelay sa)
-                (modemV32Evm so) (modemV32Evm sa)
+                (modemV32Evm so) (modemV32Evm sa) (reverse evmAt)
         isUp e = case e of { EvConnected {} -> True; _ -> False }
 
 -- | Did the call come up and carry both texts without an error?

@@ -75,6 +75,7 @@ data ModemConfig = ModemConfig
   , mcRetrainMax :: Int    -- ^ how many retrains one call may spend before giving up
   , mcProbe    :: Bool     -- ^ measure an echo path instead of placing a call
   , mcAnsReversals :: Bool -- ^ V.25 phase reversals on the answer tone; see 'v32AnsReversals'
+  , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols; see 'aidB1'
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -105,6 +106,7 @@ defaultModemConfig fs role modes = ModemConfig
   , mcRetrainMax = 4
   , mcProbe = False
   , mcAnsReversals = True
+  , mcAidB1 = True
   , mcMaxEvm = 1.0
   }
 
@@ -209,7 +211,7 @@ modemInit cfg
   -- through a capabilities exchange that cannot name the one thing it
   -- can do.
   | [s] <- hcModes hs, isV32 s, not (hcV8 hs) =
-      base { msMode = Starting32 (v32AnsReversals (mcAnsReversals cfg) (v32StartInit fs ((hcRole hs)) (v32Offer cfg))) V32Committed }
+      base { msMode = Starting32 (v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartInit fs ((hcRole hs)) (v32Offer cfg)))) V32Committed }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataModeFor cfg s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
@@ -516,14 +518,14 @@ modemStep cfg st0 rxBlock newBytes =
              -- on the alternating pair: that whole time it is
              -- transmitting 600 and 3000 Hz, which no V.22, V.21 or Bell
              -- caller understands.
-             let s32 = v32AnsReversals (mcAnsReversals cfg) (v32StartAfterAnswerTone fs ((hcRole hs)) (v32Offer cfg))
+             let s32 = v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartAfterAnswerTone fs ((hcRole hs)) (v32Offer cfg)))
                  st2 = st1 { msMode = Starting32 s32 V32Committed
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
            -- A.2.2: the answering ladder offering the pair on spec.  The
            -- same handoff, bounded, and with somewhere to go back to.
            HsOfferV32 ->
-             let s32 = v32AnsReversals (mcAnsReversals cfg) (v32StartOffer fs ((hcRole hs)) (v32Offer cfg) (hcV32Offer hs))
+             let s32 = v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartOffer fs ((hcRole hs)) (v32Offer cfg) (hcV32Offer hs)))
                  st2 = st1 { msMode = Starting32 s32 V32Offered
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)

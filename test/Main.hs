@@ -38,7 +38,7 @@ main = do
     , testGroup "frequency shift"
         [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, resampleTests]
     , testGroup "bringing a call up"
-        [handshakeTests, modemTests, v8Tests, telnetTests]
+        [handshakeTests, modemTests, v8Tests, telnetTests, framerTests]
     -- Recorded calls, replayed through the whole modem: the only tests
     -- here whose far end was a real modem on a real line.
     , live

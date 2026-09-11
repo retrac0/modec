@@ -940,6 +940,78 @@ framer, not the modem, and it is cheap to fix.
 
 The whole of it is on the page, beside the noise curves.
 
+### Iterating the receiver against the simulator (2026-09-11)
+
+Three things came out of asking whether the offline harness could stand
+in for the bench.
+
+**The loopback could not have reproduced any of it.** `Modec.Loopback`
+applied the line with `applyChannel` per block and a fresh seed each
+time: fine for noise, meaningless for anything with memory. A band-pass
+restarted every twenty milliseconds splatters at every seam; a warp can
+only read inside its own block; a 1 % clock offset is a splice every
+block rather than a drift. It runs through `Modec.Channel.Live` now,
+with the state carried across blocks, and `modec-bench v32-startup`
+puts the live matrix's own conditions through a full call, start-up
+included. It reproduces the bench: `jit-walk`, `delay2`, `clock1`,
+`slips2`, `hits`, `loss` and `echo` fail offline as they failed live,
+and `carrier15` reads clean at 9600 trellis and 12000 in both. The
+survey never exercised the start-up, which is why it had said these
+were survivable.
+
+One axis is already diagnosed. Against 2 ms of group delay distortion
+-- what a loaded subscriber loop has -- the trained pump fails at
+1400 training symbols and reads **zero errors at 4000**, at 0.002 and
+at 0.006 of LMS step alike:
+
+| rate | delay | training symbols | step | errors | settled EVM |
+| --- | --- | --- | --- | --- | --- |
+| 9600 trellis | 2 ms | 1400 | 0.002 | 1740 | 0.0363 |
+| 9600 trellis | 2 ms | 4000 | 0.002 | **0** | 0.0039 |
+| 9600 trellis | 2 ms | 1400 | 0.006 | 1732 | 0.0443 |
+| 12000 | 2 ms | 4000 | 0.006 | **0** | 0.0011 |
+
+The equaliser needs more symbols, not a faster step. What a real call
+gives it is TRN's length and then B1, and that is the connection to the
+next item.
+
+**B1 training, and why it must check itself.** §5.4.2 puts 128 symbol
+intervals of scrambled ones between the far end's E and its data, at
+the agreed rate and coding. They are predictable -- the scrambler is
+self-synchronising, so its register is the last 23 line bits and this
+end has them -- so `aidB1` re-encodes the far end's E from that
+register, and the coder state it leaves encodes 128 ones into the
+points the far end put on the line. Two unknowns stand in the way and
+both are settled by evidence rather than arithmetic: the quarter turn
+the receiver happens to hold, and where E sits among the received
+points, which the bit detector's offset gives only to within a few
+symbols. The predicted E is searched for near where the offset says, at
+every turn; a real match is unmistakable, 1e-5 per symbol against 2 for
+anything else.
+
+And then the prediction is checked before it is used, against the B1
+symbols the far end has *already* sent. That is not belt and braces. A
+false E match -- the search landing where the register does not
+correspond -- predicted B1 that disagreed with what arrived **0 of 57
+symbols one call and 57 of 57 the next**, and injecting those points
+made the handoff worse than leaving it alone: 0.021 where
+decision-directed read 0.0001. Checked, it is provably harmless, which
+is the state it is committed in.
+
+**The framer never recovered from a lost bit, and that is most of the
+burst damage.** A start bit is a space that follows a mark. Taking any
+space as a start bit is right until it is wrong: one bit lost from the
+stream and the framer latches onto a data zero, reads the next
+character's start bit as a bad stop bit, drops it, hunts again from a
+data bit, and latches onto the next data zero. Simulated against the
+old rule: after a single deleted bit it **never realigned in twenty
+trials of twenty**, and put out a steady stream of bytes with the high
+bit set -- which is exactly what every burst on the bench was followed
+by, on both modems' outputs, for lines at a time. Insisting on the edge
+it realigns every time, within about fifteen characters. That is the
+2-to-5x in the impulse, hits, dropout, bit-error and frame-loss rows of
+the live matrix, and it was nine characters of Haskell.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores

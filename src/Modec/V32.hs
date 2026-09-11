@@ -28,6 +28,7 @@ module Modec.V32
   ( -- * Scrambler (§4)
     Scrambler
   , scramblerInit
+  , scramblerFromBits
   , scrambleBit
   , descrambleBit
   , scrambleRun
@@ -81,7 +82,7 @@ module Modec.V32
   ) where
 
 import Data.Maybe (listToMaybe)
-import Data.Bits (testBit, (.|.))
+import Data.Bits (setBit, testBit, (.|.))
 import Control.Monad (replicateM)
 import Data.List (foldl')
 import qualified Data.Vector.Unboxed as VU
@@ -104,6 +105,14 @@ newtype Scrambler = Scrambler Int deriving (Eq, Show)
 
 scramblerInit :: Scrambler
 scramblerInit = Scrambler 0
+
+-- | A register from the last 23 line bits, newest first: the state a
+-- self-synchronising scrambler is in after sending them, which is also
+-- the state its descrambler is in after receiving them.  What lets one
+-- end predict what the other will send next when it knows the data --
+-- and for B1 the data is all ones.
+scramblerFromBits :: [Bool] -> Scrambler
+scramblerFromBits bs = Scrambler (foldr (\(i, b) acc -> if b then setBit acc i else acc) 0 (zip [0 ..] (take 23 bs)))
 
 -- | The generating polynomial of each direction (§4): GPC =
 -- 1 + x^-18 + x^-23 for the calling modem, GPA = 1 + x^-5 + x^-23 for

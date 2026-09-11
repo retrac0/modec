@@ -24,7 +24,7 @@ import Modec.Standards
 import Modec.Async
 import Modec.V22
 import Modec.Loopback
-import Modec.Modem (ModemConfig (..), ModemEvent (..))
+import Modec.Modem (ModemConfig (..), ModemEvent (..), defaultModemConfig)
 import Modec.Echo (EchoConfig (..))
 import Modec.V32
 import Modec.V32Pump
@@ -48,7 +48,7 @@ optsP = Opts
 -- | The FSK sweep keeps the bare options it always had, so
 -- @modec-bench --channel answer@ still means what it used to; the V.32
 -- surveys hang off subcommands beside it.
-data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | V32Bench | V32Aided | Loopback (Maybe String)
+data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | V32Bench | V32Aided | V32Startup [String] | V32Handoff | V32Delay | Loopback (Maybe String)
          | V32Echo (Maybe String)
 
 cmdP :: Parser Cmd
@@ -58,6 +58,10 @@ cmdP = hsubparser
   <> command "v32-trace"   (info (pure V32Trace)   (progDesc "V.32: the timing loop block by block through a clock offset"))
   <> command "v32-survey"  (info (pure V32Survey)  (progDesc "V.32: every impairment axis, per rate"))
   <> command "v32-aided"   (info (pure V32Aided)   (progDesc "V.32: what training on known symbols instead of on decisions would be worth, per rate"))
+  <> command "v32-delay" (info (pure V32Delay) (progDesc "V.32: the trained pump against group delay distortion, in errors and settled decision error"))
+  <> command "v32-handoff" (info (pure V32Handoff) (progDesc "V.32: the receiver's decision error in the first seconds of data mode, seed by seed, with and without training on B1"))
+  <> command "v32-startup" (info (V32Startup <$> many (strArgument (metavar "CONDITION")))
+                                 (progDesc "V.32: full calls, start-up included, through every impairment the live matrix has -- does the call come up, and does it carry"))
   <> command "v32-bench"   (info (pure V32Bench)   (progDesc "V.32: the ATA bench's path -- mu-law, +47 ppm, +0.7 Hz -- by SNR, per rate"))
   <> command "loopback"    (info (Loopback <$> optional (strArgument (metavar "MODE")))
        (progDesc "Two whole modems calling each other through the channel simulator: the lowest SNR each mode still carries text at"))
@@ -78,6 +82,9 @@ main = do
     V32Trace   -> v32LoopTrace
     V32Survey  -> v32Survey
     V32Bench   -> v32Bench
+    V32Startup cs -> v32Startup cs
+    V32Handoff -> v32Handoff
+    V32Delay -> v32Delay
     V32Aided   -> v32Aided
     Loopback m -> loopbackSweep m
     V32Echo w  -> v32EchoSweep w
@@ -632,6 +639,107 @@ v32Aided = do
           (daBits, daEvm) = v32DemodulateAided 8000 Answer r preSyms truth sig
       printf "%-7s %4.0f   %7d   %11.4f   %7d   %11.4f\n"
         (drop 4 (show r)) snr (score ddBits) ddEvm (score daBits) daEvm
+
+-- | The live distortion matrix, offline: the same conditions and values
+-- scripts/bench/distort.py puts on a real call, through a full loopback
+-- call with the start-up in it.  On the bench every V.32 rate failed to
+-- *connect* under most of these while the trained pump read through
+-- them in the survey; this is the harness that can now show that,
+-- since the loopback's line carries its state across blocks.
+-- | The handoff, watched: the decision error the answering modem's
+-- receiver reports one, two and four seconds into data mode, on the
+-- bench's own line -- G.711, 30 dB, our own echo 644 ms late and 34 dB
+-- down -- seed by seed, with B1 read decision-directed and with the
+-- receiver trained on it.  What the bench showed as a decade of
+-- variance call to call is what this should show seed to seed.
+-- | The trained pump against group delay distortion at the band edges,
+-- the impairment a real subscriber loop has most of and the one the
+-- survey said broke every rate at 2 ms: errors in 4000 bits and the
+-- settled decision error, per rate, at 30 dB.
+v32Delay :: IO ()
+v32Delay = do
+  putStrLn "rate      delay ms  trn    mu     errors   settled EVM"
+  forM_ [V32R9600T, V32R12000] $ \r ->
+    forM_ [(1.5, 1400, 0.002), (2, 1400, 0.002), (2, 4000, 0.002), (2, 1400, 0.006), (2, 4000, 0.006), (3, 4000, 0.006)] $ \(ms, trn, mu) -> do
+      let payload = prbs (11, 9) 4000
+          (clean, preSyms) = v32ModulateTrained 8000 Originate r 0.5 trn payload
+          sig = applyChannel 8000 (telephoneChannel 30) { chDelayDist = ms } clean
+          (bits, evm) = v32DemodulateTrainedEvmWith (\c -> c { qrEqMu = mu }) 8000 Answer r preSyms sig
+          errs = minimum [ length (filter id (zipWith (/=) (drop 200 payload) (drop (200 + o) bits))) | o <- [0 .. 300] ]
+      printf "%-9s %6.1f   %4d  %.3f   %6d   %9.4f\n" (drop 4 (show r)) ms trn mu errs evm
+
+v32Handoff :: IO ()
+v32Handoff = do
+  printf "%-8s %-5s  %s\n" "rate" "aid" "answering modem's decision error at +1 s, +2 s, +4 s, per seed"
+  -- Which ingredient of the bench's line spoils the handoff: the same
+  -- 12000 call on an ideal line, then with each of the three alone,
+  -- then all together, gate opened so the first seconds can be watched.
+  -- The operating point where the handoff matters: enough noise that
+  -- the decisions during B1 are wrong, which is where training on the
+  -- known symbols can do something the survey's oracle put at ~2 dB.
+  -- Errors counted over the payload, both directions, several seeds.
+  forM_ [V32R9600T, V32R12000] $ \r ->
+    forM_ [20, 18, 16 :: Double] $ \snr ->
+      forM_ [False, True] $ \aid -> do
+        let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosenRate r), mcAidB1 = aid, mcMaxEvmV32 = 3 }
+            lc s = (defaultLoop 8000 [V32bis]) { lcOrig = cfg Originate, lcAnswer = cfg Answer
+                                               , lcLine = (impairments Nothing ["snr=" ++ show snr]) { chSeed = s }, lcMaxT = 24 }
+            errsOf s = let res = loopback (lc s) textO textA
+                           d a b = length (filter id (zipWith (/=) a b)) + abs (length a - length b)
+                       in if lrConnected res then d (lrRxOrig res) textA + d (lrRxAnswer res) textO else 999
+        printf "%-8s %2.0f dB  aid %-5s  errors per seed: %s\n" (drop 4 (show r)) snr (show aid)
+          (unwords [ printf "%3d" (errsOf s) | s <- [1 .. 6] ])
+  forM_ [V32R12000, V32R14400] $ \r ->
+    forM_ [False, True] $ \aid -> do
+      let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosenRate r), mcAidB1 = aid }
+          lc s = (defaultLoop 8000 [V32bis]) { lcOrig = cfg Originate, lcAnswer = cfg Answer
+                                              , lcLine = (impairments Nothing ["ulaw=1", "snr=30"]) { chSeed = s }
+                                              , lcEcho = [(0.644, 0.02)], lcMaxT = 30 }
+          at secs xs = case [ ea | (t, _, ea) <- xs, t >= secs ] of { (v : _) -> v; [] -> 0 / 0 }
+          one s = let res = loopback (lc s) textO textA
+                      xs = lrEvmAt res
+                      t0 = case xs of { ((t, _, _) : _) -> t; [] -> 0 }
+                  in if lrConnected res then map (\d -> at (t0 + d) xs) [1, 2, 4] else [0 / 0, 0 / 0, 0 / 0]
+      printf "%-8s %-5s " (drop 4 (show r)) (if aid then "B1" else "none")
+      forM_ [1 .. 6 :: Int] $ \s -> printf " %s |" (unwords [ printf "%.4f" v | v <- one s ])
+      putStrLn ""
+  where
+    textO = map (fromIntegral . fromEnum) "the quick brown fox jumps over the lazy dog 0123456789\r\n"
+    textA = map (fromIntegral . fromEnum) "pack my box with five dozen liquor jugs 9876543210\r\n"
+
+v32Startup :: [String] -> IO ()
+v32Startup only = do
+  let conds =
+        [ ("clean", []), ("jit-s1", ["sinejit=1"]), ("jit-s3", ["sinejit=3"]), ("jit-walk", ["jitter=0.5"])
+        , ("slips2", ["slips=2"]), ("wow", ["wow=0.3"]), ("flutter", ["flutter=0.1"]), ("clock1", ["rate=0.01"])
+        , ("carrier15", ["freq=15"]), ("delay2", ["delaydist=2"]), ("wobble", ["wobble=2"]), ("phasejit", ["phasejit=10"])
+        , ("softclip", ["softclip=3"]), ("harm2", ["harm2=0.1"]), ("hum", ["hum=0.03"]), ("impulse", ["impulse=5"])
+        , ("hits", ["hits=2"]), ("dropout", ["dropout=0.02"]), ("biterr", ["ulaw=1", "biterr=0.001"])
+        , ("loss", ["loss=0.02"]), ("echo", ["echo=0.2"]) ]
+      want = if null only then conds else [ c | c <- conds, fst c `elem` only ]
+      rates = [ ("v22bis", Nothing, [V22bis]), ("9600t", Just (chosenRate V32R9600T), [V32bis]), ("12000", Just (chosenRate V32R12000), [V32bis]) ]
+      -- the bench's line: G.711, and its noise floor
+      base kvs = impairments Nothing (["ulaw=1", "snr=30"] ++ kvs)
+  printf "%-10s" "condition"
+  forM_ rates $ \(nm, _, _) -> printf "  %-22s" nm
+  putStrLn ""
+  forM_ want $ \(nm, kvs) -> do
+    printf "%-10s" nm
+    forM_ rates $ \(_, pin, modes) -> do
+      let cfg r = (defaultModemConfig 8000 r modes) { mcV32Rates = pin }
+          lc s = (defaultLoop 8000 modes) { lcOrig = cfg Originate, lcAnswer = cfg Answer
+                                          , lcLine = (base kvs) { chSeed = s }, lcMaxT = 40 }
+          cell s = let r = loopback (lc s) textO textA
+                       up = lrConnected r
+                       o = lrRxOrig r == textA; a = lrRxAnswer r == textO
+                   in if not up then "no link" else if o && a then "clean" else if o || a then "one way" else "nothing"
+          cells = map cell [1, 2]
+      printf "  %-22s" (cells !! 0 ++ " / " ++ cells !! 1)
+    putStrLn ""
+  where
+    textO = map (fromIntegral . fromEnum) "the quick brown fox jumps over the lazy dog 0123456789\r\n"
+    textA = map (fromIntegral . fromEnum) "pack my box with five dozen liquor jugs 9876543210\r\n"
+    _ = defaultLoop
 
 v32Bench :: IO ()
 v32Bench =
