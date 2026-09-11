@@ -48,7 +48,7 @@ optsP = Opts
 -- | The FSK sweep keeps the bare options it always had, so
 -- @modec-bench --channel answer@ still means what it used to; the V.32
 -- surveys hang off subcommands beside it.
-data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | Loopback (Maybe String)
+data Cmd = Fsk Opts | V32Timing | V32Carrier | V32Trace | V32Survey | V32Bench | Loopback (Maybe String)
          | V32Echo (Maybe String)
 
 cmdP :: Parser Cmd
@@ -57,6 +57,7 @@ cmdP = hsubparser
   <> command "v32-carrier" (info (pure V32Carrier) (progDesc "V.32: carrier loop gains against the hard channels"))
   <> command "v32-trace"   (info (pure V32Trace)   (progDesc "V.32: the timing loop block by block through a clock offset"))
   <> command "v32-survey"  (info (pure V32Survey)  (progDesc "V.32: every impairment axis, per rate"))
+  <> command "v32-bench"   (info (pure V32Bench)   (progDesc "V.32: the ATA bench's path -- mu-law, +47 ppm, +0.7 Hz -- by SNR, per rate"))
   <> command "loopback"    (info (Loopback <$> optional (strArgument (metavar "MODE")))
        (progDesc "Two whole modems calling each other through the channel simulator: the lowest SNR each mode still carries text at"))
   <> command "v32-echo"    (info (V32Echo <$> optional (strArgument (metavar "TABLE")))
@@ -75,6 +76,7 @@ main = do
     V32Carrier -> v32CarrierSweep
     V32Trace   -> v32LoopTrace
     V32Survey  -> v32Survey
+    V32Bench   -> v32Bench
     Loopback m -> loopbackSweep m
     V32Echo w  -> v32EchoSweep w
 
@@ -597,6 +599,28 @@ v32LoopTrace =
                 ++ "  carrier " ++ show (fromIntegral (round hz) :: Double) ++ " Hz")
 
 v32Survey :: IO ()
+-- | The bench, offline: what the CX93001-through-an-HT802V2 path adds
+-- to an ideal channel, one impairment at a time and then together, so
+-- the loss the receiver shows on hardware can be assigned.  Measured
+-- there: G.711 mu-law, the far clock 47 ppm fast, the carrier 0.1 to
+-- 0.7 Hz off, and about 30 dB of noise once the answer-tone echo was
+-- taken out.
+v32Bench :: IO ()
+v32Bench =
+  forM_ [V32R9600T, V32R12000, V32R14400] $ \r -> do
+    let tel s = telephoneChannel s
+        ulaw c = c { chCodec = Just Ulaw }
+        ppm c = c { chRateOffset = 47e-6 }
+        hz c = c { chFreqOffsetHz = 0.7 }
+        axes =
+          [ ("ideal 30", tel 30), ("ulaw 30", ulaw (tel 30)), ("ideal +47ppm 30", ppm (tel 30))
+          , ("ideal +0.7Hz 30", hz (tel 30)), ("bench 30", hz (ppm (ulaw (tel 30)))) ] ++
+          [ ("bench " ++ show s, hz (ppm (ulaw (tel s)))) | s <- [28, 26, 24, 22, 20 :: Double] ] ++
+          [ ("ideal " ++ show s, tel s) | s <- [24, 22, 20 :: Double] ]
+    putStrLn ("=== " ++ show r)
+    forM_ (v32Fuzz r axes) $ \(nm, e) ->
+      putStrLn ("  " ++ take 22 (nm ++ repeat ' ') ++ (if e == 0 then "ok" else show e ++ " errors"))
+
 v32Survey =
   -- All six, not the three that were here.  The V.32bis rates were
   -- never swept offline at all, which is exactly where a trained

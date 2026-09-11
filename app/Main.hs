@@ -231,7 +231,9 @@ cmdP = hsubparser
                   <> help "on connecting, send the far end a line or two about what was negotiated. `modec answer` sets this")
       <*> pure False        -- moHangupExits
       <*> ignoreBusyP
-      <*> switch (long "ans-plain" <> help "answer tone without V.25 phase reversals, so an echo canceller in the path (an ATA's) stays on instead of standing down for us; for paths whose reflection returns too late for modec's own canceller"))
+      <*> switch (long "ans-plain" <> help "answer tone without V.25 phase reversals, so an echo canceller in the path (an ATA's) stays on instead of standing down for us; for paths whose reflection returns too late for modec's own canceller")
+      <*> option auto (long "line-every" <> value 250 <> showDefault <> metavar "BLOCKS" <> help "blocks between 'line:' reports of the V.32 receiver's decision error and the canceller's return loss (250 is five seconds at 20 ms blocks); 12 shows what happens in the second after CONNECT")
+      <*> option auto (long "max-evm-v32" <> value 0.5 <> showDefault <> metavar "E" <> help "V.32: pass bytes, and do not retrain, while the receiver's decision error is under this fraction of the rate's decision margin. Raising it does not make a link readable: at 14400 an unlocked receiver reports the same error as a locked one, because the grid is that dense"))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and

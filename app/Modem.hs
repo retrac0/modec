@@ -121,6 +121,8 @@ data ModemOpts = ModemOpts
   , moHangupExits :: Bool          -- ^ leave when the call does, rather than back to AT
   , moIgnoreBusy :: Bool          -- ^ stay on the line through busy, congestion and SIT
   , moAnsPlain :: Bool            -- ^ answer tone without V.25 reversals, so the network's canceller stays on
+  , moLineEvery :: Int            -- ^ blocks between line reports (250 = every five seconds at 20 ms)
+  , moMaxEvmV32 :: Double         -- ^ the V.32 byte gate and retrain trigger, as a fraction of the rate's decision margin
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -134,7 +136,7 @@ defaultModemOpts = ModemOpts
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moFormat = Nothing, moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
-  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False }
+  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5 }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -183,7 +185,7 @@ runModem o = do
       -- one the author happened to be looking at.
       configFor role =
         let c0 = defaultModemConfig fs role (moModes o)
-        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcAnsReversals = not (moAnsPlain o)
+        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcAnsReversals = not (moAnsPlain o), mcMaxEvmV32 = moMaxEvmV32 o
               , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
               , mcV32Rates = v32Offered o, mcMnp = mnpCfg
               , mcHandshake = (mcHandshake c0)
@@ -345,7 +347,7 @@ runModem o = do
             -- exists prints "return loss 0.0 dB" every five seconds
             -- through a handshake that has not started cancelling
             -- anything.
-            when (k `mod` 250 == 249 && (modemV32Evm st' /= Nothing
+            when (k `mod` max 1 (moLineEvery o) == max 1 (moLineEvery o) - 1 && (modemV32Evm st' /= Nothing
                                          || modemEchoDelay st' /= Nothing)) $
               say ("line: " ++ line)
 

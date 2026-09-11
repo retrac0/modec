@@ -396,8 +396,81 @@ carries the payload both ways at a decision error of 0.005–0.006**,
 about 22.5 dB, for the first time on any hardware -- and again on a
 second call at 0.010-0.011, payload delivered both ways, then a
 retrain once the far end went idle, so it is real and it is marginal;
-14400 connects and still cannot read the line, which at 22.5 dB
-against a 26 dB threshold is what the offline sweep said it would do.
+14400 connects and still cannot read the line.
+
+The thresholds quoted earlier in this file were wrong, and the survey
+run the same night (`modec-bench v32-survey`, `recordings/bench/`) has
+the real ones for the trained pump on an ideal telephone channel:
+**9600t reads at 16 dB and fails at 14; 12000 at 20 and fails at 16;
+14400 at 22 and fails at 20** (52 errors in four thousand bits). So
+the bench's ~22.5 dB is not hopeless for 14400, it is the edge -- and
+the same survey says what pushes it over: every dense rate dies on the
+mildest timing jitter it offers (sine, 1 sample at 2 Hz: 14400 loses
+1680 bits in 4000, 12000 loses 933), where 9600t rides through.
+
+So the bench's own impairments were put into the simulator
+(`modec-bench v32-bench`: G.711 mu-law, the far clock 47 ppm fast, the
+carrier 0.7 Hz off, on top of the noise) and they do not reproduce it:
+14400 reads through all of them together down to 22 dB, and only at 20
+does the combination cost more than the ideal channel (1457 errors
+against 52). Nor is it timing wander on the live path -- measured off
+the recordings it is 0.04 to 0.08 samples RMS, ten to twenty times
+below the mildest jitter the survey offers. What the offline harness
+does not exercise is the one thing left: it trains the pump itself,
+where a live call hands the pump the equaliser and carrier the real
+start-up converged against a real far end. At 9600t and 12000 that
+handoff is good enough; at 14400 the margin it leaves is what is
+missing, by a decibel or two.
+
+**Caught, with `--line-every 12`.** In the second between CONNECT and
+the retrain, 14400's decision error is **0.008 to 0.010** -- about
+20.5 dB, between the survey's "reads at 22" and "fails at 20" -- and
+12000's is 0.004 to 0.007. The receiver was reading 14400, marginally.
+What declared it unreadable is the retrain gate: `mcMaxEvmV32` is
+**0.5**, not the 1.0 quoted earlier in this file (only the replay
+command ever exposed it), and the gate is the square root of the
+error power against half the rate's decision margin -- 0.078 at 14400,
+so an error power of 0.0061. Every block above that counts as unread,
+and a second of them is a local retrain. At 12000 the same gate is
+0.0119, which the first call cleared and the second call's 0.0168
+excursion breached -- its "could not read the line" once the far end
+went idle. At 9600t it is 0.025, never approached.
+
+That reading lasted twenty minutes. With the gate raised to 0.7 and
+0.8 (the live modem has the option now, `--max-evm-v32`), 14400 holds
+for the whole call with no retrain, and **modec's 14400 transmission
+reaches the reference byte-perfect, 496/496, twice** -- the
+transmitter is proven against real hardware. But what modec received
+was not a payload with a few errors: 10,689 bytes for 464 sent, edit
+distance 460 of 464, random. The 0.5 gate was refusing a link that was
+in fact unreadable, and the default stays at 0.5.
+
+Is the receiver even locked? Computed, not assumed: a receiver whose
+points are scattered like the signal itself reports a nearest-point
+error power of 0.037 on the 128-point grid, 0.056 on the 64, 0.074 on
+the 32. Live: 0.009, 0.005, 0.015. So at 14400 the symbols are mostly
+resolved -- the equaliser and carrier are doing their job -- and the
+bits are random anyway: the loopback's "clean symbols, wrong bytes",
+now on hardware, and one-directional, because **modec's 14400
+transmission reads clean at the reference.** At 20.5 dB of white
+noise the offline pump reads 14400 with a bit in a hundred wrong;
+random output is not that. It looks like a trellis decoder that has lost its
+path and does not find it again. What does that on a real line and not
+in the survey is not yet known: the survey's group-delay rows do not
+single 14400 out (1 ms is fine for 9600t, 12000 and 14400 alike, 2 ms
+breaks all three), so it is not ISI as the simulator models it. And the receiver's quality is not a property of the line: three
+12000 calls an hour apart on the same path ran at 0.005, 0.010 and
+0.012-0.031 -- six decibels between the best and the worst -- and the
+worst, with the gate raised to 0.7, passed bits from a receiver below
+12000's own threshold and delivered nothing readable, where the 0.5
+gate had withheld them. What differs call to call is the state the
+start-up hands the pump. What
+the receiver lacks is the thing §5.4.2 hands
+it for free: B1, 128 symbols of scrambled ones at the data rate and
+coding, a known sequence at the data constellation. This receiver waits
+for 64 ones before arming the framer and does not adapt on them; a
+receiver that trains data-aided on B1 before trusting its own decisions
+is the standard way to close exactly this gap.
 
 One of the flakes showed its mechanism on the way: a call where
 baresip's RTP stayed at `audio=0/0` for seven seconds after the SIP

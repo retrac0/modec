@@ -40,7 +40,7 @@ def read_for(f, secs, until=None):
         time.sleep(0.02)
     return buf
 
-def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
+def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False):
     extra = extra or []; ref_extra = ref_extra or []
     rx = f'{SC}/sweep-{tag}-rx.wav'; tx = f'{SC}/sweep-{tag}-tx.wav'
     log = open(f'{SC}/sweep-{tag}.log','wb')
@@ -73,7 +73,14 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
             out = read_for(mo.stdout, 12, until=b'CONNECT')
             result['modec_connect'] = b'CONNECT' in out
             time.sleep(1.0)
-            os.write(m.fd, PAY_B)                      # reference -> modec
+            if slow:
+                # one line at a time with idle between them, so a
+                # start-stop framer that lost alignment on a bad bit has
+                # marks to find the next start bit against
+                for ln in PAY_B.split(b'\r\n'):
+                    if ln: os.write(m.fd, ln + b'\r\n'); time.sleep(0.4)
+            else:
+                os.write(m.fd, PAY_B)                  # reference -> modec
             mo.stdin.write(PAY_A); mo.stdin.flush()    # modec -> reference
             got_ref = b''; t0=time.time()
             while time.time()-t0 < window:
@@ -101,6 +108,15 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     return result
 
 MODES = [
+    # payload one line at a time: bits mostly right shows as lines mostly intact
+    ('v32b-14400-slow', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--max-evm-v32','0.7'], [], 16, True),
+    ('v32b-12000-slow', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000'], [], 16, True),
+    ('v32b-14400-g07', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--max-evm-v32','0.7','--line-every','12'], [], 16),
+    ('v32b-14400-g08', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--max-evm-v32','0.8','--line-every','12'], [], 16),
+    ('v32b-12000-g07', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--max-evm-v32','0.7','--line-every','12'], [], 16),
+    # line reports every quarter second: the decision error in the second after CONNECT
+    ('v32b-14400-fast', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--line-every','12'], [], 16),
+    ('v32b-12000-fast', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--line-every','12'], [], 16),
     # trellis or constellation?  9600 non-trellis passed; every trellis rate failed
     ('v32b-9600t', 'v32bis', 'AT+MS=V32B,0,9600,9600', ['--v32-rate','9600t'], [], 16),
     ('v32b-4800',  'v32bis', 'AT+MS=V32B,0,4800,4800', ['--v32-rate','4800'],  [], 16),
