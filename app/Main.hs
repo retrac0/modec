@@ -14,6 +14,7 @@ import Dial
 import FakeDongle
 import qualified Modec.Channel as Ch
 import Modec.Link
+import Modec.Echo (EchoConfig (..))
 import Modec.Modem
 import Modec.Replay
 import Modec.Fixture
@@ -243,7 +244,11 @@ cmdP = hsubparser
       <*> many (strOption (long "impair" <> metavar "K=V"
              <> help "impair the line as `modec replay --impair` does, live: the same keys (freq, rate, gain, dc, band, clip, hum, echo, softclip, harm2, harm3, sing, wobble, phasejit, jitter, slips, wow, flutter, ulaw, alaw, biterr, loss, burst, stuck, impulse, hits, dropout), run a block at a time with their state carried across blocks. Repeatable. Filters arrive late by half their length, which a modem cannot see"))
       <*> optional (strOption (long "channel" <> metavar "NAME"
-             <> help "start from a named line profile (voip, longloop, carbon, tape, switched) and apply --impair on top")))
+             <> help "start from a named line profile (voip, longloop, carbon, tape, switched) and apply --impair on top"))
+      <*> option auto (long "echo-data-mu" <> value 0.001 <> showDefault <> metavar "MU"
+             <> help "V.32: the echo canceller's step while the far end is talking, once its data-mode search has aimed it and set its taps. The taps come from the search; this only holds them. The far end's signal is noise to the update, so keep it small; 0 leaves the taps to the search alone")
+      <*> flag True False (long "no-echo-data"
+             <> help "V.32: do not search for or cancel our own echo once the far end is talking. What the canceller did before it could, and the thing to compare against"))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and
@@ -503,6 +508,9 @@ runReplay ro = do
   forM_ (rrPhases r) $ \(t, ph) -> hPrintf stderr "  %6.2f  %s\n" t ph
   forM_ (rrLine r) $ \(t, evm, sps) ->
     hPrintf stderr "  %6.2f  evm %7.4f  sps %8.5f\n" t evm sps
+  forM_ (rrEcho r) $ \(t, lag, erle) ->
+    hPrintf stderr "  %6.2f  echo %s  return loss %5.1f dB\n" t
+      (maybe "unaimed" (\l -> "at " ++ show (round (fromIntegral l / (fs / 1000) :: Double) :: Int) ++ " ms") lag) erle
   forM_ (rrEvents r) $ \(t, e) -> hPrintf stderr "  %6.2f  %s\n" t (describeEvent e)
   hPrintf stderr "%d bytes\n" (length (rrBytes r))
   hSetBinaryMode stdout True

@@ -188,6 +188,25 @@ modemTests = testGroup "full modem duplex" $
         (textA `isInfixOf` rxO')
       assertBool ("14400: text from originate to answer: " ++ show rxA')
         (textO `isInfixOf` rxA')
+  , testCase "a V.32bis call at 12000 through a reflection 644 ms late and 20 dB down" $ do
+      -- The echo an HT802V2 behind a softphone actually returns: our own
+      -- data, 644 ms after it went out, 20 dB under the far end's signal,
+      -- and the same for the length of the call.  Too late for the
+      -- quiet-window search, and with both ends talking for the rest of
+      -- the call, only the data-mode search and its estimate can take it
+      -- out -- and until they did, 12000 never carried a byte on that
+      -- bench at any signal-to-noise ratio, because a reflection 20 dB
+      -- down is an error power of 0.01 and a 64-point constellation
+      -- needs 23 dB of slicer.
+      let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosen V32R12000) }
+          path = [(5152, 0.1), (5155.5, 0.05), (5161.2, 0.02)]
+          (rxO, rxA, evO, evA, _, _) = modemDuplexEcho path (cfg Originate) (cfg Answer) 40 textO textA 45
+      assertBool ("originate events " ++ show evO)
+        (case evO of (EvConnected V32bis (V32Link Originate V32R12000) : _) -> True; _ -> False)
+      assertBool ("answer events " ++ show evA)
+        (case evA of (EvConnected V32bis (V32Link Answer V32R12000) : _) -> True; _ -> False)
+      assertBool ("answer to originate: " ++ show rxO) (textA `isInfixOf` rxO)
+      assertBool ("originate to answer: " ++ show rxA) (textO `isInfixOf` rxA)
   , testCase "a V.32 call wrecked mid-session retrains and carries on" $ do
       -- 5.5.  Half a second of noise loud enough that no receiver could
       -- read through it, on one direction only, and then the line is

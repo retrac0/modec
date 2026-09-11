@@ -169,6 +169,14 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
     return result
 
 MODES = [
+    # The data-mode echo canceller, on and off, at the two rates the
+    # 644 ms reflection kept under a floor.  The window is long so the
+    # scans have time to aim and average; the decision error's course
+    # through the call, in the per-call log, is the measurement.
+    ('v32b-12000-ec',   'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--line-every','25','--max-evm-v32','3'], [], 40),
+    ('v32b-12000-noec', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--line-every','25','--max-evm-v32','3','--no-echo-data'], [], 40),
+    ('v32b-14400-ec',   'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--line-every','25','--max-evm-v32','3'], [], 40),
+    ('v32b-14400-noec', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--line-every','25','--max-evm-v32','3','--no-echo-data'], [], 40),
     # Adverse conditions: noise on the line, scheduled from the call coming
     # up, so a call that trained at its best rate has to hold it or step
     # down.  The reference is in automode (the 1 in AT+MS) so it may

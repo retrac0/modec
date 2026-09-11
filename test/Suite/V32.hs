@@ -453,9 +453,70 @@ runEchoFrom st0 cfg blk tx rx = go 0 st0 []
               st2 = echoPush cfg (VS.slice i take_ tx) st1
           in go (i + take_) st2 (clean : acc)
 
+-- | The same, through the data-mode block: the far end talking for the
+-- whole run, which is what 'echoBlockData' exists for.
+runEchoData :: EchoConfig -> Int -> Signal -> Signal -> (Signal, EchoState)
+runEchoData cfg blk tx rx = go 0 (echoInit cfg) []
+  where
+    n = VS.length rx
+    go i st acc
+      | i >= n = (VS.concat (reverse acc), st)
+      | otherwise =
+          let take_ = min blk (n - i)
+              (st1, clean) = echoBlockData cfg (VS.slice i take_ rx) st
+              st2 = echoPush cfg (VS.slice i take_ tx) st1
+          in go (i + take_) st2 (clean : acc)
+
+-- | Band-limited noise, the shape of a V.32 signal: what both ends of a
+-- data call sound like to a correlator.
+lineNoise :: Int -> Int -> Double -> Signal
+lineNoise seed n amp = VS.map (* amp) (firCentered (firBandpass 8000 600 3000 129) (gaussianNoise seed n 1))
+
 echoTests :: TestTree
 echoTests = testGroup "echo cancellation"
-  [  testCase "the echo is found where a VoIP leg actually puts it" $ do
+  [ testCase "with the far end talking, the data-mode search finds a late reflection and the filter takes it down" $ do
+      -- Measured through an HT802V2 and baresip: our own data back
+      -- 644 ms later, 34 dB down, 20 dB under the far end's signal, and
+      -- steady for the length of the call.  The quiet-window search
+      -- could not reach it and data mode never adapted.
+      let secs = 24; n = 8000 * secs
+          d = 5152                                     -- 644 ms
+          tx = lineNoise 11 n 0.3
+          -- the far end arrives 14 dB under our own transmit level, as it
+          -- does on the bench, so a reflection 34 dB down on what we sent
+          -- is 20 dB under what we are trying to read
+          far = lineNoise 12 n 0.06
+          echo = VS.generate n (\i -> if i >= d then 0.02 * VS.unsafeIndex tx (i - d) else 0)
+          rx = VS.zipWith (+) far echo
+          -- the shipped window and step, a bigger slice so the test
+          -- runs in seconds, and a reach that stops short of the test's
+          -- own silence
+          cfg = defaultEchoConfig { ecFarSlice = 96, ecFarSearch = 6400 }
+          (out, st) = runEchoData cfg 160 tx rx
+          tail_ k v = VS.drop (VS.length v - k) v
+          lastS = 4 * 8000
+          before = VS.zipWith (-) (tail_ lastS rx) (tail_ lastS far)   -- the echo as it arrived
+          after = VS.zipWith (-) (tail_ lastS out) (tail_ lastS far)   -- what is left of it
+          pw v = VS.sum (VS.map (\x -> x * x) v) / fromIntegral (VS.length v)
+          gain = 10 * logBase 10 (pw before / pw after)
+      case echoDelay st of
+        Nothing -> assertFailure "the scan found nothing"
+        Just l -> assertBool ("aimed at " ++ show l ++ ", not " ++ show d) (abs (l - d) <= 6)
+      assertBool ("took the echo down by only " ++ show gain ++ " dB; " ++ echoDebug st) (gain >= 8)
+
+  , testCase "with the far end talking and nothing reflecting, data mode leaves the line alone" $ do
+      -- A canceller that believes a noise peak subtracts a signal that
+      -- was never there; this one must not.  Off until aimed, and never
+      -- aimed by noise, the block comes back untouched.
+      let n = 8000 * 12
+          tx = lineNoise 21 n 0.3
+          far = lineNoise 22 n 0.3
+          cfg = defaultEchoConfig { ecFarSlice = 96, ecFarSearch = 6400 }
+          (out, st) = runEchoData cfg 160 tx far
+      assertEqual "aimed at something on a line with no echo" Nothing (echoDelay st)
+      assertBool "changed the line" (out == far)
+
+  ,   testCase "the echo is found where a VoIP leg actually puts it" $ do
       -- 116 ms is not a guess: it is where dialling the voip.ms echo
       -- test, which returns everything it is sent, put our own signal
       -- back.  The bulk delay the canceller started with spans 20 to

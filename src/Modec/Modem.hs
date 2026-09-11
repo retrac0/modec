@@ -18,6 +18,7 @@ module Modec.Modem
   , modemV32Evm
   , modemV32Line
   , modemEchoErle
+  , modemEchoData
   , modemEchoDelay
   , modemPhase
   , modemV32Phase
@@ -387,6 +388,11 @@ modemEchoDelay st = msEcho st >>= echoDelay
 modemEchoErle :: ModemState -> Maybe Double
 modemEchoErle = fmap echoErle . msEcho
 
+-- | The data-mode canceller's state: on or off, and the share of the
+-- line its filter predicts.  Nothing until it has aimed.
+modemEchoData :: ModemState -> Maybe (Bool, Double)
+modemEchoData st = msEcho st >>= echoDataState
+
 -- | Where the V.32 start-up has got to, for tracing.  'Nothing' once it
 -- is over, or if it never ran.
 modemV32Phase :: ModemState -> Maybe (V32Phase, Bool)
@@ -575,7 +581,7 @@ modemStep cfg st0 rxBlock newBytes =
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsFailed why }, audio, [], [EvFailed why])
     DataV32 role rate pump framer armed ->
-      let (echo', rxClean) = cancelEcho False st n rxBlock
+      let (echo', rxClean) = cancelEchoData st n rxBlock
           -- receive only; what goes on the line is decided further down,
           -- once the protocol layer has had its say
           (pump', gotBits) = v32DataRx fs (role) rate pump rxClean
@@ -878,6 +884,14 @@ modemStep cfg st0 rxBlock newBytes =
           | Just _ <- echoDelay e = e
           | Just (l, _) <- echoSearch (mcEcho cfg) e = echoAim (mcEcho cfg) l e
           | otherwise = e
+
+    -- Data mode: the far end is talking for the rest of the call, and
+    -- the canceller has its own way of working under that; see
+    -- 'echoBlockData'.
+    cancelEchoData st' n' blk = case msEcho st' of
+      Nothing -> (Nothing, blk)
+      Just e -> let (e', clean) = echoBlockData (mcEcho cfg) blk e
+                in (Just e', if n' == 0 then blk else clean)
 
     pushEcho audio = fmap (echoPush (mcEcho cfg) audio)
 

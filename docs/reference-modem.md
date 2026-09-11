@@ -724,10 +724,13 @@ floors, against what each constellation needs to be read at all:
 | 12000 | 64 | ~23 dB | 17.0 dB | **-6** |
 | 14400 | 128 | ~26 dB | 20.2 dB | **-6** |
 
-That floor is the hybrid echo of `docs/reference-modem.md`'s earlier
-section -- the ATA's reflection at 1159 ms, too late for
-`Modec.Echo` to reach -- and it is a ceiling on the whole V.32 family
-that no amount of signal-to-noise can lift. 4800 has eight decibels of
+That floor was taken for the hybrid echo of the earlier section -- the
+1159 ms reflection `--ans-plain` removed -- and it is not quite that:
+the section after this one measures it, and it is a *second*
+reflection, of the data rather than the tone, at 644 ms, that the
+canceller could not reach and, until it was made to work in data mode,
+did not try to. It is a ceiling on the whole V.32 family that no
+amount of signal-to-noise can lift. 4800 has eight decibels of
 margin over it and works. 7200 and 9600 trellis have one, which is why
 they read on a clean line and collapse as soon as any noise eats into
 it. 12000 and 14400 are six decibels *under* the floor before the line
@@ -745,6 +748,128 @@ floor of its own making, and every rate that needs more than about
 reach that reflection -- which is the data-aided work the previous
 section measured at about 2 dB, and the decision-directed aiming that
 section leaves as the next design change.
+
+### The higher rates, debugged: it is echo, and not the one that was fixed (2026-09-11)
+
+The campaign above left 12000 and 14400 under a floor -- a decision
+error of 0.01 to 0.02 on a clean line, 17 to 20 dB of slicer, where a
+64-point constellation needs 23 and a 128-point one 26 -- and the
+section before it had already removed an echo. So the first thing to
+check was whether the floor was echo at all, and that is a measurement,
+not an inference: cross-correlate what modec transmitted against what it
+received, in a window where its own data was going out, and look for
+where the transmission reappears. The far end's signal is uncorrelated
+with ours, so a correlation peak is a reflection, with its delay and
+its level.
+
+Done in the wrong window first. The bench recordings start when the
+process does, some eight seconds before the call, and the window I took
+for "data" held the start-up: the transmit spectrum had lines at 600,
+1800 and 3000 Hz with ten-decibel troughs between, which is the S
+signal's -- two states alternating -- and a periodic reference gives a
+correlator a confident answer at a delay set by arithmetic. The
+per-call recordings start at the call, and the per-call log says where
+CONNECT is; the windows below are a few seconds into data mode, after
+each end's payload, while it idles on scrambled ones.
+
+| call | reflection | gain re our transmit | under the far signal |
+| --- | --- | --- | --- |
+| 12000 at 40 dB | 644 ms | -34.0 dB | -20.4 dB |
+| 14400 at 30 dB | 651 ms | -35.6 dB | -22.1 dB |
+| 9600 trellis at 40 dB | 673 ms | -41.7 dB | -27.9 dB |
+| 4800 at 40 dB | 658 ms | -34.5 dB | -20.6 dB |
+
+**A reflection 20 to 22 dB under the far end's signal is an error
+power of 0.006 to 0.01, which is the floor.** It sits at 644 ms in
+every two-second window of a call -- eight windows, not a sample of
+drift -- so it is one place on the line and it does not move. And in
+the same call the answer tone reflects at -60 dB, which is nothing:
+`--ans-plain` did what it was for, the ATA's canceller converged on
+2100 Hz and cancels it, and then, with both modems transmitting for
+the rest of the call, its double-talk detector froze it there, and the
+wideband reflection of our data goes past it 34 dB down.
+
+Nothing on modec's side could touch it, and the code said so in three
+places. `Modec.Echo` searched 500 ms back; the reflection is at 644.
+It searched only in the start-up's quiet windows, on the principle --
+correct for a canceller's usual step -- that with both ends
+transmitting the far end's signal enters the error term and drives the
+filter off the echo path. And in data mode the modem called it with
+adaptation off, every block, for the length of the call. So every V.32
+rate that needs more than about 20 dB of slicer was under a floor no
+signal-to-noise ratio could lift, which is precisely what the campaign
+measured.
+
+**The fix, in `Modec.Echo`: a canceller that works while the far end
+talks.** In data mode the modem now calls `echoBlockData`. An
+incremental search ('Scan') scores a slice of lags each block against
+a two-second window, band-limited to the modem's own 600-3000 Hz, and
+reaches 900 ms; the filter is aimed on a plurality -- two of the last
+three scans' best lags agreeing for a first aim, three of four to move
+one -- because on a real call the reflection wins the scan two times in
+three and a noise peak wins the third, somewhere different each time.
+Once aimed, the taps come from the scan itself: the correlation of the
+two windows over the taps around the peak, scaled by the one factor
+that minimises the residual over the window, averaged scan to scan,
+read off a dozen taps a block. A slow normalised update holds them. The
+filter switches on by its own rule -- the share of the line it predicts
+-- since the old rule compared residual against received power and
+cannot trigger while the far end is most of what is received.
+
+Four things went wrong on the way and each is in the code's comments,
+because each is a fact about a real-time canceller rather than a slip.
+Estimating all 256 taps from one window is worse than nothing: each tap
+carries the far end's signal as noise, a tenth of the main tap, and 256
+of those sum to five decibels above the echo; only the taps around the
+peak, averaged across scans, come out below it. A correlation divided
+by the reference's energy is the response through the reference's own
+autocorrelation, whose in-band gain is the sample rate over the
+bandwidth, three and a third; unscaled, the filter predicted three
+times the echo. The scores were consed onto a list nothing read until
+the scan finished, so all seven thousand were evaluated in that one
+block: 336 to 370 ms against a budget of 20, seventeen blocks of audio
+gone, which the far end read as junk and answered with a retrain, and
+which looked for two hours like the canceller degrading the
+transmitter. And the switch-on threshold sat a coin toss above the
+estimate's own prediction, since the estimate runs at about half the
+echo. A block-time report in the live loop (`slow block: N ms`) is what
+found the third; a trace of the canceller's state in the line report
+(`canceller on predicting 0.28%`) is what found the fourth.
+
+**What it does.** On the recorded 12000 call whose floor was 0.02: aimed
+at 662 ms nine seconds into data mode, on four seconds later, and the
+reflection in its output down from -35 dB to -44 dB by then and -47.5 dB
+a few seconds after -- nine to twelve decibels of the echo gone, into
+the noise. Live, it aims on every call it has been given (672 to
+690 ms; the jitter buffer sits differently each time), the loop's
+worst block is back to the pump's own 30 to 37 ms, and the far end
+reads clean bytes. A loopback test now puts a -20 dB reflection 644 ms
+late under a 12000 bit/s call with both ends talking and expects the
+text whole both ways, and the modem passes it.
+
+**What it does not do, yet, and why.** The 14400 decision error did not
+move on the call where the canceller aimed and converged, and that
+call's recording says why: its echo is -39 to -41 dB, some 25 dB under
+the far end's signal -- a third of the 0.009 floor at most -- and the
+rest is the receiver's own loss on a hundred and twenty-eight points.
+The same session gave 12000 its best call of the night, 0.002 to
+0.004 with the canceller never aiming, and its worst, 0.02, a minute
+apart on the same line: the state the start-up hands the pump varies
+by a decade call to call, and on a bad handoff the echo is the smaller
+half of the floor. So the echo is out of the way and was not the whole
+of it. What is left is in two places -- the handoff, and the loops on a
+dense grid -- and the data-aided training the section before measured
+at two decibels is aimed at the first.
+
+Two things the block timer turned up belong here too. Even with the
+canceller off, the live loop's worst block at 14400 is 33 to 39 ms,
+nearly twice the budget, and a 12000 call has blocks of 20 to 30: the
+pump itself runs close to the edge, which is a plausible source of the
+bursts the campaign saw and a target on its own. And the reference,
+with its own retrain monitor left on (`AT%E0` was set only in ber.py),
+asks for a retrain about 27 seconds into every 12000 call, on either
+setting of the canceller: its judgement of modec's transmission, not
+of the line.
 
 ### Roles reversed: blocked at the ATA
 

@@ -45,6 +45,7 @@ import Modec.Dtmf
 import Modec.Progress
 import Modec.Hayes
 import Modec.Modem
+import Modec.Echo (EchoConfig (..))
 import Modec.Standards
 import qualified Modec.V32 as V32
 import Modec.Mnp (MnpConfig (..), MnpEvent (..), defaultMnpConfig)
@@ -133,6 +134,8 @@ data ModemOpts = ModemOpts
   , moLineSeed :: Int              -- ^ the noise realisation
   , moImpair   :: [String]         -- ^ @--impair K=V@, as the replay takes them
   , moChannel  :: Maybe String     -- ^ a named profile from "Modec.Channel"
+  , moEchoDataMu :: Double         -- ^ the canceller's step with the far end talking
+  , moEchoData :: Bool             -- ^ search for and cancel the echo in data mode at all
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -148,7 +151,7 @@ defaultModemOpts = ModemOpts
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
   , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5
   , moLineSnr = [], moLineDir = (True, True), moLineSeed = 1
-  , moImpair = [], moChannel = Nothing }
+  , moImpair = [], moChannel = Nothing, moEchoDataMu = 0.001, moEchoData = True }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -198,6 +201,8 @@ runModem o = do
       configFor role =
         let c0 = defaultModemConfig fs role (moModes o)
         in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcAnsReversals = not (moAnsPlain o), mcMaxEvmV32 = moMaxEvmV32 o
+              , mcEcho = (mcEcho c0) { ecDataMu = moEchoDataMu o
+                                     , ecFarSearch = if moEchoData o then ecFarSearch (mcEcho c0) else 0 }
               , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
               , mcV32Rates = v32Offered o, mcMnp = mnpCfg
               , mcHandshake = (mcHandshake c0)
@@ -401,7 +406,8 @@ runModem o = do
                 delay = maybe "" (printf ", echo at %.0f ms" . (\d -> fromIntegral d / (fs / 1000) :: Double))
                               (modemEchoDelay st')
                 erle = maybe "" (printf ", return loss %.1f dB") (modemEchoErle st')
-                line = intercalate ", " (filter (not . null) [evm, dropComma delay, dropComma erle])
+                dataSt = maybe "" (\(on, share) -> printf ", canceller %s predicting %.2f%%" (if on then "on" else "off" :: String) (100 * share)) (modemEchoData st')
+                line = intercalate ", " (filter (not . null) [evm, dropComma delay, dropComma erle, dropComma dataSt])
                 dropComma x = case x of { (',' : ' ' : r) -> r; _ -> x }
             -- Only once there is something to say.  A V.32 call has a
             -- canceller from the first block, so reporting whenever one
@@ -471,6 +477,7 @@ runModem o = do
             , seStartCall = startCall
             , seParams = defaultProgressParams
             , seLine = lineRef, seBanner = bannerRef, seBlock = blockRef
+            , seSlow = \secs at -> logMsg ("slow block: " ++ show (round (secs * 1000) :: Int) ++ " ms at " ++ show (fromIntegral (round (at * 10) :: Int) / 10 :: Double) ++ " s")
             }
       if not (moHayes o) && sip == Nothing
         then do

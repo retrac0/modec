@@ -39,6 +39,7 @@ module Modec.Session
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as B
 import Data.IORef
+import GHC.Clock (getMonotonicTime)
 import qualified Data.Vector.Storable as VS
 
 import Modec.DSP (Signal)
@@ -85,6 +86,8 @@ data Session = Session
     -- ^ a greeting held until the link can carry it and the DTE is
     -- online to send it.
   , seBlock     :: IORef Int
+  , seSlow      :: Double -> Double -> IO ()
+    -- ^ told of a block that took longer than it should: seconds it took, seconds into the session
   }
 
 -- | What the DTE has to say this block.
@@ -159,7 +162,15 @@ runLoop se co = loop
               seWrite se (now VS.++ VS.replicate (blockN - VS.length now) 0)
               writeIORef (seLine se)
                 (if VS.null rest then seStartCall se Originate else LineDialing rest)
-            LineCall st c watch -> call k turn st c watch raw
+            LineCall st c watch -> do
+              -- A real-time loop is judged by its worst block.  Anything
+              -- over twelve of the twenty milliseconds is reported,
+              -- because the far end reads a late block as a gap in the
+              -- carrier and the recording shows nothing.
+              t0 <- getMonotonicTime
+              call k turn st c watch raw
+              t1 <- getMonotonicTime
+              when (t1 - t0 > 0.012) $ seSlow se (t1 - t0) (fromIntegral (k * blockN) / seFs se)
           modifyIORef' (seBlock se) (+ 1)
           done <- coDone co
           unless done loop

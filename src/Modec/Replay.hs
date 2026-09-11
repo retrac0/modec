@@ -28,6 +28,7 @@ import Data.Word (Word8)
 
 import Modec.DSP (Signal)
 import Modec.Modem
+import Modec.Echo (EchoConfig (..))
 import Modec.V22 (rxEvmEstimate, rxSpsEstimate)
 
 data ReplayConfig = ReplayConfig
@@ -50,20 +51,31 @@ data ReplayResult = ReplayResult
     -- whenever 'rcEvery' asks and there is a receiver to ask.  Whichever
     -- receiver is carrying the call: the V.22 one, or the V.32 data pump
     -- once the start-up has handed over to it.
+  , rrEcho   :: [(Double, Maybe Int, Double)]
+    -- ^ time, the delay the echo canceller is aimed at, and its return
+    -- loss, on the same cadence, whenever there is a canceller
   }
 
 replay :: ReplayConfig -> Signal -> ReplayResult
-replay rc x = go (modemInit cfg) 0 [] [] [] []
+replay rc x = go (modemInit cfg) 0 [] [] [] [] []
   where
-    cfg = rcModem rc
+    -- Data-mode echo cancellation is off in a replay, whatever the
+    -- config says.  A replayed modem regenerates its transmit from its
+    -- own data and scrambler state, which matches what was actually
+    -- sent only until the first payload byte diverges them; the echo in
+    -- the recording is of the original.  The search would aim at
+    -- nothing, or at noise, and a fixture's bytes would depend on it.
+    -- To measure the canceller on a recorded call, drive it over the
+    -- recorded transmit as well: scripts/diag/echoscan.hs.
+    cfg = let c = rcModem rc in c { mcEcho = (mcEcho c) { ecFarSearch = 0 } }
     fs = mcRate cfg
     blk = max 1 (round (fs * rcBlock rc)) :: Int
     limit = maybe (VS.length x) (\s -> min (VS.length x) (round (s * fs))) (rcLimit rc)
     every = fmap (\s -> max 1 (round (s / rcBlock rc)) :: Int) (rcEvery rc)
     secs i = fromIntegral (i * blk) / fs
-    go st i bytes evs phs line
+    go st i bytes evs phs line echo
       | i * blk >= limit =
-          ReplayResult (concat (reverse bytes)) (reverse evs) (reverse phs) (reverse line)
+          ReplayResult (concat (reverse bytes)) (reverse evs) (reverse phs) (reverse line) (reverse echo)
       | otherwise =
           let n = min blk (limit - i * blk)
               (st', _, bs, es) = modemStep cfg st (VS.slice (i * blk) n x) []
@@ -82,4 +94,8 @@ replay rc x = go (modemInit cfg) 0 [] [] [] []
                     Just (_, r) -> (t, rxEvmEstimate r, rxSpsEstimate r) : line
                     Nothing -> line
                 _ -> line
-          in go st' (i + 1) (bs : bytes) evs' phs' line'
+              echo' = case every of
+                Just k | i `mod` k == 0, Just _ <- modemEchoErle st' ->
+                  (t, modemEchoDelay st', maybe 0 id (modemEchoErle st')) : echo
+                _ -> echo
+          in go st' (i + 1) (bs : bytes) evs' phs' line' echo'
