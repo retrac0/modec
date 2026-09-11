@@ -9,6 +9,7 @@ import Test.Tasty
 
 import Corpus
 import Suite.Channel
+import Suite.LiveChannel
 import Suite.Dsp
 import Suite.Fsk
 import Suite.Link
@@ -32,6 +33,7 @@ main = do
     -- What the simulator every other measurement here leans on actually
     -- does, as against what it says it does.
     , channelSimTests
+    , liveChannelTests
     , specs
     , testGroup "frequency shift"
         [fx, chunkTests, propertyTests, errorRateTests, channelTests, detectTests, resampleTests]

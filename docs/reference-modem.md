@@ -594,6 +594,158 @@ nothing happening. And a link that had just stepped to 4800 at 13 dB
 went `NO CARRIER` a second later, where the survey says 4800 rides down
 to 10; what ended it is not yet known.
 
+### Error rate against noise, both ways, every mode (2026-09-11)
+
+`modec modem` can now put the channel simulator on a live call.
+`Modec.Channel.Live` is the same `Channel` -- the same record, the same
+profiles, the same `--impair K=V` -- run a block at a time with its
+state carried across blocks: filter histories, delay lines, the random
+walk's last value, the loss chain's state and last good frame, an
+impulse's ring-down into the next block, the running level the noise is
+set against. `--line-snr` sets the noise on a schedule counted from the
+call coming up; `--impair` and `--channel` set everything else;
+`--line-snr-dir` chooses which direction hears it.
+
+Three things could not come over from the whole-signal version and are
+worth knowing. A filter that was centred is causal here and arrives
+late by half its length, which `liveLatency` reports and no modem can
+see. A resampler cannot make samples before they exist, so a clock
+offset is a delay that starts at a second and drifts from there. And
+every warp of time is *biased* rather than clamped: sine jitter swings
+its delay down to zero, and a floor put under it does not delay the
+signal, it flattens the bottom of every cycle into a different
+waveform -- which is a distortion the caller did not ask for, and it
+was in the first version of this module.
+
+**The method.** `scripts/bench/ber.py` places one call per mode per
+signal-to-noise ratio. The reference dials in pinned by `AT+MS` with
+error control and compression off (`AT&K0 AT%C0 AT\N0 AT%E0`), so
+nothing between the two modems corrects anything: what is measured is
+the modulation and the receiver, not a retransmission protocol. The
+handshake runs clean at 40 dB; the noise steps in two seconds after
+that mode's CONNECT, and the payload goes three seconds later still, so
+every byte of every payload crosses a line already at the stated ratio.
+The payload is 24 indexed lines of 62 varied printable characters --
+about 1500 characters, which resolves a character error rate down to
+roughly 7e-4 -- scored line by line: a line is found by its index and
+compared character for character, and counted lost if its index never
+arrives. `modec --max-evm-v32 3` opens the byte gate so that wrong bits
+are delivered rather than withheld, since wrong bits are the
+measurement.
+
+Two mistakes in the first attempt are worth recording, because both
+made the numbers look better than they were. The noise stepped in at a
+fixed thirteen seconds, which is after CONNECT for V.32 but well into
+the payload for the modes that connect in five -- so the first quarter
+of those payloads crossed a clean line, which leaves the character
+error rate about right, a waterfall that steep moves a tenth of a
+decibel, and the count of intact lines badly wrong, because the intact
+ones were the ones sent before the noise arrived. And the payloads went
+both ways at once: with about 4.7 kB in flight in each direction, two
+clean-line calls in a row each had *one* direction demodulate to
+garbage, and which direction it was flipped between runs. Sustained
+full duplex is more than this path carries. Each direction is now
+measured on its own, which also takes the near end's echo of its own
+transmission out of the measurement.
+
+**The comparison.** `scripts/bench/theory.py` gives the textbook error
+rate for each modulation on the bench's own definition of
+signal-to-noise -- white noise over the whole 0-4 kHz band, sigma the
+signal's r.m.s. over 10^(snr/20). A receiver's matched filter keeps
+only the noise in its own band, so
+
+    Eb/N0 [dB] = SNR [dB] + 10 log10(4000 / bit rate)
+
+which is the whole reason 300 bit/s FSK reads at 0 dB and 14400 does
+not. The curves are the standard AWGN results: non-coherent binary FSK
+for Bell 103 and V.21; coherent 4-PSK with a factor of two for
+differential decoding for Bell 212A and V.22; square-QAM with a factor
+of 1.5 where two bits of four are carried in a differentially coded
+quadrant, for V.22bis and V.32 9600; and for the trellis rates the
+uncoded constellation carrying the same payload plus 3 dB, which is the
+usual figure for the 8-state Ungerboeck code and no better than a rule
+of thumb. Character error rate is taken as ten times the bit error
+rate -- one wrong bit per wrong ten-bit character -- which is a floor:
+a start-stop framer does worse than that on both modems, because one
+wrong bit can misalign the characters after it.
+
+**What it measured.** The threshold below is where a direction
+collapses -- past 20 % of characters wrong, or nothing arriving at all
+-- rather than where it crosses 1 %, because the bench contributes
+occasional bursts of its own and one damaged line in twenty-four is
+already 4e-2. Those bursts are real and worth knowing about: at 4 dB on
+a link whose textbook error rate is 3e-8, two lines came back short and
+scrambled, and a six-line burst hit Bell 212A at 40 dB. They are
+intermittent -- the same points ran clean on a repeat -- so a character
+error rate below about 5e-2 on a single call is at the measurement
+floor, and only the dB axis is worth reading.
+
+| mode | rate | theory | reference reads modec | modec reads reference |
+| --- | --- | --- | --- | --- |
+| Bell 103 | 300 | -2.3 | -1.4 (+0.9) | -1.7 (+0.6) |
+| V.21 | 300 | -2.3 | -2.0 (+0.3) | -1.3 (+1.0) |
+| Bell 212A | 1200 | 0.0 | held to 2 | 2.4 (+2.4) |
+| V.22 | 1200 | 0.0 | held to 2 | 5.7 (+5.7) |
+| V.22bis | 2400 | 6.2 | 7.5 (+1.2) | 9.6 (+3.3) |
+| V.32 4800 | 4800 | 6.0 | 7.0 (+1.0) | 9.1 (+3.1) |
+| V.32 9600 | 9600 | 12.3 | 14.5 (+2.2) | 21.4 (+9.2) |
+| V.32 9600 trellis | 9600 | 8.7 | 12.2 (+3.6) | 18.2 (+9.6) |
+| V.32bis 7200 | 7200 | 5.6 | 8.2 (+2.7) | 13.7 (+8.1) |
+| V.32bis 12000 | 12000 | 11.6 | never | never |
+| V.32bis 14400 | 14400 | 14.5 | 27.6 (+13.1) | never |
+
+**modec transmits at very nearly the textbook.** Every mode from 300
+bit/s to 9600 is read by the reference within **0.3 to 3.6 dB** of the
+theoretical curve, and that figure is not modec's alone -- it contains
+the reference's own receiver and everything the ATA, the codec and the
+softphone do on the way. The two 1200 bit/s modes never collapsed at
+all inside the range tried. This is the strongest evidence yet that the
+transmit side is right, and it agrees with the narrower result from the
+14400 work: modec's 14400 transmission reaches the reference
+byte-perfect.
+
+**modec receives 0.6 to 3.3 dB behind at 4800 and below, and 8 to 10 dB
+behind above it.** The break is sharp and it is not gradual: FSK is
+within a decibel, V.22bis and V.32 4800 within about three, and then
+7200, 9600 and 9600 trellis are all eight to ten decibels adrift, with
+12000 and 14400 never carrying a byte in either direction at any
+signal-to-noise ratio tried.
+
+**And the decision error says exactly why.** On a *clean* line -- 40 dB,
+where the noise is nothing -- modec's V.32 receiver reports these
+floors, against what each constellation needs to be read at all:
+
+| rate | points | slicer SNR needed | floor measured | margin |
+| --- | --- | --- | --- | --- |
+| 4800 | 4 | ~10 dB | 18.4 dB | +8 |
+| V.32bis 7200 | 16 | ~17 dB | 18.1 dB | +1 |
+| 9600 trellis | 32 | ~20 dB | 20.8 dB | +1 |
+| 9600 | 16 | ~19 dB | 22.0 dB | +3 |
+| 12000 | 64 | ~23 dB | 17.0 dB | **-6** |
+| 14400 | 128 | ~26 dB | 20.2 dB | **-6** |
+
+That floor is the hybrid echo of `docs/reference-modem.md`'s earlier
+section -- the ATA's reflection at 1159 ms, too late for
+`Modec.Echo` to reach -- and it is a ceiling on the whole V.32 family
+that no amount of signal-to-noise can lift. 4800 has eight decibels of
+margin over it and works. 7200 and 9600 trellis have one, which is why
+they read on a clean line and collapse as soon as any noise eats into
+it. 12000 and 14400 are six decibels *under* the floor before the line
+is touched, which is why they never worked tonight and why no
+signal-to-noise ratio in the sweep made any difference to them. The
+receiver is not failing at 12000 and 14400 because the line is noisy;
+it is failing because its own echo is louder than the constellation is
+fine.
+
+So the answer to "how does modec compare" is two answers. Transmitting,
+it is within a few decibels of theory at every rate it offers.
+Receiving, it is within a few decibels up to 4800 and then runs into a
+floor of its own making, and every rate that needs more than about
+20 dB of slicer is beyond it on this bench until the canceller can
+reach that reflection -- which is the data-aided work the previous
+section measured at about 2 dB, and the decision-directed aiming that
+section leaves as the next design change.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores

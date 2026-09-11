@@ -21,6 +21,7 @@ library
                       Modec.Standards
                       Modec.Link
                       Modec.Channel
+                      Modec.Channel.Live
                       Modec.Metrics
                       Modec.Detect
                       Modec.Handshake
@@ -109,6 +110,7 @@ test-suite modec-test
     other-modules:    Corpus
                       Harness
                       Suite.Channel
+                      Suite.LiveChannel
                       Suite.Dsp
                       Suite.Fsk
                       Suite.Link

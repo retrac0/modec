@@ -23,6 +23,8 @@ module Modec.Channel
   , applyChannel
   , mixAt
   , echoPath
+    -- * Shared with the block-at-a-time version
+  , erfApprox
   ) where
 
 import Data.Bits (shiftL, xor, (.&.))

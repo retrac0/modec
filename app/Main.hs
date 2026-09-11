@@ -239,7 +239,11 @@ cmdP = hsubparser
       <*> option (maybeReader lineDir) (long "line-snr-dir" <> value (True, True) <> metavar "DIR"
              <> help "which way the noise goes: rx (only what this modem hears, so this end retrains), tx (only what the far end hears, so it does), or both (default)")
       <*> option auto (long "line-seed" <> value 1 <> showDefault <> metavar "N"
-             <> help "which noise realisation --line-snr uses"))
+             <> help "which noise realisation the line uses")
+      <*> many (strOption (long "impair" <> metavar "K=V"
+             <> help "impair the line as `modec replay --impair` does, live: the same keys (freq, rate, gain, dc, band, clip, hum, echo, softclip, harm2, harm3, sing, wobble, phasejit, jitter, slips, wow, flutter, ulaw, alaw, biterr, loss, burst, stuck, impulse, hits, dropout), run a block at a time with their state carried across blocks. Repeatable. Filters arrive late by half their length, which a modem cannot see"))
+      <*> optional (strOption (long "channel" <> metavar "NAME"
+             <> help "start from a named line profile (voip, longloop, carbon, tape, switched) and apply --impair on top")))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and
@@ -520,71 +524,9 @@ describeEvent e = case e of
   EvRetrain _ -> "retraining"
   EvRate r -> "now " ++ show (rateBitRate r) ++ " bit/s"
 
--- | The channel simulator, driven from a named profile and repeated
--- @--impair K=V@ options, so a fixture can be asked what it survives
--- without leaving the file.
---
--- An unknown key is an error rather than a shrug.  It used to be
--- ignored silently, which meant a misspelt sweep reported the numbers
--- for an unimpaired line and looked like very good news.
-impairments :: Maybe String -> [String] -> Ch.Channel
-impairments name = foldl one base
-  where
-    base = case name of
-      Nothing -> Ch.idealChannel
-      Just n -> case Ch.profile n of
-        Just c -> c
-        Nothing -> error ("no such channel: " ++ n)
-    one ch kv = case break (== '=') kv of
-      (k, '=' : v) -> set ch k (read v :: Double)
-      _ -> error ("--impair wants KEY=VALUE, got " ++ show kv)
-    set ch k val = case k of
-      -- the line
-      "snr"     -> ch { Ch.chSnrDb = Just val }
-      "freq"    -> ch { Ch.chFreqOffsetHz = val }
-      "rate"    -> ch { Ch.chRateOffset = val }
-      "gain"    -> ch { Ch.chGain = fromDb val }
-      "dc"      -> ch { Ch.chDcOffset = val }
-      "band"    -> ch { Ch.chBandpass = Just (val, 3400) }
-      "clip"    -> ch { Ch.chClip = Just val }
-      "hum"     -> ch { Ch.chHum = Just (50, val) }
-      "seed"    -> ch { Ch.chSeed = round val }
-      "dropout" -> ch { Ch.chDropout = Just (0.02, val) }
-      "echo"    -> ch { Ch.chEcho = Just (0.02, val) }
-      -- analogue
-      "softclip" -> ch { Ch.chNonlin = Just (Ch.SoftClip val) }
-      "harm2"   -> ch { Ch.chNonlin = Just (Ch.Polynomial val (a3Of ch)) }
-      "harm3"   -> ch { Ch.chNonlin = Just (Ch.Polynomial (a2Of ch) val) }
-      "sing"    -> ch { Ch.chSing = Just (val, snd (singOf ch)) }
-      "wobble"  -> ch { Ch.chWobble = Just (val, 4) }
-      "phasejit" -> ch { Ch.chPhaseJitter = Just (val, 60) }
-      "singgain" -> ch { Ch.chSing = Just (fst (singOf ch), val) }
-      -- time
-      "jitter"  -> ch { Ch.chJitter = Ch.WalkJitter val (4 * val) }
-      "slips"   -> ch { Ch.chJitter = Ch.Slips 1.0 val }
-      "wow"     -> ch { Ch.chJitter = Ch.WowFlutter [(val / 100, 1)] }
-      "flutter" -> ch { Ch.chJitter = Ch.WowFlutter [(val / 100, 25)] }
-      -- the digital span
-      "ulaw"    -> ch { Ch.chCodec = if val /= 0 then Just Ch.Ulaw else Nothing }
-      "alaw"    -> ch { Ch.chCodec = if val /= 0 then Just Ch.Alaw else Nothing }
-      "biterr"  -> ch { Ch.chBitError = Just val }
-      "loss"    -> ch { Ch.chLoss = Just (Ch.Loss 0.02 (val * 2) 0.5 Ch.RepeatFrame) }
-      "burst"   -> ch { Ch.chLoss = Just (lossOf ch) { Ch.lsToGood = 1 / max 1 val } }
-      "stuck"   -> ch { Ch.chStuck = Just (Ch.Stuck val 0.02 0xFF) }
-      -- transient
-      "impulse" -> ch { Ch.chImpulse = Just (Ch.Impulse val 0.3 1400 0.002) }
-      "hits"    -> ch { Ch.chHits = Just (Ch.Hits val 0.006 (-6)) }
-      _         -> error ("no such impairment: " ++ k)
-    a2Of ch = case Ch.chNonlin ch of { Just (Ch.Polynomial a _) -> a; _ -> 0 }
-    a3Of ch = case Ch.chNonlin ch of { Just (Ch.Polynomial _ a) -> a; _ -> 0 }
-    singOf ch = case Ch.chSing ch of { Just p -> p; Nothing -> (0.004, 0.7) }
-    lossOf ch = case Ch.chLoss ch of
-      Just l -> l
-      Nothing -> Ch.Loss 0.02 0.0005 0.5 Ch.RepeatFrame
-
+replaySpec :: ReplayOpts -> CallSpec
 -- | The fixture spec a replay is running under.  'mint' fills in what
 -- the run turned out to do; this is what it was asked to do.
-replaySpec :: ReplayOpts -> CallSpec
 replaySpec ro = emptyCallSpec
   { csSeconds = roSeconds ro
   , csRole    = if roAnswer ro then Answer else Originate

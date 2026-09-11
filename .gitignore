@@ -16,3 +16,7 @@ recordings/third-party/*.wav
 # The bench sweep (scripts/bench/sweep.py) writes a call, two WAVs and
 # a log per mode here; same reasoning as the recordings above it.
 recordings/bench/
+
+# Python caches from the bench scripts.
+__pycache__/
+*.pyc
