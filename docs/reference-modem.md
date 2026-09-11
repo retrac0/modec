@@ -537,6 +537,63 @@ start-up fails at R2, which looked like a regression for twenty
 minutes. And the recordings begin at process start, not at the call:
 the call arrives around 11 s in, and modec's answer tone runs to 14 s.
 
+### T3.1 and T3.2 on a line that gets worse (2026-09-10, late)
+
+`modec modem --line-snr` puts noise on a live call. `Modec.Channel`
+does this to a recording, whole-signal, which a live call cannot use --
+a band-pass restarted every twenty milliseconds splatters at every seam
+and one seed repeats the same noise for ever -- so what comes over is
+the one impairment that decides whether a rate can be held: additive
+noise, which is stateless per sample. The convention is the simulator's
+exactly (sigma is the signal's r.m.s. over 10^(snr/20)), so a number
+here and a number in `modec-bench v32-survey` mean the same thing.
+`--line-snr 40@0,21@15,18@27,15@39` is a schedule counted from the call
+coming up; `--line-snr-dir rx|tx|both` chooses whether this end hears
+it, the far end does, or both.
+
+**The ladder works.** With the reference in automode and the line
+walked down through the survey's thresholds:
+
+```
+CONNECT V32bis 14400 ... retraining: this receiver could not read the line
+now running at 12000 ... retraining ... now running at 9600
+```
+
+and with both directions of the reference capped at 12000, so that
+nothing but the noise is driving it, **12000 -> 9600 -> 4800 with the
+payload delivered both ways**. That is T3.2, the least-tested path in
+the codebase, working against real hardware for the first time. T3.1's
+other half turned up too: `retraining the link: the far end asked` --
+a far-end-initiated retrain, which until now only `modemDuplexDisturb`
+had ever produced.
+
+**7200 is reachable, and is never chosen by a renegotiation.** Capped
+at 7200 the pair connects `V32bis 7200`, carries the payload both ways,
+and steps down to 4800 under noise -- so both ends can run it and modec
+can select it. But in five step-downs the chosen rates were 12000, 9600
+and 4800 and never 7200, including the decisive case: with the
+reference offering exactly 9600, 7200 and 4800, the step from 9600 went
+straight to **4800**.
+
+`ratesBelow` is not what drops it -- it clears by bit rate, so 7200
+survives a step below 9600 -- and `allV32Rates` prefers 7200 over 4800.
+What can rule it out is `bestCommonRate`'s guard: 7200 and 12000 are
+V.32bis-only, and `bis` requires *both* rate sequences to announce
+V.32bis. If the far end's renegotiation signal clears B4, the usable
+set is V.32's alone -- 9600 trellis, 9600, 4800 -- and below 9600 only
+4800 is left, which is exactly what happens. That is the leading
+explanation and it is not yet proven: nothing logs the peer's rate
+sequence during a renegotiation, and it should. Until it does, "the far
+end proposed 4800" is not excluded.
+
+**Two more things the noise turned up.** A retrain that cannot
+re-establish sits for about 33 seconds before giving up -- the
+start-up's per-phase timeout -- during which the call is silent and the
+DTE is told nothing; on a stepping call that is most of a minute of
+nothing happening. And a link that had just stepped to 4800 at 13 dB
+went `NO CARRIER` a second later, where the survey says 4800 rides down
+to 10; what ended it is not yet known.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores

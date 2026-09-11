@@ -35,7 +35,7 @@ import System.Posix.Signals (Handler (..), installHandler, sigTERM)
 
 import CallLog
 import Modec.Link
-import Modec.DSP (Signal, rms)
+import Modec.DSP (Signal, addNoise, fromDb, rms)
 import Modec.Handshake
 import Modec.Baresip
 import Modec.Dtmf
@@ -123,6 +123,11 @@ data ModemOpts = ModemOpts
   , moAnsPlain :: Bool            -- ^ answer tone without V.25 reversals, so the network's canceller stays on
   , moLineEvery :: Int            -- ^ blocks between line reports (250 = every five seconds at 20 ms)
   , moMaxEvmV32 :: Double         -- ^ the V.32 byte gate and retrain trigger, as a fraction of the rate's decision margin
+  , moLineSnr  :: [(Double, Double)]
+    -- ^ noise to put on the line, as (seconds since the call came up,
+    -- signal-to-noise ratio in dB), in force until the next entry
+  , moLineDir  :: (Bool, Bool)     -- ^ which directions it is added to: (received, transmitted)
+  , moLineSeed :: Int              -- ^ the noise realisation
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -136,7 +141,8 @@ defaultModemOpts = ModemOpts
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moFormat = Nothing, moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
-  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5 }
+  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5
+  , moLineSnr = [], moLineDir = (True, True), moLineSeed = 1 }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -276,17 +282,71 @@ runModem o = do
                 outcome <- readIORef outcomeRef
                 callRecEnd c outcome
                 writeIORef callRef Nothing
+      -- A noisy line, put on a real call.
+      --
+      -- 'Modec.Channel' does this to a recording, whole-signal, which a
+      -- live call cannot use: a band-pass restarted every twenty
+      -- milliseconds splatters at every seam, and one seed would repeat
+      -- the same noise for ever.  What a live call wants from that
+      -- module is the one impairment that decides whether a rate can be
+      -- held at all, and additive noise is stateless per sample, so it
+      -- is the part that comes over honestly.  The convention is the
+      -- simulator's exactly -- sigma is the signal's r.m.s. over
+      -- 10^(snr/20) -- so a number here and a number in
+      -- @modec-bench v32-survey@ mean the same thing.
+      --
+      -- The level is a running mean rather than this block's, because
+      -- the far end goes quiet between signals and noise measured
+      -- against silence is silence.  The seed moves with the block, or
+      -- every block would carry the same noise.
+      noiseT0 <- newIORef (Nothing :: Maybe Int)
+      rxPow <- newIORef 0
+      txPow <- newIORef 0
+      let snrAt secs = case [ d | (t, d) <- moLineSnr o, t <= secs ] of
+            [] -> case moLineSnr o of { ((_, d) : _) -> Just d; [] -> Nothing }
+            ds -> Just (last ds)
+          noised salt powRef x
+            | null (moLineSnr o) = return x
+            | otherwise = do
+                t0 <- readIORef noiseT0
+                k <- readIORef blockRef
+                let secs = case t0 of
+                      Just s -> fromIntegral (k - s) * fromIntegral blockN / fs
+                      Nothing -> 0
+                p <- readIORef powRef
+                let here = rms x
+                    p' = if here > 1e-6 then 0.9 * p + 0.1 * here else p
+                writeIORef powRef p'
+                return $ case snrAt secs of
+                  Nothing -> x
+                  Just snr | p' <= 0 -> x
+                           | otherwise -> addNoise (moLineSeed o * 7919 + salt * 104729 + k)
+                                                   (p' / fromDb snr) x
+          -- The schedule is counted from the call coming up, so a
+          -- degradation lands in the same place whatever the dialling
+          -- took.  A call is up exactly when there is a recording of one.
+          markCall up = do
+            t0 <- readIORef noiseT0
+            case (up, t0) of
+              (True, Nothing) -> readIORef blockRef >>= (writeIORef noiseT0 . Just)
+              (False, Just _) -> writeIORef noiseT0 Nothing
+              _ -> return ()
       let readBlock = do
-            x <- aiRead ai blockN
+            x0 <- aiRead ai blockN
             p <- readIORef primed
             unless p $ do
               writeIORef primed True
               aiWrite ai lead
-            mapM_ (\w -> wavAppend w x) recRx
             mc <- readIORef callRef
+            markCall (maybe False (const True) mc)
+            x <- if fst (moLineDir o) then noised 0 rxPow x0 else return x0
+            -- Recorded after the noise, so the recording is the call
+            -- that happened and a replay of it meets the same line.
+            mapM_ (\w -> wavAppend w x) recRx
             mapM_ (\c -> callRecWrite c x) mc
             return x
-          writeBlock x = do
+          writeBlock x0 = do
+            x <- if snd (moLineDir o) then noised 1 txPow x0 else return x0
             mapM_ (\w -> wavAppend w x) recTx
             mc <- readIORef callRef
             mapM_ (\c -> callRecWriteTx c x) mc

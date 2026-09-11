@@ -108,6 +108,46 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False):
     return result
 
 MODES = [
+    # Adverse conditions: noise on the line, scheduled from the call coming
+    # up, so a call that trained at its best rate has to hold it or step
+    # down.  The reference is in automode (the 1 in AT+MS) so it may
+    # renegotiate rather than only retrain.
+    # No --v32-rate: pinning offers exactly one rate, so a retrain that
+    # narrows the offer finds nothing below it and the call clears
+    # instead of stepping.  --mode v32bis offers the whole ladder.
+    # The schedule walks down through the survey's thresholds: 14400
+    # wants 22 dB, 12000 20, 9600 trellis 16.
+    ('v32b-stepdown', 'v32bis', 'AT+MS=V32B,1,4800,14400',
+     ['--line-snr','40@0,21@15,18@27,15@39','--line-every','25'], [], 48),
+    ('v32b-stepdown-rx', 'v32bis', 'AT+MS=V32B,1,4800,14400',
+     ['--line-snr','40@0,21@15,18@27,15@39','--line-snr-dir','rx','--line-every','25'], [], 48),
+    # Degraded past what any rate can hold: does the link retrain and
+    # come back, or drop cleanly, or hang?
+    ('v32b-collapse', 'v32bis', 'AT+MS=V32B,1,4800,14400',
+     ['--line-snr','40@0,10@20','--line-every','25'], [], 40),
+    # The whole ladder, with the 14400 defect kept out of it: the far end
+    # offers no more than 12000, which modec can hold, so every step that
+    # follows is the noise and nothing else.  Each retrain costs 9-11 s,
+    # so the window has to be long enough for four of them.
+    ('v32b-ladder', 'v32bis', 'AT+MS=V32B,1,4800,12000,4800,12000',
+     ['--line-snr','40@0,19@16,15@32,12@48','--line-every','25'], [], 85),
+    # Is 7200 reachable at all?  Four step-downs in a row went 12000,
+    # 9600, 4800 and never 7200, and modec prefers 7200 over 4800
+    # (allV32Rates), so the question is whether the far end ever offers
+    # it.  Cap the reference at 7200 and see what the pair lands on,
+    # then take the line below it.
+    #
+    # +MS takes six fields: modulation, automode, min and max transmit,
+    # min and max receive.  Four of them caps the transmit direction
+    # only, which is why the run capped at 12000 connected at 14400.
+    # Decisive for the skip: the far end can do 9600, 7200 and 4800 and
+    # nothing else.  A step to 7200 means the ladder uses it; a step
+    # straight to 4800 means something rules 7200 out, and the only
+    # thing that can is bestCommonRate's V.32bis guard.
+    ('v32b-9600-cap', 'v32bis', 'AT+MS=V32B,1,4800,9600,4800,9600',
+     ['--line-snr','40@0,13@20','--line-every','25'], [], 45),
+    ('v32b-7200-cap', 'v32bis', 'AT+MS=V32B,1,4800,7200,4800,7200',
+     ['--line-snr','40@0,12@20','--line-every','25'], [], 45),
     # payload one line at a time: bits mostly right shows as lines mostly intact
     ('v32b-14400-slow', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--max-evm-v32','0.7'], [], 16, True),
     ('v32b-12000-slow', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000'], [], 16, True),

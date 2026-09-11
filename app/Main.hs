@@ -233,11 +233,32 @@ cmdP = hsubparser
       <*> ignoreBusyP
       <*> switch (long "ans-plain" <> help "answer tone without V.25 phase reversals, so an echo canceller in the path (an ATA's) stays on instead of standing down for us; for paths whose reflection returns too late for modec's own canceller")
       <*> option auto (long "line-every" <> value 250 <> showDefault <> metavar "BLOCKS" <> help "blocks between 'line:' reports of the V.32 receiver's decision error and the canceller's return loss (250 is five seconds at 20 ms blocks); 12 shows what happens in the second after CONNECT")
-      <*> option auto (long "max-evm-v32" <> value 0.5 <> showDefault <> metavar "E" <> help "V.32: pass bytes, and do not retrain, while the receiver's decision error is under this fraction of the rate's decision margin. Raising it does not make a link readable: at 14400 an unlocked receiver reports the same error as a locked one, because the grid is that dense"))
+      <*> option auto (long "max-evm-v32" <> value 0.5 <> showDefault <> metavar "E" <> help "V.32: pass bytes, and do not retrain, while the receiver's decision error is under this fraction of the rate's decision margin. Raising it does not make a link readable: at 14400 an unlocked receiver reports the same error as a locked one, because the grid is that dense")
+      <*> option (maybeReader snrSchedule) (long "line-snr" <> value [] <> metavar "SPEC"
+             <> help "put noise on the line, in dB of signal to noise: a number for the whole call, or a schedule like 40@0,24@20,16@35 -- 40 dB from the call coming up, 24 dB from twenty seconds in, 16 dB from thirty-five. The same measure Modec.Channel and modec-bench use, so the numbers compare. This is how to make a call step its rate down on purpose")
+      <*> option (maybeReader lineDir) (long "line-snr-dir" <> value (True, True) <> metavar "DIR"
+             <> help "which way the noise goes: rx (only what this modem hears, so this end retrains), tx (only what the far end hears, so it does), or both (default)")
+      <*> option auto (long "line-seed" <> value 1 <> showDefault <> metavar "N"
+             <> help "which noise realisation --line-snr uses"))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and
     -- listen to one instead.
+    -- "24" is 24 dB for the whole call; "40@0,24@20" is 40 dB until
+    -- twenty seconds after the call came up and 24 dB after that.
+    snrSchedule s = case s of
+      "" -> Nothing
+      _ -> mapM one (splitOn ',' s)
+      where
+        one w = case break (== '@') w of
+          (d, "") -> (,) 0 <$> readMaybe d
+          (d, _ : t) -> (,) <$> readMaybe t <*> readMaybe d
+        readMaybe t = case reads t of { [(v, "")] -> Just (v :: Double); _ -> Nothing }
+    lineDir s = case s of
+      "rx" -> Just (True, False)
+      "tx" -> Just (False, True)
+      "both" -> Just (True, True)
+      _ -> Nothing
     ignoreBusyP = switch (long "ignore-busy"
       <> help "stay on the line when the far end returns busy, congestion or a special information tone, instead of hanging up and reporting BUSY")
     -- Every call is recorded and logged under this directory, named for
