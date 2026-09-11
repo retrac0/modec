@@ -464,7 +464,14 @@ breaks all three), so it is not ISI as the simulator models it. And the receiver
 worst, with the gate raised to 0.7, passed bits from a receiver below
 12000's own threshold and delivered nothing readable, where the 0.5
 gate had withheld them. What differs call to call is the state the
-start-up hands the pump. What
+start-up hands the pump. Sent one line at a time with idle between, so the framer can find
+its alignment again after a bad bit: **12000 delivers all eight lines
+intact**, and **14400 delivers one of eight** -- 610 consecutive
+correct bits, which no receiver decoding at random produces -- with
+ten kilobytes of wrong characters around it. So the 14400 receiver is
+marginal and not systematically wrong: it holds the trellis path for
+stretches and loses it, and what it needs is margin, not a correction.
+What
 the receiver lacks is the thing §5.4.2 hands
 it for free: B1, 128 symbols of scrambled ones at the data rate and
 coding, a known sequence at the data constellation. This receiver waits
