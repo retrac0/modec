@@ -53,6 +53,7 @@ module Modec.V32Start
   , v32Timeline
   , chosen
   , v32Bits
+  , v32AnsReversals
   ) where
 
 import Data.Maybe (listToMaybe)
@@ -152,6 +153,7 @@ data V32Start = V32Start
   , vsData    :: !TxCoder       -- ^ the data coder, once a rate is agreed
   , vsAfterE  :: Maybe V32Rate  -- ^ change to this coding when E has gone out
   , vsAnsPh   :: !Double
+  , vsAnsRev  :: !Bool          -- ^ reverse the answer tone's phase every 450 ms
   -- receive
   , vsRx      :: !QamRxState
   , vsRev1800 :: !RevTracker
@@ -241,6 +243,21 @@ v32StartCoder = vsData
 -- | Recent descrambled bits, newest first.
 v32Bits :: V32Start -> [Bool]
 v32Bits = vsBits
+
+-- | Whether the answer tone carries V.25's phase reversals.
+--
+-- The reversals are an instruction: G.164 and G.165 have every echo
+-- canceller and suppressor on the path stand down when it hears
+-- 2100 Hz reversed every 450 ms, on the understanding that a modem
+-- sending it will cancel its own echo.  Through an ATA and a softphone
+-- that understanding is wrong.  The ATA's hybrid returns our signal
+-- 1159 ms later at -28 dB, 'Modec.Echo' cannot reach a reflection that
+-- late, and the one canceller that can -- the ATA's own, sitting at the
+-- hybrid -- had switched itself off because we asked it to.  A plain
+-- tone leaves it running.  What the reversals buy is only wanted where
+-- our own canceller can do the job.
+v32AnsReversals :: Bool -> V32Start -> V32Start
+v32AnsReversals b st = st { vsAnsRev = b }
 
 -- | Whether this turned out to be a V.32bis call: Table 5 Note 1 makes
 -- it V.32bis only if both rate signals announce it, so both halves of
@@ -370,7 +387,7 @@ v32StartInit fs dir offer = V32Start
   , vsTx = qamTxInit, vsSrc = TxNothing, vsQueue = [], vsTxSym = 0
   , vsSwitch = Nothing, vsTxScr = scramblerInit, vsTxQ = (False, False)
   , vsData = txCoderInit, vsAfterE = Nothing
-  , vsAnsPh = 0
+  , vsAnsPh = 0, vsAnsRev = True
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
   , vsMark = Nothing, vsTrip = Nothing
@@ -642,12 +659,13 @@ emit st n
   where
     p = v32Params (vsFs st)
     -- the V.25 answer tone, reversed every 450 ms to stand down any echo
-    -- canceller in the network: we are about to be our own
+    -- canceller in the network: we are about to be our own.  Unless
+    -- told otherwise -- see 'v32AnsReversals'.
     w = 2 * pi * answerToneItu / vsFs st
     tone = VS.generate n $ \i ->
       let t = vsN st + i
           seg = (t * 1000) `div` (round (vsFs st) * 450 `div` 1000) :: Int
-          sgn = if even (seg `div` 1000) then 1 else -1
+          sgn = if not (vsAnsRev st) || even (seg `div` 1000) then 1 else -1
       in 0.35 * sgn * sin (vsAnsPh st + w * fromIntegral i)
     ph' = vsAnsPh st + w * fromIntegral n
 

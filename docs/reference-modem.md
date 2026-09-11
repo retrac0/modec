@@ -363,10 +363,14 @@ real-time loop: three start-ups in a row lost at R2. Letting the search
 run while the far end talked aimed at **85 ms** instead of 1159,
 cancelled nothing, and a filter adapting at the wrong delay against a
 signal it cannot predict took 9600t's decision error from 0.015 to
-0.033. A cheaper wide search confined to the quiet windows was built
-but never validated -- the recording it was judged on turned out to be
-of a call that had already failed -- so it is withdrawn for want of
-evidence, not disproven. The shape of the real fix is clear and is not
+0.033. A cheaper wide search confined to the quiet windows -- a stride-four
+grid with a refinement -- was clean on one live 9600t call and then
+failed three loopback tests in the suite: 7200 text both ways, 12000
+and 14400, and the classic ladder, whose calling side lost R3. The
+simulator's echo is close and the coarse grid does something to it
+that the live path never showed. It was committed on a summary line
+read too quickly and reverted the same hour; disproven, not merely
+withdrawn. The shape of the real fix is clear and is not
 a bench evening: on a path this late the reflection of the aperiodic
 TRN never arrives inside a quiet window, so the canceller would have to
 be aimed and trained in data mode, decision-directed, after the
@@ -377,14 +381,24 @@ on every run of a tag. Replay the per-call recordings under
 `recordings/`, which are never overwritten, when the question is what
 a change did.)
 
-**The bench-side fix is the ATA's own echo canceller.** The doc above
-says to disable it, to keep two adaptive filters off one path. That
-advice assumed modec's could reach the echo; through a softphone it
-cannot, and the HT802V2's LEC sits at the hybrid where the reflection
-is born. Enable it, re-run `v32b-9600t`, and the decision error should
-fall from 0.015 toward the 0.001 the 30 dB noise floor allows -- at
-which point 12000 and 14400 become a real test of modec rather than of
-the line. That is the next thing to do.
+**The fix was one bit in the answer tone.** The ATA's line echo
+canceller was on all along -- and standing down for every V.32 call,
+because modec's answer tone carries V.25's phase reversals every
+450 ms, and G.164/G.165 have every canceller on the path switch itself
+off when it hears 2100 Hz reversed like that, on the understanding
+that a modem sending it will cancel its own echo. Through a softphone
+that understanding is wrong: the one canceller close enough to the
+hybrid to matter is the ATA's. `--ans-plain` sends the tone without
+the reversals. Measured, same evening, same bench: the reflection of
+the answer tone goes from **−27.6 dB at 1140 ms to −53 dB with no
+correlation at all**; 9600t sits at 0.009–0.016; **12000 connects and
+carries the payload both ways at a decision error of 0.005–0.006**,
+about 22.5 dB, for the first time on any hardware; 14400 connects and
+still cannot read the line, which at 22.5 dB against a 26 dB threshold
+is what the offline sweep said it would do. What is left between 22.5
+and the ~30 dB the line's noise floor allows is receiver implementation
+loss -- timing and carrier jitter, equaliser misadjustment -- and that
+is the next thing, and a modec thing.
 
 **Two lessons for the harness.** Never run the test suite while a bench
 call is in progress: the real-time audio path starves and every

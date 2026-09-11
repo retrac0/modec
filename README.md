@@ -171,6 +171,12 @@ current.
   bytes each, and heavy sinusoidal jitter breaks the coherent path.
 - 9600 bit/s: delay distortion past 1 ms breaks it where 4800 rides
   through.
+- Through an ATA, send `--ans-plain`: the V.25 phase reversals in the
+  V.32 answer tone tell the ATA's echo canceller to stand down, and the
+  hybrid's reflection then returns through the softphone too late for
+  modec's own canceller to reach. Plain, the reflection is gone and
+  12000 bit/s carries data; with reversals every V.32 call sat at a
+  decision error of 0.015.
 - Echo on a V.32 call: a reflection at -26 dB is carried end to end; the
   same path 6 dB louder is not. The canceller is not what decides that.
   It reaches 18 dB of return loss at the louder setting and the call

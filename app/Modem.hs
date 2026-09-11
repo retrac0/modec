@@ -120,6 +120,7 @@ data ModemOpts = ModemOpts
   , moBanner   :: Bool             -- ^ greet the far end with what we connected at
   , moHangupExits :: Bool          -- ^ leave when the call does, rather than back to AT
   , moIgnoreBusy :: Bool          -- ^ stay on the line through busy, congestion and SIT
+  , moAnsPlain :: Bool            -- ^ answer tone without V.25 reversals, so the network's canceller stays on
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -133,7 +134,7 @@ defaultModemOpts = ModemOpts
   , moHayes = False, moSip = Nothing, moSipDomain = ""
   , moAudio = AudioSipLoop "modec", moFormat = Nothing, moData = DataStdio, moAmp = 0.5
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
-  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False }
+  , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -182,7 +183,7 @@ runModem o = do
       -- one the author happened to be looking at.
       configFor role =
         let c0 = defaultModemConfig fs role (moModes o)
-        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o
+        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcAnsReversals = not (moAnsPlain o)
               , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
               , mcV32Rates = v32Offered o, mcMnp = mnpCfg
               , mcHandshake = (mcHandshake c0)

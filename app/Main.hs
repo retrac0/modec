@@ -230,7 +230,8 @@ cmdP = hsubparser
       <*> switch (long "banner"
                   <> help "on connecting, send the far end a line or two about what was negotiated. `modec answer` sets this")
       <*> pure False        -- moHangupExits
-      <*> ignoreBusyP)
+      <*> ignoreBusyP
+      <*> switch (long "ans-plain" <> help "answer tone without V.25 phase reversals, so an echo canceller in the path (an ATA's) stays on instead of standing down for us; for paths whose reflection returns too late for modec's own canceller"))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and

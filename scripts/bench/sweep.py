@@ -48,8 +48,11 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     bare = subprocess.Popen(['baresip','-f',os.path.expanduser('~/.baresip-bench')],
                             stdout=bl, stderr=subprocess.STDOUT)
     time.sleep(3)
+    # --ans-plain always: through the ATA the V.25 reversals on the answer
+    # tone stand its echo canceller down (docs/reference-modem.md); it
+    # touches nothing but the V.32 answer tone
     args = [BIN,'modem','--answer','--sip','127.0.0.1:4444','--audio-sip-loop','modec',
-            '--mode',mode,'--hayes','--data-stdio','--record-rx',rx,'--record-tx',tx]+extra
+            '--mode',mode,'--hayes','--data-stdio','--ans-plain','--record-rx',rx,'--record-tx',tx]+extra
     mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
     nonblock(mo.stdout)
     time.sleep(3)
@@ -96,6 +99,10 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16):
     return result
 
 MODES = [
+    # plain answer tone: the ATA's echo canceller stays on
+    ('v32b-9600t-plain', 'v32bis', 'AT+MS=V32B,0,9600,9600',   ['--v32-rate','9600t','--ans-plain'], [], 16),
+    ('v32b-12000-plain', 'v32bis', 'AT+MS=V32B,0,12000,12000', ['--v32-rate','12000','--ans-plain'], [], 16),
+    ('v32b-14400-plain', 'v32bis', 'AT+MS=V32B,0,14400,14400', ['--v32-rate','14400','--ans-plain'], [], 16),
     # trellis or constellation?  9600 non-trellis passed; every trellis rate failed
     ('v32b-9600t', 'v32bis', 'AT+MS=V32B,0,9600,9600', ['--v32-rate','9600t'], [], 16),
     ('v32b-4800',  'v32bis', 'AT+MS=V32B,0,4800,4800', ['--v32-rate','4800'],  [], 16),

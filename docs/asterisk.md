@@ -79,7 +79,7 @@ speech default that is wrong for data:
 | Preferred Vocoder 1 | PCMU | and leave 2-8 blank |
 | Voice Frames per TX | 2 | 20 ms, matching the loopback block size |
 | Silence Suppression | No | CNG during a V.8 silence wrecks [Modec.V8](../src/Modec/V8.hs) |
-| Disable Line Echo Canceller | **No, for V.32** | modec's canceller cannot reach a reflection that returns through the softphone 1.2 s later; the ATA's can, at the hybrid. See reference-modem.md, "12000 and 14400" |
+| Disable Line Echo Canceller | No | keep it on -- and run modec with `--ans-plain`, or the V.25 reversals in its answer tone tell the ATA's canceller to stand down for the call, and the hybrid's reflection comes back through the softphone 1.2 s later where modec's own canceller cannot reach it. See reference-modem.md, "The fix was one bit in the answer tone" |
 | Disable Network Echo Suppressor | Yes | |
 | Jitter Buffer Type | Fixed | adaptive buffers insert and drop samples |
 | Jitter Buffer Length | High | latency is free, dropped samples are not |
