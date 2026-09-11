@@ -689,20 +689,6 @@ v32Handoff = do
                        in if lrConnected res then d (lrRxOrig res) textA + d (lrRxAnswer res) textO else 999
         printf "%-8s %2.0f dB  aid %-5s  errors per seed: %s\n" (drop 4 (show r)) snr (show aid)
           (unwords [ printf "%3d" (errsOf s) | s <- [1 .. 6] ])
-  forM_ [V32R12000, V32R14400] $ \r ->
-    forM_ [False, True] $ \aid -> do
-      let cfg role = (defaultModemConfig 8000 role [V32bis]) { mcV32Rates = Just (chosenRate r), mcAidB1 = aid }
-          lc s = (defaultLoop 8000 [V32bis]) { lcOrig = cfg Originate, lcAnswer = cfg Answer
-                                              , lcLine = (impairments Nothing ["ulaw=1", "snr=30"]) { chSeed = s }
-                                              , lcEcho = [(0.644, 0.02)], lcMaxT = 30 }
-          at secs xs = case [ ea | (t, _, ea) <- xs, t >= secs ] of { (v : _) -> v; [] -> 0 / 0 }
-          one s = let res = loopback (lc s) textO textA
-                      xs = lrEvmAt res
-                      t0 = case xs of { ((t, _, _) : _) -> t; [] -> 0 }
-                  in if lrConnected res then map (\d -> at (t0 + d) xs) [1, 2, 4] else [0 / 0, 0 / 0, 0 / 0]
-      printf "%-8s %-5s " (drop 4 (show r)) (if aid then "B1" else "none")
-      forM_ [1 .. 6 :: Int] $ \s -> printf " %s |" (unwords [ printf "%.4f" v | v <- one s ])
-      putStrLn ""
   where
     textO = map (fromIntegral . fromEnum) "the quick brown fox jumps over the lazy dog 0123456789\r\n"
     textA = map (fromIntegral . fromEnum) "pack my box with five dozen liquor jugs 9876543210\r\n"

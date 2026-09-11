@@ -995,8 +995,33 @@ false E match -- the search landing where the register does not
 correspond -- predicted B1 that disagreed with what arrived **0 of 57
 symbols one call and 57 of 57 the next**, and injecting those points
 made the handoff worse than leaving it alone: 0.021 where
-decision-directed read 0.0001. Checked, it is provably harmless, which
-is the state it is committed in.
+decision-directed read 0.0001.
+
+**It works, and it is off.** The prediction is exact -- nine symbols of
+B1 out of nine, at an E-match cost seventy times under threshold, on
+every call. Getting there took three rounds of "it makes no
+difference", all of them the same self-inflicted bug: the corroboration
+gate asked for sixteen symbols of agreement when E is recognised about
+*nine* symbols into B1, so nine is all there ever is, and a perfect
+prediction was discarded silently every time. Reachable, it engages.
+What it does not do is help:
+
+| 12000 bit/s | errors per seed, decision-directed | trained on B1 |
+| --- | --- | --- |
+| 20 dB | 58, 0, 0, 59, 91, 57 | 54, 0, 0, 53, 94, **0** |
+| 18 dB | 7007, 259, 8478, 483, 213, 999 | 7007, **1234**, 8478, 342, **328**, 999 |
+| 16 dB | 1790, 8560, 1914, 1940, 7640, 2008 | 2027, 8560, 1865, 1838, 7640, 1986 |
+
+A gain at 20 dB, a wash at 16, and at 18 dB it is worse on two seeds of
+six and better on one. The reference is already stopped short of B1's
+end -- queueing the whole remainder ran it into the far end's data and
+was worse again, 259 errors becoming 971 -- and that fixed the overrun
+without turning the result positive. So `mcAidB1` is off, `--aid-b1`
+turns it on, and what the section above called a two-decibel ceiling
+from the oracle remains unclaimed by any real receiver. The oracle knew
+the symbols with no prediction, no alignment and no turn to resolve;
+this knows them exactly and still cannot spend them, which says the
+handoff's variance is not mostly in what B1 could teach.
 
 **The framer never recovered from a lost bit, and that is most of the
 burst damage.** A start bit is a space that follows a mark. Taking any

@@ -153,7 +153,7 @@ defaultModemOpts = ModemOpts
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
   , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5
   , moLineSnr = [], moLineDir = (True, True), moLineSeed = 1
-  , moImpair = [], moChannel = Nothing, moEchoDataMu = 0.001, moEchoData = True, moAidB1 = True }
+  , moImpair = [], moChannel = Nothing, moEchoDataMu = 0.001, moEchoData = True, moAidB1 = False }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)

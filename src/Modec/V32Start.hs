@@ -300,9 +300,9 @@ aidB1 off e s
   | not (vsAidB1 s) = s
   | Nothing <- vsRate s = s
   | n < 16 || length lineBits < off + 16 + 23 = s
-  | best > 0.02 = s                       -- E not found in the point history
-  | received < 16 || agree * 10 < received * 9 = s  -- the prediction is checked against B1 already in hand
-  | otherwise = s { vsRx = qamRxRef (map (turn k) (drop received b1)) (vsRx s) }
+  | best > 0.5 = s                        -- E not found in the point history
+  | received < 8 || agree * 10 < received * 6 = s  -- checked against the B1 already in hand
+  | otherwise = s { vsRx = qamRxRef (map (turn k) queued) (vsRx s) }
   where
     Just rate = vsRate s
     far = vsFar s
@@ -324,6 +324,17 @@ aidB1 off e s
     -- predicted E is searched for in the points near where the offset
     -- says, at every turn -- a real E match is unmistakable, 1e-5 per
     -- symbol against 2 for anything else -- and that settles both.
+    --
+    -- Both thresholds are set from that separation and not from
+    -- tidiness, because both were set tight first and rejected every
+    -- call at the one operating point this exists for.  A true match
+    -- costs the line's own noise power per symbol -- 0.016 at 18 dB,
+    -- which a threshold of 0.02 refuses -- so it is 0.5, still four
+    -- times under a false match.  And the B1 check cannot ask for
+    -- agreement the noise will not allow: at 16 dB a tenth of the
+    -- received quadrants are wrong on their own, so nine in ten is
+    -- unmeetable, while random agreement is one in four.  Six in ten
+    -- separates 57-of-57 from 0-of-57 with room at both ends.
     --
     -- Then the prediction is checked before it is trusted: the B1
     -- symbols the far end has *already* sent are in hand, and the
@@ -352,6 +363,14 @@ aidB1 off e s
     received = length gotB1
     quad (x, y) = (x >= 0, y >= 0)
     agree = length [ () | (g, p) <- zip gotB1 (map (turn k) b1), quad g == quad p ]
+    -- Stop short of B1's end.  The reference must never outlast the
+    -- signal it predicts: past the far end's 128th symbol it is sending
+    -- data, and a receiver still training on predicted ones is being
+    -- taught the wrong thing at the worst moment.  Queueing the whole
+    -- remainder did that -- at 18 dB it turned 259 byte errors into
+    -- 971 on one seed and 483 into 1113 on another -- and the margin
+    -- costs a dozen symbols of training that were never the point.
+    queued = take (max 0 (128 - received - 16)) (drop received b1)
 
 -- | Whether this turned out to be a V.32bis call: Table 5 Note 1 makes
 -- it V.32bis only if both rate signals announce it, so both halves of

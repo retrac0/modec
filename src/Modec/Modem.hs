@@ -75,7 +75,7 @@ data ModemConfig = ModemConfig
   , mcRetrainMax :: Int    -- ^ how many retrains one call may spend before giving up
   , mcProbe    :: Bool     -- ^ measure an echo path instead of placing a call
   , mcAnsReversals :: Bool -- ^ V.25 phase reversals on the answer tone; see 'v32AnsReversals'
-  , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols; see 'aidB1'
+  , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols ('aidB1').  Off: it predicts B1 exactly and does not reliably help; see the measurement in docs/reference-modem.md
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   } deriving (Show)
 
@@ -106,7 +106,7 @@ defaultModemConfig fs role modes = ModemConfig
   , mcRetrainMax = 4
   , mcProbe = False
   , mcAnsReversals = True
-  , mcAidB1 = True
+  , mcAidB1 = False
   , mcMaxEvm = 1.0
   }
 

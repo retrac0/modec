@@ -249,8 +249,8 @@ cmdP = hsubparser
              <> help "V.32: the echo canceller's step while the far end is talking, once its data-mode search has aimed it and set its taps. The taps come from the search; this only holds them. The far end's signal is noise to the update, so keep it small; 0 leaves the taps to the search alone")
       <*> flag True False (long "no-echo-data"
              <> help "V.32: do not search for or cancel our own echo once the far end is talking. What the canceller did before it could, and the thing to compare against")
-      <*> flag True False (long "no-aid-b1"
-             <> help "V.32: read the far end's B1 decision-directed, as before, rather than training the receiver on its known symbols; the thing to compare against"))
+      <*> switch (long "aid-b1"
+             <> help "V.32: train the receiver on the far end's B1, whose 128 symbols are predictable from the scrambler, instead of reading them decision-directed. It predicts them exactly and is refused unless it can corroborate that against the B1 already received -- but it does not reliably lower the error rate, so it is off; see docs/reference-modem.md"))
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and
