@@ -63,6 +63,7 @@ module Modec.QAM
   , qamRxTiming
   , qamRxUnlock
   , quarterTurns
+  , quarterTurnsOf
   , qamRxEnergy
   , qamRxPrevSym
     -- * Training on symbols that are known rather than decided
@@ -367,11 +368,15 @@ data QamSym = QamSym
 -- ambiguity the loop settles into, which is why V.32 encodes its
 -- start-up and its rate signals as quadrant changes in the first place.
 quarterTurns :: [QamSym] -> (Double, Double) -> ([Int], (Double, Double))
-quarterTurns syms prev0 = go prev0 syms []
+quarterTurns = quarterTurnsOf qsRaw
+
+-- | 'quarterTurns' measured on whichever view of the symbol is asked for.
+quarterTurnsOf :: (QamSym -> (Double, Double)) -> [QamSym] -> (Double, Double) -> ([Int], (Double, Double))
+quarterTurnsOf view syms prev0 = go prev0 syms []
   where
     go prev [] acc = (reverse acc, prev)
     go (pr, pim) (sy : rest) acc =
-      let (yr, yi) = qsRaw sy
+      let (yr, yi) = view sy
           dr = yr * pr + yi * pim
           di = yi * pr - yr * pim
           k = (round (atan2 di dr / (pi / 2)) :: Int) `mod` 4

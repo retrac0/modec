@@ -1291,17 +1291,114 @@ is a far stronger assertion than emptiness. And the CX93001 9600
 fixture moved by nine bytes of idle, the payload byte for byte
 unchanged, because the framer opens about a block earlier.
 
-### Roles reversed: blocked at the ATA
+### Roles reversed: modec dials (2026-09-12)
 
-T1.1 wants both directions. With modec dialling, the HT802V2 **ignores
-every SIP message from this host** -- INVITE, OPTIONS, on 5060 and
-5062, not even a 100 Trying -- while cheerfully sending REGISTERs that
-baresip cannot honour. It originates with `Outgoing Call without
-Registration` but will not terminate a call from a proxy it is not
-registered to. Two ways out: a setting in the ATA that accepts inbound
-from the proxy while unregistered, or a real registrar. `opensips` is
-in `extra`; Asterisk is AUR and also buys the progress tones and
-per-leg recording in [asterisk/](asterisk/).
+T1.1 wants both directions, and this section used to say the ATA would
+not allow it: the HT802V2 ignored every INVITE and OPTIONS sent to 5060
+and 5062, and the conclusion drawn was that it will not terminate a call
+from a proxy it is not registered to. That was wrong. **Its SIP stack
+listens on a random port** (22097 on this boot), says nothing at all on
+5060, and answers OPTIONS at the right port with a 200 OK, unregistered.
+No registrar is needed. Its own INVITE names the port in `Contact:`, so
+`sweep.py` finds it by having the reference dial out while nothing holds
+5060 and reading the INVITE off the socket; the answer is cached in
+`recordings/bench/ata-sip.txt` and re-checked with OPTIONS each run, and
+`ATA_SIP=host:port` overrides it. Setting "Use Random SIP Port" to No in
+the ATA would make it 5060 for good. modec then dials
+`ATD1001@192.168.30.105:22097` -- `dialUri` passes anything with an `@`
+through -- and the reference picks up on `ATS0=1`:
+
+    scripts/bench/sweep.py -o v22bis v32b-9600    # -o: modec places the call
+
+**The first pass found three V.32 caller failures that answering never
+could.** Bell 212A, V.22, V.22bis, V.32 9600 and V.32bis 7200 and 9600
+carried the payload both ways at once; Bell 103 and V.21 were error free
+both ways for as much of it as 16 s at 300 bit/s holds. 4800 never
+connected; 12000 carried modec's data and not the reference's; 14400
+carried neither. Every one of them came out of the calling start-up,
+which until now had only ever run against modec itself and against
+2600.network, and three separate defects were stacked in it.
+
+**It answered ringback.** baresip plays North American ringback, 440 +
+480 Hz, into the modem while the ATA rings, exactly as a PSTN line would.
+It leaks into the 600 Hz tracker well over the threshold `OListen` used,
+and its 40 Hz beat reads as a phase reversal every 12 to 27 ms. The
+caller sent AA at 0.36 s -- two seconds before the answer tone -- took two
+beats for the far end's two reversals, and measured a round trip of 40
+ms. AC is steady until the answerer has heard AA, so `OListen` now wants
+256 symbols of AC with no reversal in it; the replay goes to AA at 8.9 s,
+on the real AC, and measures NT as about 0.9 s. The third-party Banksia
+fixture had the same false start (AA at 3.70 s, inside the answer tone, a
+60 ms "round trip") and its reference was minted from it; it is re-minted,
+the V.42 exchange byte for byte unchanged and 88 bytes of unreadable tail
+moved, at the same decision error (0.01968 before, 0.01966 after).
+
+**It took R1 for R3.** The answering modem sends R1 until it hears our S,
+so R1 goes on arriving for a round trip after S begins -- a second, on
+this path, which is longer than our S and TRN together. `OR2` waited 128
+symbols and accepted the first rate signal it saw: R1, three seconds
+before R3. It then waited for an E anchored on the wrong sequence. `OR2`
+now discards what it hears until NT plus 512 symbols after our S began;
+the far end's own S, S-bar and TRN, at least 1552 symbols, still separate
+that moment from its R3. Both fixes were needed: the gate is measured in
+NT, and NT had been 40 ms.
+
+**It read R3 and E through the line's ISI.** With both fixed, the 4800
+caller reached `OB1` on time and still never saw E. The rate-signal bits
+were taken from the change between *raw* symbols -- before the equaliser,
+chosen so the S and AC detectors owe nothing to the carrier loop -- and
+this line's neighbouring-symbol taps are 0.15 of the main one. R3 read
+with 17% of its descrambled bits wrong (the descrambler triples each
+error: the gaps between them cluster at 5, 18 and 23) while the equalised
+points sat within fifteen degrees of their states, not one of 1680 in
+doubt. E is sent once and tolerates one error in its seven fixed bits.
+In `OR2`, `OB1` and the answerer's `AR3` -- after a TRN the receiver has
+trained on -- the bits now come from the equalised points: R3 reads
+without a single error in any 512-bit window, on the 4800 call and on a
+9600 call that had been getting E through by luck.
+
+The 4800 call is now a fixture, `cx93001-answering-v32-4800`: the build
+before these fixes replays it to 0 bytes, this one to CONNECT at 19.78 s
+and all eight of the reference's lines.
+
+**After the fixes, both directions, every V.32 rate:**
+
+| rate | modec answers | modec calls |
+| --- | --- | --- |
+| V.32 4800 | payload both ways | payload both ways (never connected before) |
+| V.32 9600 | payload both ways | payload both ways |
+| V.32bis 7200 | payload both ways | payload both ways |
+| V.32bis 9600 | payload both ways | payload both ways |
+| V.32bis 12000 | payload both ways | payload both ways (reference's data lost before) |
+| V.32bis 14400 | payload both ways | the reference refuses the rate |
+
+Against the recordings of every V.32 call modec placed over voip.ms in
+September -- nine that connected at 4800 to 14400, one that failed "no E
+from the answering modem", one timeout -- the fixed start-up and the one
+before it replay byte for byte the same: same rate at the same instant,
+same retrains, same bytes, AA a tenth of a second later. Those calls ran
+V.8, which starts V.32 after the answer tone and so never met ringback,
+and their far ends' R3s read the same either way. The two failures stay
+failures; they are something else.
+
+The 14400 caller failure is not a detection fault. Twice since the fixes
+the CX93001, pinned to 14400 with automode off, answered our R2 with an
+R3 of `0000 0001 1001 0001` -- the trellis bit and no rate -- and modec
+read it correctly and cleared. The answering modem chooses R3 from what
+its receiver made of our TRN, so the CX93001 judged the line in the
+modec-to-reference direction not good enough for 14400 when modec is the
+caller, and good enough when modec answers. Our S lasts the same 1.05 s
+either way, as does the CX93001's own. Before the fixes one caller call
+did train at 14400, and the reference received garbage from it. So the
+open question is modec's *calling* transmitter at 14400 (GPC scrambler,
+caller TRN) against its answering one, which is proven. That is where to
+look next, not at the path.
+
+One more thing the reversed direction shows: the ATA re-INVITEs once,
+after the far end's answer tone, on nine of the first eleven calls modec
+placed (not on Bell 103 or Bell 212A). The calls
+carry data regardless, but it is a media renegotiation mid-call and
+"Re-INVITE After Fax Tone Detected" is the setting to check.
 
 ## Tier 1 — the questions that are open now
 

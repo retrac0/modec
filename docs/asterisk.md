@@ -91,6 +91,7 @@ speech default that is wrong for data:
 | SLIC Setting | USA | |
 | TX / RX Gain | 0 dB to start | then set from extension 600, not by ear |
 | NAT Traversal | No | |
+| Use Random SIP Port | No | otherwise the port's SIP stack is on a random port and silent on 5060, which looks exactly like an ATA refusing calls from an unregistered proxy. `scripts/bench/sweep.py` finds the port itself; see reference-modem.md, "Roles reversed" |
 | Dial Plan | `{ [6]xx \| [1-2]xxx \| 1xxxxxxxxxx }` | 3-digit tests, 4-digit peers, 11-digit trunk |
 
 Register port 1 as 1001 and port 2 as 1002 against the Asterisk box.

@@ -34,6 +34,13 @@
 # of 0.11.  It now runs at 0.040 and asks for nothing.  Connecting is
 # what 'connect:' pins; holding the line is what 'retrains:' pins, and
 # only the second of them ever moved.
+#
+# Re-minted when the caller stopped taking non-AC for AC.  Until then this
+# replay went to AA at 3.70 s, inside the answer tone, and "measured" a
+# round trip of 60 ms off two reversals that were not the far end's; it
+# now goes at 7.92 s on the real AC.  The EC pattern and the LAPM frames
+# are byte for byte what they were; the last 88 bytes, which nothing reads
+# (decision error through data mode 0.01968 before, 0.01966 after), moved.
 source:    recordings/third-party/banksia-mymodem144-answer.wav
 seconds:   32.0
 role:      originate

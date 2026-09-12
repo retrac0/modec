@@ -57,7 +57,7 @@ module Modec.V32Start
   , v32AidB1
   ) where
 
-import Data.Maybe (listToMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Vector.Storable as VS
 
 import Modec.Link
@@ -162,8 +162,10 @@ data V32Start = V32Start
   , vsRev3000 :: !RevTracker
   , vsMark    :: Maybe Int       -- ^ sample index of the first reversal
   , vsTrip    :: Maybe Int       -- ^ NT or MT, in samples
+  , vsSentS   :: Maybe Int       -- ^ calling modem: sample index its conditioning signal began
   , vsTurns   :: [Int]           -- ^ recent quadrant changes, newest first
   , vsPrevSym :: (Double, Double) -- ^ last raw symbol, for the difference
+  , vsPrevEq  :: (Double, Double) -- ^ last equalised symbol, for the difference
   , vsPts     :: [(Double, Double)] -- ^ recent equalised points, newest first, for 'aidB1'
   , vsAidB1   :: !Bool           -- ^ train the receiver on B1's known symbols; see 'aidB1'
   , vsDescr   :: !Scrambler
@@ -175,6 +177,7 @@ data V32Start = V32Start
   , vsACLimit :: !Int            -- ^ symbols to hold the pair in AAC before giving up
   , vsACHold  :: !Int            -- ^ symbols of the pair to send before reacting to AA
   , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
+  , vsACSteady :: !Int           -- ^ calling modem listening: samples of AC heard without a reversal
   , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
@@ -503,11 +506,11 @@ v32StartInit fs dir offer = V32Start
   , vsAnsPh = 0, vsAnsRev = True
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
-  , vsMark = Nothing, vsTrip = Nothing
-  , vsTurns = [], vsPrevSym = (0, 0), vsPts = [], vsAidB1 = True
+  , vsMark = Nothing, vsTrip = Nothing, vsSentS = Nothing
+  , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vs1800Run = 0
+  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vs1800Run = 0
   , vsLineErr = 1 }
   where
     role = case dir of { Originate -> Originate; Answer -> Answer }
@@ -557,7 +560,7 @@ observe st rx = st
   -- answering modem acts on it, which is a duration and not an instant.
   , vs1800Run = if tone1800 then vs1800Run st + VS.length rx else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
-  , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsDescr = descr', vsBits = bits'
+  , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsPrevEq = prevEq', vsDescr = descr', vsBits = bits'
   , vsPts = take 128 (reverse (map qsPoint syms) ++ vsPts st)
   -- The best look at the far end's training, not the last one.  The
   -- error is an exponential mean, so anything that disturbs it -- the
@@ -628,7 +631,23 @@ observe st rx = st
     -- nothing to a carrier loop that has no absolute reference anyway.
     (turns, prev') = quarterTurns syms (vsPrevSym st)
     turns' = take 128 (reverse turns ++ vsTurns st)
-    dibits = concat [ [a, b] | k <- turns, let (a, b) = dibitOfTurn k ]
+    -- The bits, though, are read from the equalised points once the
+    -- receiver has trained on the far end's TRN and is reading its rate
+    -- signal and E.  The raw symbol is the line before the equaliser, and
+    -- this line's echo of the previous and next symbols is a sixth of the
+    -- symbol itself: enough to push about one quadrant change in twenty
+    -- past forty-five degrees.  Measured against a CX93001 answering at
+    -- 4800 through the ATA, R3 read from the raw symbols with 17% of its
+    -- bits wrong -- the descrambler triples each one -- while the
+    -- equalised points sat within fifteen degrees of their states, not
+    -- one of 1680 in doubt.  E is sent once and allows one error in its
+    -- seven fixed bits, so the caller missed it and waited out the call.
+    -- By these phases the loop has TRN behind it and the far end is on
+    -- the four states it tracks, so the equalised change is the better
+    -- reading, and the four-fold ambiguity still cancels in the difference.
+    (turnsEq, prevEq') = quarterTurnsOf qsPoint syms (vsPrevEq st)
+    readEq = case vsPhase st of { OR2 -> True; OB1 -> True; AR3 -> True; _ -> False }
+    dibits = concat [ [a, b] | k <- if readEq then turnsEq else turns, let (a, b) = dibitOfTurn k ]
     (descr', got) = descrambleRun (vsFar st) (vsDescr st) dibits
     bits' = take 512 (reverse got ++ vsBits st)
     pw = if VS.null rx then 0 else VS.sum (VS.map (\v -> v * v) rx) / fromIntegral (VS.length rx)
@@ -858,7 +877,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
     -- time the carrier phase, the equaliser and the descrambler that
     -- were tracking the last signal are worse than nothing for the next.
     restart s = s { vsRx = qamRxReset (v32Params (vsFs s)) v32StartCfg (vsRx s)
-                  , vsTurns = [], vsBits = [], vsPrevSym = (0, 0)
+                  , vsTurns = [], vsBits = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0)
                   , vsDescr = scramblerInit }
     rearm s = s { vsRev1800 = revRearm (vsRev1800 s)
                 , vsRev600 = revRearm (vsRev600 s)
@@ -892,10 +911,23 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
 
     step s = case vsPhase s of
       -- ------------------------------------------------ calling modem
+      -- AC is a steady pair: the answering modem does not reverse it
+      -- until it has heard our AA, so anything that reverses while we are
+      -- still listening is not AC.  Ringback is the case that matters.
+      -- 440 + 480 Hz leaks into the 600 Hz tracker well over its
+      -- threshold, and its 40 Hz beat reads as a reversal every 12 to 27
+      -- ms; a caller that took the first block of it for AC answered the
+      -- ATA's ringing with AA, took two beats for the far end's two
+      -- reversals, and measured a round trip of 40 ms -- which then
+      -- misled everything that trusts NT.  256 symbols of AC with no
+      -- reversal in it is more than two beats and costs a real answerer
+      -- nothing.
       OListen
-        | acHeard -> enter OAA (rearm s) { vsSrc = TxState StA }
+        | steady && vsACSteady s + n >= sym 256 ->
+            enter OAA (rearm s) { vsSrc = TxState StA, vsACSteady = 0 }
         | tooLong 60000 s -> enter (V32Fail "no answering modem") s
-        | otherwise -> s
+        | otherwise -> s { vsACSteady = if steady then vsACSteady s + n else 0 }
+        where steady = acHeard && acRev == Nothing
       OAA | vsSince s < sym 96 -> s
       OAA -> case acRev of
         -- 5.4.1: on the first reversal, start the clock and change AA to
@@ -931,6 +963,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
                 -- 5.4.1: R2 excludes anything absent from R1
                 r2 = maybe (vsOffer s) (restrictRates (vsOffer s)) (vsPeer s)
             in enter OCond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
+                             , vsSentS = Just (vsN s)
                              , vsSrc = TxCoded (cycle (rateSeqBits r2))
                              , vsAdapt = True }
         | otherwise -> s
@@ -958,6 +991,20 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- is what OListen waits for, and going back to OAA is what it does
       -- when it hears it.
       _ | restarted -> enter OAA (rearm s) { vsSrc = TxState StA }
+      -- R1 does not stop when we start answering it.  The answering
+      -- modem sends R1 until it hears our conditioning signal, so R1
+      -- keeps arriving for a whole round trip after S began -- and over
+      -- the ATA and a softphone that round trip is a second, longer
+      -- than our S and TRN.  The caller came into OR2 with R1 still on
+      -- the line, read it as R3, and then waited for an E anchored on
+      -- the wrong rate sequence until the far end gave up.  Replayed,
+      -- both the 4800 and the 9600 call modec placed through the bench
+      -- left OR2 on R1, three seconds before R3.  Until R1 has certainly gone
+      -- (NT, and 512 symbols for the far end to notice S) nothing heard
+      -- is R3; the far end's own S and TRN, 1552 symbols at least,
+      -- still separate that moment from its R3.
+      OR2 | Just s0 <- vsSentS s
+          , vsN s < s0 + fromMaybe 0 (vsTrip s) + sym 512 -> s { vsBits = [] }
       OR2 | vsSince s < sym 128 -> s
       OR2 -> case detectRate (vsBits s) of
         Just r3 | Just rate <- bestCommonRate (vsOffer s) r3 ->

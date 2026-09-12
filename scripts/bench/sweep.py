@@ -9,6 +9,7 @@ payload goes each way, and both are compared byte for byte.
 
     scripts/bench/sweep.py                 # every mode in MODES
     scripts/bench/sweep.py v22bis v32b-9600
+    scripts/bench/sweep.py -o v22bis       # roles reversed: modec dials
     OUT=recordings/bench PORT=/dev/modem-ref scripts/bench/sweep.py ...
 
 Needs: baresip with a config dir at ~/.baresip-bench (ctrl_tcp on
@@ -46,14 +47,76 @@ def read_for(f, secs, until=None):
         time.sleep(0.02)
     return buf
 
+def sip_options(host, port, timeout=2.0):
+    """True if a SIP stack answers OPTIONS at host:port."""
+    import socket, random
+    b = random.randint(1, 10**9)
+    msg = (f'OPTIONS sip:probe@{host}:{port} SIP/2.0\r\n'
+           f'Via: SIP/2.0/UDP 192.168.30.1:5070;branch=z9hG4bK{b};rport\r\n'
+           f'Max-Forwards: 70\r\nTo: <sip:probe@{host}:{port}>\r\n'
+           f'From: <sip:probe@192.168.30.1>;tag={b}\r\nCall-ID: {b}@192.168.30.1\r\n'
+           f'CSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.settimeout(timeout); s.sendto(msg.encode(), (host, port))
+        return s.recvfrom(65535)[0].startswith(b'SIP/2.0 200')
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+def ata_address():
+    """Where the ATA's FXS 1 takes SIP, as host:port.
+
+    The HT802V2 listens on a random port unless told otherwise, and says
+    nothing on 5060 -- which is what made "the ATA ignores SIP from an
+    unregistered proxy" look true.  Its own INVITE names the port, so the
+    reference dials out while nothing holds 5060 and the INVITE is read
+    off the socket.  ATA_SIP=host:port skips all of it; the answer is
+    cached in OUT/ata-sip.txt and re-checked with OPTIONS each time."""
+    import socket, re
+    if os.environ.get('ATA_SIP'):
+        return os.environ['ATA_SIP']
+    cache = f'{SC}/ata-sip.txt'
+    if os.path.exists(cache):
+        addr = open(cache).read().strip()
+        h, p = addr.rsplit(':', 1)
+        if sip_options(h, int(p)):
+            return addr
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('192.168.30.1', 5060)); s.settimeout(0.5)
+    m = AT(PORT)
+    try:
+        m.cmd('ATZ', 3, quiet=True)
+        os.write(m.fd, b'ATDT2001\r')
+        end = time.time() + 15; addr = None
+        while time.time() < end and not addr:
+            try: d, src = s.recvfrom(65535)
+            except socket.timeout: continue
+            c = re.search(rb'^Contact:\s*<sip:[^@>]*@([\d.]+):(\d+)', d, re.M | re.I)
+            if d.startswith(b'INVITE') and c:
+                addr = f'{c.group(1).decode()}:{c.group(2).decode()}'
+        m.cmd('ATH', 4, quiet=True)
+    finally:
+        m.close(); s.close()
+    if not addr:
+        raise RuntimeError('the ATA never sent an INVITE: is FXS 1 pointed at 192.168.30.1?')
+    open(cache, 'w').write(addr + '\n')
+    time.sleep(2)
+    return addr
+
 def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
-        pay_a=None, pay_b=None, settle=1.0, post=None, taketurns=False):
+        pay_a=None, pay_b=None, settle=1.0, post=None, taketurns=False,
+        originate=False):
     """One call.  pay_a goes modec -> reference, pay_b the other way;
     settle is the pause after CONNECT before either is sent (a noise
     schedule may need to have started); post is a list of AT commands
     to run at the reference after the call, their replies returned in
-    result['post'].  The defaults are the original sweep."""
+    result['post'].  originate reverses the roles: modec dials the ATA
+    and the reference answers on ring.  The defaults are the original
+    sweep."""
     extra = extra or []; ref_extra = ref_extra or []
+    dial_to = f'1001@{ata_address()}' if originate else None
     pay_a = PAY_A if pay_a is None else pay_a; pay_b = PAY_B if pay_b is None else pay_b
     rx = f'{SC}/sweep-{tag}-rx.wav'; tx = f'{SC}/sweep-{tag}-tx.wav'
     log = open(f'{SC}/sweep-{tag}.log','wb')
@@ -64,27 +127,42 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
     # --ans-plain always: through the ATA the V.25 reversals on the answer
     # tone stand its echo canceller down (docs/reference-modem.md); it
     # touches nothing but the V.32 answer tone
-    args = [BIN,'modem','--answer','--sip','127.0.0.1:4444','--audio-sip-loop','modec',
-            '--mode',mode,'--hayes','--data-stdio','--ans-plain','--record-rx',rx,'--record-tx',tx]+extra
+    role = [] if originate else ['--answer','--ans-plain']
+    args = [BIN,'modem']+role+['--sip','127.0.0.1:4444','--audio-sip-loop','modec',
+            '--mode',mode,'--hayes','--data-stdio','--record-rx',rx,'--record-tx',tx]+extra
     mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
     nonblock(mo.stdout)
     time.sleep(3)
-    result = {'tag':tag,'mode':mode,'ms':ms}
+    result = {'tag':tag,'mode':mode,'ms':ms,'dir':'originate' if originate else 'answer'}
     m = AT(PORT)
     try:
         # inside the try: if modec has already died (an option it does not
         # know, say) this raises, and the far end and baresip still get
         # cleaned up rather than left off hook
-        mo.stdin.write(b'ATS0=1\r'); mo.stdin.flush()
-        read_for(mo.stdout, 1.5)
+        stops = [b'CONNECT',b'NO CARRIER',b'BUSY',b'NO ANSWER',b'ERROR']
         for c in ['AT&F','AT&K0','AT%C0','AT\\N0','ATX4','ATS7=40', ms] + ref_extra:
             m.cmd(c,3,quiet=True)
-        r = m.cmd('ATDT2001',45,stop=[b'CONNECT',b'NO CARRIER',b'BUSY',b'NO ANSWER',b'ERROR'],quiet=True)
+        if originate:
+            # the reference picks up on the first ring; modec's ATD waits
+            # for the call to be established, then trains as the caller
+            m.cmd('ATS0=1',3,quiet=True)
+            mo.stdin.write(f'ATD{dial_to}\r'.encode()); mo.stdin.flush()
+            r = b''; out = b''; t0 = time.time()
+            while time.time()-t0 < 60 and not any(s in r for s in stops):
+                try: r += os.read(m.fd, 65536)
+                except BlockingIOError: pass
+                out += read_for(mo.stdout, 0.1)
+        else:
+            mo.stdin.write(b'ATS0=1\r'); mo.stdin.flush()
+            read_for(mo.stdout, 1.5)
+            r = m.cmd('ATDT2001',45,stop=stops,quiet=True)
+            out = b''
         rtxt = r.decode('latin1').replace('\r',' ').strip()
         result['ref'] = 'CONNECT' if b'CONNECT' in r else rtxt.split()[-1] if rtxt else '?'
         result['ref_connect'] = next((l.strip() for l in rtxt.split('  ') if 'CONNECT' in l), '')
         if b'CONNECT' in r:
-            out = read_for(mo.stdout, 12, until=b'CONNECT')
+            if b'CONNECT' not in out:
+                out += read_for(mo.stdout, 12, until=b'CONNECT')
             result['modec_connect'] = b'CONNECT' in out
             time.sleep(settle)
             if slow:
@@ -252,13 +330,19 @@ MODES = [
     ('v32b-14400','v32bis',  'AT+MS=V32B,0,14400,14400',['--v32-rate','14400']),
 ]
 if __name__ == '__main__':
-  only = sys.argv[1:] or None
+  # -o: modec places the call, the reference answers.  Tags get an -o
+  # suffix so the two directions' recordings sit side by side.
+  args = sys.argv[1:]
+  originate = '-o' in args
+  only = [a for a in args if a != '-o'] or None
   rows=[]
   for spec in MODES:
     tag = spec[0]
     if only and tag not in only: continue
-    print(f'>>> {tag} ({spec[2]})', flush=True)
-    r = one(*spec)
+    print(f'>>> {tag} ({spec[2]}){" originate" if originate else ""}', flush=True)
+    if originate:
+      spec = (tag + '-o',) + tuple(spec[1:])
+    r = one(*spec, originate=originate)
     rows.append(r); print('   ', r, flush=True)
   print('\n=== SUMMARY ===')
   for r in rows: print(r)

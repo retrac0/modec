@@ -1,0 +1,27 @@
+# 20260912T192557-1001-192-168-30-105-22097.wav
+#
+# The first call modec placed to the reference modem rather than taking
+# one from it: modec dials the ATA, the CX93001 answers pinned to V.32 at
+# 4800 (AT+MS=V32,0,4800,4800).  The only live fixture where a real
+# answering V.32 modem is not 2600.network, and the only one that starts
+# before the far end has answered.
+#
+# It pins three faults of the calling start-up, each of which alone kept
+# this call from ever connecting.  The first seconds are baresip's
+# 440 + 480 Hz ringback, which the caller used to take for AC -- AA at
+# 0.32 s and a 40 ms round trip.  The answerer's R1 goes on arriving for
+# a second after our S begins, and the caller used to read it as R3.  And
+# R3 and E read through this line's inter-symbol interference from the raw
+# symbols came back 17% wrong, so the one E went by unrecognised.  Before
+# the fixes the replay reads 0 bytes; after, CONNECT at 19.78 s and all
+# eight of the reference's payload lines.  See reference-modem.md, "Roles
+# reversed: modec dials".
+source:    recordings/20260912T192557-1001-192-168-30-105-22097.wav
+seconds:   40.0
+role:      originate
+modes:     v32
+v8:        no
+connect:   V32 4800
+retrains:  0
+expect:    B0007 pack my box with five dozen liquor jugs 9876543210
+tolerance: 0
