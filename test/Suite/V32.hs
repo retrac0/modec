@@ -197,7 +197,7 @@ v32Tests = testGroup "V.32 coding layer"
             dec ps = snd (decodeQuads Answer r (codedQuads r
                        -- the coding layer reads only the point and the
                        -- decision; the differential fields are the loop's
-                       [ QamSym p (slicePoint r p) 0 p 0 0 | p <- ps ]) rxCoderInit)
+                       [ QamSym p (slicePoint r p) 0 p 0 0 Nothing (p, p) | p <- ps ]) rxCoderInit)
             skip = if rateTrellis r then 200 else 40
         forM_ [0, 1, 2, 3] $ \k -> do
           let turned = iterate (map rot90) enc !! k

@@ -1,6 +1,7 @@
 module Main (main) where
 
 import Control.Monad (forM_, when)
+import Data.Maybe (isJust)
 import qualified Data.ByteString as B
 import qualified Data.Vector.Storable as VS
 import Options.Applicative
@@ -17,6 +18,8 @@ import Modec.Link
 import Modec.Echo (EchoConfig (..))
 import Modec.Modem
 import Modec.Replay
+import Modec.QAM (QamSym (..))
+import Modec.V32Pump (V32Diag (..))
 import Modec.Fixture
 import Modec.Detect
 import Modec.V32Start (v32Timeline)
@@ -70,6 +73,13 @@ data ReplayOpts = ReplayOpts
   , roMaxEvmV32 :: Double
   , roSeconds :: Maybe Double
   , roLine    :: Bool
+  , roTruth   :: Bool
+  , roTrainTruth :: Bool
+  , roEvmFreeze :: Maybe Double
+  , roNoAcq   :: Bool
+  , roHoldFreq :: Bool
+  , roFreqHz  :: Maybe Double
+  , roDumpSyms :: Maybe FilePath
   , roImpair  :: [String]
   , roChannel :: Maybe String
   , roMint    :: Maybe String
@@ -168,6 +178,13 @@ cmdP = hsubparser
              <> help "the same gate for V.32, as a fraction of the constellation's own margin")
       <*> optional (option auto (long "seconds" <> metavar "S" <> help "stop after this much of the recording"))
       <*> switch (long "line" <> help "report the receiver's decision error and symbol timing twice a second")
+      <*> switch (long "truth" <> help "V.32: predict the far end's B1 and the idle after it, and report the receiver's true error against it every half second, beside the nearest-point error it reports live")
+      <*> switch (long "train-truth" <> help "V.32: and train the loops on those predicted symbols while they last (the oracle of modec-bench v32-aided, on this recording)")
+      <*> optional (option auto (long "v32-evm-freeze" <> metavar "E" <> help "V.32: let the data-mode equaliser adapt under this decision error power instead of the rate's own freeze (0.0052 at 14400, 0.0102 at 12000)"))
+      <*> switch (long "v32-no-acq" <> help "V.32: skip the 256-symbol acquisition window after the handover and run the rate's tracking configuration from the first data symbol")
+      <*> switch (long "v32-hold-freq" <> help "V.32: hold the carrier frequency estimate through data mode (no integral term)")
+      <*> optional (option auto (long "v32-freq" <> metavar "HZ" <> help "V.32: with --v32-hold-freq, start data mode from this carrier offset rather than what the start-up left"))
+      <*> optional (strOption (long "dump-syms" <> metavar "FILE" <> help "V.32: write every decided symbol, one per line: t zr zi zmr zmi ur ui idx tx ty (tx ty are nan without a prediction)"))
       <*> many (strOption (long "impair" <> metavar "K=V"
              <> help "degrade the recording first, on top of --channel. Line: snr, freq, rate, gain, dc, band, clip, hum, seed. Analogue: softclip, harm2, harm3, sing, singgain, wobble, phasejit. Time: jitter, slips, wow, flutter. Digital span: ulaw, alaw, biterr, loss, burst, stuck. Transient: impulse, hits. Repeatable"))
       <*> optional (strOption (long "channel" <> metavar "NAME"
@@ -498,14 +515,21 @@ runReplay ro = do
       -- The same assembly the corpus uses, so a replay from the command
       -- line and the test that replays the fixture it mints are the same
       -- modem.  Only the two decision-error gates are the command's own.
+      diag = V32Diag { vgTruth = roTruth ro || roTrainTruth ro
+                     , vgTrainTruth = roTrainTruth ro
+                     , vgEvmFreeze = roEvmFreeze ro
+                     , vgNoAcq = roNoAcq ro
+                     , vgHoldFreq = roHoldFreq ro || isJust (roFreqHz ro)
+                     , vgFreqHz = roFreqHz ro }
       cfg = (callSpecConfig fs (replaySpec ro))
-              { mcMaxEvm = roMaxEvm ro, mcMaxEvmV32 = roMaxEvmV32 ro }
+              { mcMaxEvm = roMaxEvm ro, mcMaxEvmV32 = roMaxEvmV32 ro, mcV32Diag = diag }
       trimmed = case roSeconds ro of
         Nothing -> samples
         Just s -> VS.take (round (s * fs)) samples
       x = Ch.applyChannel fs (impairments (roChannel ro) (roImpair ro)) trimmed
       rc = (defaultReplayConfig cfg)
-             { rcEvery = if roLine ro then Just 0.5 else Nothing }
+             { rcEvery = if roLine ro then Just 0.5 else Nothing
+             , rcSyms = isJust (roDumpSyms ro) }
       r = replay rc x
   forM_ (rrPhases r) $ \(t, ph) -> hPrintf stderr "  %6.2f  %s\n" t ph
   forM_ (rrLine r) $ \(t, evm, sps) ->
@@ -513,13 +537,53 @@ runReplay ro = do
   forM_ (rrEcho r) $ \(t, lag, erle) ->
     hPrintf stderr "  %6.2f  echo %s  return loss %5.1f dB\n" t
       (maybe "unaimed" (\l -> "at " ++ show (round (fromIntegral l / (fs / 1000) :: Double) :: Int) ++ " ms") lag) erle
+  -- The truth, a half second at a time: the block rows summed over
+  -- windows, the true error weighted by how many symbols each block
+  -- had a prediction for.
+  forM_ (truthWindows 0.5 (rrTruth r)) $ \(t, near, true, nT, ones, bits) ->
+    hPrintf stderr "  %6.2f  truth  near %.4f  ones %3d%%  true %s  n %d\n" t near
+      (if bits == 0 then 0 else (100 * ones) `div` bits :: Int)
+      (if nT > 0 then printf "%.4f %5.1f dB" true (-10 * logBase 10 (max 1e-9 true) :: Double) :: String else "      -        ")
+      nT
+  forM_ (rrTaps r) $ \(t, ph, ts) ->
+    hPrintf stderr "  %6.2f  taps %s |w|,deg: %s\n" t ph
+      (unwords [ printf "%.2f/%.0f" (sqrt (a * a + b * b) :: Double) (atan2 b a * 180 / pi :: Double) | (a, b) <- ts ])
+  forM_ (rrPower r) $ \(t, ph, (pw, fr, sps, evm)) ->
+    hPrintf stderr "  %6.2f  loops power %6.1f dB  freq %6.2f Hz  sps %8.5f  evm %.4f  %s\n" t
+      (10 * logBase 10 (max 1e-12 pw) :: Double) (fr * 2400 / (2 * pi) :: Double) sps evm ph
   forM_ (rrEvents r) $ \(t, e) -> hPrintf stderr "  %6.2f  %s\n" t (describeEvent e)
   hPrintf stderr "%d bytes\n" (length (rrBytes r))
+  case roDumpSyms ro of
+    Nothing -> return ()
+    Just path -> withFile path WriteMode $ \h ->
+      forM_ (rrSyms r) $ \(t, ss) -> forM_ ss $ \sy ->
+        let ((zr, zi), (zmr, zmi)) = qsLine sy
+            (ur, ui) = qsPoint sy
+            (tx, ty) = maybe (0 / 0, 0 / 0) id (qsTruth sy)
+        in hPrintf h "%.4f %.6f %.6f %.6f %.6f %.6f %.6f %d %.6f %.6f\n" t zr zi zmr zmi ur ui (qsIndex sy) tx ty
   hSetBinaryMode stdout True
   B.hPut stdout (B.pack (rrBytes r))
   case roMint ro of
     Nothing -> return ()
     Just name -> mint ro r name (round fs) trimmed
+
+-- | Block rows of the truth trace summed into windows of @w@ seconds:
+-- the nearest-point error averaged over the blocks, the true error over
+-- the symbols that had a prediction, the ones over all the bits.
+truthWindows :: Double -> [(Double, Double, Double, Int, Int, Bool, Int, Int)]
+             -> [(Double, Double, Double, Int, Int, Int)]
+truthWindows w rows = case rows of
+  [] -> []
+  ((t0, _, _, _, _, _, _, _) : _) ->
+    let (now, later) = span (\(t, _, _, _, _, _, _, _) -> t < t0 + w) rows
+        nb = length now
+        near = sum [ x | (_, x, _, _, _, _, _, _) <- now ] / fromIntegral nb
+        nT = sum [ k | (_, _, _, k, _, _, _, _) <- now ]
+        true = if nT == 0 then 0
+               else sum [ x * fromIntegral k | (_, _, x, k, _, _, _, _) <- now ] / fromIntegral nT
+        ones = sum [ o | (_, _, _, _, _, _, o, _) <- now ]
+        bits = sum [ b | (_, _, _, _, _, _, _, b) <- now ]
+    in (t0, near, true, nT, ones, bits) : truthWindows w later
 
 describeEvent :: ModemEvent -> String
 describeEvent e = case e of

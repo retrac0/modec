@@ -31,6 +31,9 @@ module Modec.V32Pump
   , modulatePointsFor
     -- * A duplex data pump
   , V32Data
+  , V32Diag (..)
+  , defaultV32Diag
+  , v32DataDiag
   , v32DataInit
   , v32DataFrom
   , v32DataResume
@@ -41,6 +44,9 @@ module Modec.V32Pump
   , v32DataEvm
   , v32DataSps
   , v32DataPower
+  , v32DataTruth
+  , v32DataSyms
+  , v32DataOnes
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
@@ -383,9 +389,14 @@ decodeSymbols dir r syms st = decodeQuads dir r (codedQuads r syms) st
 -- overlap a second time puts it out of step with the far end -- which
 -- looks like a receiver that locks perfectly and then decodes noise.
 codedQuads :: V32Rate -> [QamSym] -> [Coded]
-codedQuads r syms
-  | rateTrellis r = viterbiDecode r viterbiDepth (map qsPoint syms)
-  | otherwise =
+codedQuads r = map snd . codedQuadsStates r
+
+-- | 'codedQuads' with the trellis state each symbol left, where there
+-- is a trellis; 'convInit' otherwise.
+codedQuadsStates :: V32Rate -> [QamSym] -> [(ConvState, Coded)]
+codedQuadsStates r syms
+  | rateTrellis r = viterbiDecodeStates r viterbiDepth (map qsPoint syms)
+  | otherwise = map ((,) convInit)
       [ let i = qsIndex sym
             k = rateBitsPerSymbol r
             bits = [ odd (i `div` (2 ^ b)) | b <- reverse [0 .. k - 1] ]
@@ -643,8 +654,44 @@ runBlocks p cfg sig st0 = go st0 (chunksOf (blockOf (qpFs p)) sig)
 
 -- | A V.32 data pump for the connected state: a block of audio in, a
 -- block out, bits both ways.
+-- | Measurement switches on the data pump, all off in a modem that is
+-- carrying a call.  They exist so a recorded call can be read back
+-- with one thing changed and the receiver's true error watched.
+data V32Diag = V32Diag
+  { vgTruth      :: !Bool
+    -- ^ predict the far end's idle symbols and measure against them;
+    -- see 'armTruth'
+  , vgTrainTruth :: !Bool
+    -- ^ ...and train the loops on them while the prediction lasts
+    -- ('Modec.QAM.qrTrainTruth'): the oracle, on a real call
+  , vgEvmFreeze  :: !(Maybe Double)
+    -- ^ adapt the equaliser in data mode under this decision error
+    -- instead of the rate's own 'qrEvmFreeze'
+  , vgNoAcq      :: !Bool
+    -- ^ skip the 'v32AcqCfg' window after the handover: the rate's own
+    -- tracking configuration from the first data symbol
+  , vgHoldFreq   :: !Bool
+    -- ^ hold the carrier frequency estimate through data mode: the
+    -- loop's integral gain set to nothing
+  , vgFreqHz     :: !(Maybe Double)
+    -- ^ ...and start it from this offset, in hertz, at the first data
+    -- block, rather than from what the start-up left
+  } deriving (Eq, Show)
+
+defaultV32Diag :: V32Diag
+defaultV32Diag = V32Diag False False Nothing False False Nothing
+
 data V32Data = V32Data
-  { vdTx    :: !QamTxState
+  { vdDiag  :: !V32Diag
+  , vdSyms  :: [QamSym]   -- ^ the symbols the last block decided, for measurement
+  , vdOnes  :: !(Int, Int)
+    -- ^ of the data bits the last block put out, how many were ones,
+    -- and how many there were.  A far end with nothing to say sends
+    -- ones, and a descrambled bit is one when the three line bits it is
+    -- made of came through right, so on an idle line this is a bit
+    -- error rate that needs no reference: all ones is a receiver in
+    -- step, a half is one decoding noise.
+  , vdTx    :: !QamTxState
   , vdCode  :: !TxCoder
   , vdRx    :: !QamRxState
   , vdDec   :: !RxCoder
@@ -656,7 +703,8 @@ data V32Data = V32Data
 
 v32DataInit :: Double -> V32Rate -> V32Data
 v32DataInit fs r = V32Data
-  { vdTx = qamTxInit, vdCode = txCoderInit
+  { vdDiag = defaultV32Diag, vdSyms = [], vdOnes = (0, 0)
+  , vdTx = qamTxInit, vdCode = txCoderInit
   , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
   , vdPend = [], vdWait = [], vdBits = [], vdAcq = v32AcqSymbols }
 
@@ -664,6 +712,10 @@ v32DataInit fs r = V32Data
 -- has already brought into lock.
 v32DataFrom :: QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
 v32DataFrom rx tx code st = st { vdRx = qamRxUnlock rx, vdTx = tx, vdCode = code }
+
+-- | Set the measurement switches.
+v32DataDiag :: V32Diag -> V32Data -> V32Data
+v32DataDiag d st = st { vdDiag = d }
 
 -- | The receiver and transmitter a retrain has to carry back into the
 -- start-up, so the symbol clock and carrier phase do not restart in the
@@ -685,7 +737,8 @@ v32DataTxState = vdTx
 -- of a symbol the coder had left over.
 v32DataResume :: Double -> V32Rate -> QamRxState -> QamTxState -> TxCoder -> V32Data -> V32Data
 v32DataResume fs r rx tx code old =
-  (v32DataInit fs r) { vdRx = qamRxUnlock rx, vdTx = tx, vdCode = code, vdBits = vdBits old }
+  (v32DataInit fs r) { vdRx = qamRxUnlock rx, vdTx = tx, vdCode = code, vdBits = vdBits old
+                     , vdDiag = vdDiag old }
 
 v32DataEvm :: V32Data -> Double
 v32DataEvm = qamRxEvm . vdRx
@@ -700,6 +753,29 @@ v32DataSps = qamRxSps . vdRx
 -- nothing when the far end does.
 v32DataPower :: V32Data -> Double
 v32DataPower = qamRxPower . vdRx
+
+-- | The last block measured against the far end's predicted symbols:
+-- the mean nearest-point error over the block, the mean true error over
+-- the symbols that had a prediction, how many of the block's symbols
+-- had one, how many have been measured since the prediction was
+-- queued, and whether it is still live.
+v32DataTruth :: V32Data -> (Double, Double, Int, Int, Bool)
+v32DataTruth st = (near, true, nT, qamRxTruthCount (vdRx st), qamRxTruthLive (vdRx st))
+  where
+    syms = vdSyms st
+    mean xs = if null xs then 0 else sum xs / fromIntegral (length xs)
+    near = mean (map qsError syms)
+    withT = [ (qsPoint s, t) | s <- syms, Just t <- [qsTruth s] ]
+    nT = length withT
+    true = mean [ (a - c) * (a - c) + (b - d) * (b - d) | ((a, b), (c, d)) <- withT ]
+
+-- | The symbols the last block decided, for dumping.
+v32DataSyms :: V32Data -> [QamSym]
+v32DataSyms = vdSyms
+
+-- | Ones among the data bits the last block put out, and the bits.
+v32DataOnes :: V32Data -> (Int, Int)
+v32DataOnes = vdOnes
 
 -- | How many symbols of context the decoder needs behind it.  A trellis
 -- decoder judges a sequence, so restarting it at every block boundary
@@ -727,8 +803,14 @@ v32DataRx :: Double -> Role -> V32Rate -> V32Data -> Signal -> (V32Data, [Bool])
 v32DataRx fs dir r st rx = (st', out)
   where
     p = v32Params fs
-    cfg = if vdAcq st > 0 then v32AcqCfg r else v32RxCfg r
-    (rx', syms) = qamRxBlock p cfg rx (vdRx st)
+    cfg = tune (vdDiag st) (if vdAcq st > 0 && not (vgNoAcq (vdDiag st)) then v32AcqCfg r else v32RxCfg r)
+    tune d c = c { qrEvmFreeze = maybe (qrEvmFreeze c) id (vgEvmFreeze d)
+                 , qrTrainTruth = vgTrainTruth d
+                 , qrThKi = if vgHoldFreq d then 0 else qrThKi c }
+    rx0 = case (vgFreqHz (vdDiag st), vdAcq st == v32AcqSymbols) of
+      (Just hz, True) -> qamRxSetFreq (2 * pi * hz / qpBaud p) (vdRx st)
+      _ -> vdRx st
+    (rx', syms) = qamRxBlock p cfg rx rx0
     -- A Viterbi decoder is only sure of a symbol once it has seen the
     -- traceback's worth of symbols after it.  Emitting a block's newest
     -- symbols the moment they arrive therefore hands out precisely the
@@ -740,9 +822,14 @@ v32DataRx fs dir r st rx = (st', out)
     stream = vdPend st ++ vdWait st ++ syms
     nPend = length (vdPend st)
     emitTo = max nPend (length stream - depth)
-    fresh = take (emitTo - nPend) (drop nPend (codedQuads r stream))
+    freshS = take (emitTo - nPend) (drop nPend (codedQuadsStates r stream))
+    fresh = map snd freshS
     (dec', out) = decodeQuads dir r fresh (vdDec st)
-    st' = st { vdRx = rx', vdDec = dec'
+    rx'' = case (vgTruth (vdDiag st) && not (qamRxTruthLive rx'), freshS) of
+      (True, _ : _) -> armTruth dir r dec' (fst (last freshS)) (length stream - emitTo) rx'
+      _ -> rx'
+    st' = st { vdRx = rx'', vdDec = dec', vdSyms = syms
+             , vdOnes = (length (filter id out), length out)
              , vdWait = drop emitTo stream
              , vdPend = lastN vdOverlap (take emitTo stream)
              , vdAcq = max 0 (vdAcq st - length syms) }
@@ -774,3 +861,41 @@ v32DataTx fs dir r amp n bits st = (st { vdTx = tx', vdCode = code', vdBits = ke
 
 lastN :: Int -> [a] -> [a]
 lastN k xs = drop (max 0 (length xs - k)) xs
+
+-- | Predict what the far end sends next, on the assumption that it is
+-- idling, and hand the prediction to the receiver to measure itself
+-- against ('Modec.QAM.qamRxTruth').
+--
+-- A V.32 modem with nothing to say sends scrambled binary ones, and a
+-- receiver in step with it holds everything needed to say which points
+-- those are: its descrambler's register is the far scrambler's, the
+-- last Y1 Y2 it decoded is the far differential encoder's memory, and
+-- the trellis path it decoded fixes the far convolutional encoder's
+-- state -- all of them in the receiver's own frame, which is what makes
+-- the prediction land on the receiver's points without any quarter turn
+-- to resolve: a rotated code sequence is a code sequence, from the
+-- rotated state.  From there the far end's ones are encoded exactly as
+-- it encodes them.  Where the prediction stops matching -- the far end
+-- has data to send, or the receiver has lost it -- the receiver drops
+-- it, and the next block arms it again.  So the truth is available
+-- whenever the far end idles, for as long as it idles, from the first
+-- block the decoder is in step, and never at the seam after E where
+-- the receiver is at its worst and this was first attempted.
+--
+-- The prediction begins at the first symbol the decoder has not emitted
+-- yet, which the receiver has already produced -- the trellis holds
+-- 'viterbiDepth' back -- so that many predicted points are skipped and
+-- the rest queued for the symbols still to come.
+armTruth :: Role -> V32Rate -> RxCoder -> ConvState -> Int -> QamRxState -> QamRxState
+armTruth dir r dec state held rx = qamRxTruth (drop held (onesFrom far r coder)) rx
+  where
+    far = case dir of { Originate -> Answer; Answer -> Originate }
+    coder = TxCoder (rcDescr dec) (rcPrev dec) state []
+
+-- | Scrambled ones from a data coder, without end: what a V.32 modem
+-- sends while it has nothing to say.  In pieces, because
+-- 'encodeSymbols' takes the length of what it is given.
+onesFrom :: Role -> V32Rate -> TxCoder -> [Point]
+onesFrom far r c =
+  let (c', ps) = encodeSymbols far r (replicate (64 * rateBitsPerSymbol r) True) c
+  in ps ++ onesFrom far r c'

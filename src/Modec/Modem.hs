@@ -17,6 +17,11 @@ module Modec.Modem
   , modemConnected
   , modemV32Evm
   , modemV32Line
+  , modemV32Truth
+  , modemV32Syms
+  , modemV32Ones
+  , modemV32Power
+  , modemV32Taps
   , modemEchoErle
   , modemEchoData
   , modemEchoDelay
@@ -52,7 +57,8 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.V32 (RateSeq (..), rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
-import Modec.V32Pump (V32Data, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataRxState, v32DataTxState)
+import Modec.QAM (QamSym, qamRxPower, qamRxTaps, qamRxFreq, qamRxSps, qamRxEvm)
+import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Mnp
@@ -77,6 +83,7 @@ data ModemConfig = ModemConfig
   , mcAnsReversals :: Bool -- ^ V.25 phase reversals on the answer tone; see 'v32AnsReversals'
   , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols ('aidB1').  Off: it predicts B1 exactly and does not reliably help; see the measurement in docs/reference-modem.md
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
+  , mcV32Diag   :: V32Diag       -- ^ measurement switches on the V.32 data pump, all off for a real call
   } deriving (Show)
 
 -- | @modes@ lists the standards the modem may negotiate, best first.
@@ -108,6 +115,7 @@ defaultModemConfig fs role modes = ModemConfig
   , mcAnsReversals = True
   , mcAidB1 = False
   , mcMaxEvm = 1.0
+  , mcV32Diag = defaultV32Diag
   }
 
 data ModemEvent
@@ -211,7 +219,7 @@ modemInit cfg
   -- through a capabilities exchange that cannot name the one thing it
   -- can do.
   | [s] <- hcModes hs, isV32 s, not (hcV8 hs) =
-      base { msMode = Starting32 (v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartInit fs ((hcRole hs)) (v32Offer cfg)))) V32Committed }
+      base { msMode = Starting32 (startFlags cfg (v32StartInit fs ((hcRole hs)) (v32Offer cfg))) V32Committed }
   | mcNoHandshake cfg, [s] <- hcModes hs =
       let link = linkFor (hcRole hs) s
       in base { msMode = dataModeFor cfg s link, msTxCmd = dataCmd link, msStatus = HsConnected s link
@@ -290,6 +298,13 @@ armFramer mnp armed trust acquired onesRun bits framer
 -- announced by B4 and B8 together, and a V.32 call has to leave B4
 -- clear or a V.32bis modem on the other end will read Note 1 the other
 -- way and offer 14400 to a modem that cannot take it.
+-- | The start-up's switches, from the configuration: the answer tone's
+-- reversals and B1 training.  One place, so a retrain gets the same
+-- answer as the first start-up -- 'v32StartInit' turns B1 training on
+-- by itself, and the retrain path used to keep it.
+startFlags :: ModemConfig -> V32Start -> V32Start
+startFlags cfg = v32AidB1 (mcAidB1 cfg) . v32AnsReversals (mcAnsReversals cfg)
+
 v32Offer :: ModemConfig -> RateSeq
 v32Offer cfg = case mcV32Rates cfg of
   Just r -> r
@@ -424,6 +439,47 @@ modemV32Line st = case msMode st of
   DataV32 _ _ pump _ _ -> Just (sqrt (v32DataEvm pump), v32DataSps pump)
   _ -> Nothing
 
+-- | The data pump's last block against the far end's predicted symbols;
+-- see 'Modec.V32Pump.v32DataTruth'.  'Nothing' outside V.32 data mode.
+modemV32Truth :: ModemState -> Maybe (Double, Double, Int, Int, Bool)
+modemV32Truth st = case msMode st of
+  DataV32 _ _ pump _ _ -> Just (v32DataTruth pump)
+  _ -> Nothing
+
+-- | The V.32 receiver's estimate of the received power before its gain,
+-- whichever receiver has the line: the start-up's or the data pump's.
+modemV32Power :: ModemState -> Maybe (Double, Double, Double, Double)
+modemV32Power st = case msMode st of
+  Starting32 s32 _ -> Just (loops (v32StartRx s32))
+  Retrain32 s32 _ -> Just (loops (v32StartRx s32))
+  DataV32 _ _ pump _ _ -> Just (loops (v32DataRxState pump))
+  _ -> Nothing
+  where
+    -- power, carrier frequency estimate in radians per symbol, samples
+    -- per symbol, and the nearest-point error
+    loops rx = (qamRxPower rx, qamRxFreq rx, qamRxSps rx, qamRxEvm rx)
+
+-- | The V.32 receiver's equaliser taps, whichever receiver has the line.
+modemV32Taps :: ModemState -> Maybe [(Double, Double)]
+modemV32Taps st = case msMode st of
+  Starting32 s32 _ -> Just (qamRxTaps (v32StartRx s32))
+  Retrain32 s32 _ -> Just (qamRxTaps (v32StartRx s32))
+  DataV32 _ _ pump _ _ -> Just (qamRxTaps (v32DataRxState pump))
+  _ -> Nothing
+
+-- | Ones among the data bits the pump put out last block, and the bits:
+-- see 'Modec.V32Pump.v32DataOnes'.
+modemV32Ones :: ModemState -> Maybe (Int, Int)
+modemV32Ones st = case msMode st of
+  DataV32 _ _ pump _ _ -> Just (v32DataOnes pump)
+  _ -> Nothing
+
+-- | The symbols the data pump decided in the last block.
+modemV32Syms :: ModemState -> Maybe [QamSym]
+modemV32Syms st = case msMode st of
+  DataV32 _ _ pump _ _ -> Just (v32DataSyms pump)
+  _ -> Nothing
+
 modemConnected :: ModemState -> Bool
 modemConnected st = case msMode st of
   DataFsk {} -> True
@@ -518,14 +574,14 @@ modemStep cfg st0 rxBlock newBytes =
              -- on the alternating pair: that whole time it is
              -- transmitting 600 and 3000 Hz, which no V.22, V.21 or Bell
              -- caller understands.
-             let s32 = v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartAfterAnswerTone fs ((hcRole hs)) (v32Offer cfg)))
+             let s32 = startFlags cfg (v32StartAfterAnswerTone fs ((hcRole hs)) (v32Offer cfg))
                  st2 = st1 { msMode = Starting32 s32 V32Committed
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
            -- A.2.2: the answering ladder offering the pair on spec.  The
            -- same handoff, bounded, and with somewhere to go back to.
            HsOfferV32 ->
-             let s32 = v32AidB1 (mcAidB1 cfg) (v32AnsReversals (mcAnsReversals cfg) (v32StartOffer fs ((hcRole hs)) (v32Offer cfg) (hcV32Offer hs)))
+             let s32 = startFlags cfg (v32StartOffer fs ((hcRole hs)) (v32Offer cfg) (hcV32Offer hs))
                  st2 = st1 { msMode = Starting32 s32 V32Offered
                            , msEcho = Just (echoInit (mcEcho cfg)) }
              in (st2, VS.replicate n 0, [], v8Menus)
@@ -554,7 +610,7 @@ modemStep cfg st0 rxBlock newBytes =
                  -- transmitter's symbol clock, rather than restarting both
                  -- mid-signal
                  pump = v32DataFrom (v32StartRx s32') (v32StartTx s32') (v32StartCoder s32')
-                                    (v32DataInit fs r)
+                                    (v32DataDiag (mcV32Diag cfg) (v32DataInit fs r))
                  st2 = st1 { msMode = DataV32 (hcRole hs) r pump (asyncRxInit (mcFraming cfg)) False
                            , msStatus = HsConnected std link, msSettled = 0
                            , msMnp = mnpFor cfg link }
@@ -670,9 +726,9 @@ modemStep cfg st0 rxBlock newBytes =
           st1 = st { msEcho = echo', msZeros = onesRun', msListen = listen', msBad = bad' }
       in case wantRetrain of
            Just why | hdCount held < mcRetrainMax cfg, not (rateSeqCleardown offer') ->
-             let s32 = v32RetrainInit fs (role) offer'
+             let s32 = startFlags cfg (v32RetrainInit fs (role) offer'
                          (why == RetrainLocal)
-                         (v32DataRxState pump') (v32DataTxState pump') Nothing
+                         (v32DataRxState pump') (v32DataTxState pump') Nothing)
                  (txSt, audio) = transmit TxSilence st1
              in ( st1 { msMode = Retrain32 s32 held { hdWhy = why, hdCount = hdCount held + 1 }
                       , msTx = txSt, msBad = 0, msRetrains = msRetrains st + 1 }

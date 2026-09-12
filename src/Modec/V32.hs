@@ -59,6 +59,7 @@ module Modec.V32
   , convInit
   , convStep
   , viterbiDecode
+  , viterbiDecodeStates
     -- * Start-up signals (§5.2, §5.3)
   , trnBits
   , trnStates
@@ -502,7 +503,13 @@ convStep (ConvState st) (y1, y2) = (ConvState st', y0)
 -- Emission is delayed by @depth@ symbols; the tail is flushed from the
 -- best surviving path at the end.
 viterbiDecode :: V32Rate -> Int -> [Point] -> [(Bool, Bool, [Bool])]
-viterbiDecode rate depth = go start (0 :: Int)
+viterbiDecode rate depth = map snd . viterbiDecodeStates rate depth
+
+-- | The same, with the encoder state each decided symbol left behind on
+-- the path it was decided along: what a prediction of the far end's
+-- next symbols has to start from.
+viterbiDecodeStates :: V32Rate -> Int -> [Point] -> [(ConvState, (Bool, Bool, [Bool]))]
+viterbiDecodeStates rate depth = go start (0 :: Int)
   where
     -- §5.4: the encoder's delay elements start at zero, so the decoder
     -- knows the initial state and need not consider the other seven.
@@ -527,7 +534,7 @@ viterbiDecode rate depth = go start (0 :: Int)
       [ pick s' | s' <- [0 .. 7] ]
       where
         cands =
-          [ (s', (m + bm, take (depth + 1) ((y1, y2, q) : hist)))
+          [ (s', (m + bm, take (depth + 1) ((ConvState s', (y1, y2, q)) : hist)))
           | (s, (m, hist)) <- zip [0 ..] sts
           , (y1, y2) <- [(False, False), (False, True), (True, False), (True, True)]
           , let (ConvState s', y0) = convStep (ConvState s) (y1, y2)

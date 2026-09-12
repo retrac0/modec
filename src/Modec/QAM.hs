@@ -53,6 +53,8 @@ module Modec.QAM
   , QamSym (..)
   , qamRxEvm
   , qamRxSps
+  , qamRxTaps
+  , qamRxSetFreq
   , agcSettleSyms
   , qamRxPower
   , qamRxTheta
@@ -66,6 +68,12 @@ module Modec.QAM
     -- * Training on symbols that are known rather than decided
   , qamRxRef
   , qamRxRefLeft
+    -- * Measuring against symbols that are known
+  , qamRxTruth
+  , qamRxTruthLive
+  , qamRxTruthCount
+  , truthDrop
+  , truthDropRun
     -- * Starting a receiver somewhere other than at rest
   , QamRxSeed (..)
   , defaultSeed
@@ -163,6 +171,12 @@ data QamRxCfg = QamRxCfg
     -- V.22 keeps.  Both were the unexamined consequence of where each
     -- fork happened to write its reset, and each is what its own
     -- measurements were taken against.
+  , qrTrainTruth :: !Bool
+    -- ^ while the truth queue ('qamRxTruth') is live, train the loops on
+    -- it as 'qamRxRef' would, and adapt the equaliser regardless of
+    -- 'qrEvmFreeze'.  A measurement switch: the oracle of
+    -- 'Modec.V32Pump.v32DemodulateAided' on a real call.  Off, the truth
+    -- queue is read and never steers anything.
   }
 
 -- | What 'qrRestartOn' is shown, per symbol.
@@ -206,7 +220,8 @@ defaultRxCfg slice point = QamRxCfg
   , qrSlice = slice, qrPoint = point
   , qrSteerAt = 2, qrAdaptAt = 3, qrAdaptRun = maxBound
   , qrFreqFf = 0, qrFreqFfRun = maxBound
-  , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True }
+  , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True
+  , qrTrainTruth = False }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -299,6 +314,17 @@ data QamSym = QamSym
   , qsDev      :: !Double
     -- ^ that advance's signed deviation from the nearest quarter turn,
     -- in radians: the carrier offset, seen directly
+  , qsTruth    :: !(Maybe (Double, Double))
+    -- ^ the point the far end is known to have sent, in the receiver's
+    -- own frame, if 'qamRxTruth' had one for this symbol.  What the
+    -- decision error should have been measured against: 'qsError' is
+    -- the distance to the nearest point, which on sixty-four or a
+    -- hundred and twenty-eight of them stops growing once the true
+    -- error fills a decision cell.
+  , qsLine     :: !((Double, Double), (Double, Double))
+    -- ^ the two samples this symbol put into the equaliser's delay
+    -- line: on time and half a symbol earlier, after gain and carrier,
+    -- before the taps.  Enough to fit any equaliser to offline.
   } deriving (Eq, Show)
 
 -- | Phase advance from one symbol to the next, in quarter turns.
@@ -353,6 +379,15 @@ data QamRxState = QamRxState
     -- decision-directed receiver and is bit for bit what it always was.
     -- See 'qamRxRef'.
   , rxSeed    :: QamRxSeed  -- ^ where 'qamRxReset' returns to
+  , rxTruth   :: [(Double, Double)]
+    -- ^ Points the far end is known to be sending, oldest first, for
+    -- measurement: 'qsTruth'.  May be unbounded, so nothing here takes
+    -- its length.  Dropped once 'truthDropRun' symbols in a row miss it
+    -- by more than 'truthDrop': the far end has stopped sending what was
+    -- predicted, or the receiver has slipped a quarter turn, and either
+    -- way the prediction is worthless from there on.
+  , rxTruthBad :: !Int    -- ^ consecutive symbols the truth missed
+  , rxTruthN  :: !Int     -- ^ symbols measured against the truth so far
   }
 
 -- | The values a receiver starts from.  Two pumps that are one machine
@@ -385,7 +420,8 @@ qamRxInitWith p cfg seed = QamRxState
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
   , rxEvm_ = srEvm0 seed, rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
   , rxTiming = False
-  , rxLastStep = 0, rxStepRun = 0, rxEnergy = 0, rxSeed = seed, rxRef = [] }
+  , rxLastStep = 0, rxStepRun = 0, rxEnergy = 0, rxSeed = seed, rxRef = []
+  , rxTruth = [], rxTruthBad = 0, rxTruthN = 0 }
   where
     sps = samplesPerSymbol p
     taps = qrEqTaps cfg
@@ -434,6 +470,34 @@ qamRxRef ps st = st { rxRef = rxRef st ++ ps }
 qamRxRefLeft :: QamRxState -> Int
 qamRxRefLeft = length . rxRef
 
+-- | Hand the receiver the points the far end is known to be sending,
+-- oldest first, to be measured against and -- only if 'qrTrainTruth' --
+-- trained on.  Replaces any earlier queue.  The list may be unbounded:
+-- a far end idling on scrambled ones is predictable for as long as it
+-- idles, and the queue is dropped by the receiver itself when the
+-- prediction stops matching what arrives.
+qamRxTruth :: [(Double, Double)] -> QamRxState -> QamRxState
+qamRxTruth ps st = st { rxTruth = ps, rxTruthBad = 0, rxTruthN = 0 }
+
+-- | Whether a truth queue is still being consumed.
+qamRxTruthLive :: QamRxState -> Bool
+qamRxTruthLive = not . null . rxTruth
+
+-- | How many symbols have been measured against the truth since it was
+-- queued.
+qamRxTruthCount :: QamRxState -> Int
+qamRxTruthCount = rxTruthN
+
+-- | A symbol further than this (squared) from its predicted point
+-- counts as a miss.  A random point of a unit-power constellation
+-- against another averages 2; a readable line is under 0.05.
+truthDrop :: Double
+truthDrop = 0.5
+
+-- | Misses in a row before the queue is dropped.
+truthDropRun :: Int
+truthDropRun = 4
+
 qamRxEvm :: QamRxState -> Double
 qamRxEvm = rxEvm_
 
@@ -459,6 +523,17 @@ agcSettleSyms = 512
 -- that is reading the line well and still getting the answer wrong.
 qamRxTiming :: QamRxState -> Bool
 qamRxTiming = rxTiming
+
+-- | Set the carrier frequency estimate, in radians per symbol.  For
+-- measurement: what a receiver does when its frequency is right and
+-- not its own to lose.
+qamRxSetFreq :: Double -> QamRxState -> QamRxState
+qamRxSetFreq f st = st { rxFreq = f }
+
+-- | The equaliser's taps, oldest input last, as complex pairs: for
+-- watching what a handover or an acquisition did to them.
+qamRxTaps :: QamRxState -> [(Double, Double)]
+qamRxTaps st = zip (VS.toList (rxEqRe st)) (VS.toList (rxEqIm st))
 
 qamRxSps :: QamRxState -> Double
 qamRxSps = rxSps
@@ -611,6 +686,17 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
 
               idx = qrSlice cfg (ur, ui)
               (px, py) = qrPoint cfg idx
+              -- The truth, if there is one for this symbol: measured
+              -- against, and dropped when it stops matching.
+              (truthNow, truthRest, tErr) = case rxTruth st of
+                (q : qs) -> (Just q, qs, dist2 (ur, ui) q)
+                []       -> (Nothing, [], 0)
+              bad' = case truthNow of
+                Just _ | tErr > truthDrop -> rxTruthBad st + 1
+                _ -> 0
+              dropped = bad' >= truthDropRun
+              truth' = if dropped then [] else truthRest
+              aided = qrTrainTruth cfg && not dropped && case truthNow of { Just _ -> True; Nothing -> False }
               -- What the loops train against.  Decision-directed, that
               -- is the nearest point -- which is also the thing being
               -- measured, so on a constellation dense enough for the
@@ -620,9 +706,10 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- symbols are known -- §5.4.2's B1 is 128 of them, and a
               -- far end idling sends thousands -- training on the truth
               -- instead removes that term.  'rxRef' carries them.
-              (ax, ay, ref') = case rxRef st of
-                (q : qs) -> (fst q, snd q, qs)
-                []       -> (px, py, [])
+              (ax, ay, ref') = case (rxRef st, truthNow) of
+                (q : qs, _)                    -> (fst q, snd q, qs)
+                ([], Just (tx, ty)) | aided    -> (tx, ty, [])
+                _                              -> (px, py, [])
               phErr = atan2 (ui * ax - ur * ay) (ur * ax + ui * ay)
               errR = ax - ur; errI = ay - ui
               -- The decision error stays the decision's, so everything
@@ -725,7 +812,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- perfectly failed to find E.
               timing' = rxTiming st
                 || (qrTrackAt cfg > 0 && evm < qrTrackAt cfg && varied && rxSyms st >= 64)
-              mu = if qrAdapt cfg && locked && evm < qrEvmFreeze cfg && varied && good
+              mu = if qrAdapt cfg && locked && (aided || evm < qrEvmFreeze cfg) && varied && good
                        && stepRun < qrAdaptRun cfg
                      then qrEqMu cfg / lineP else 0
               eqRe' = VS.zipWith3 (\w lr li -> w + mu * (errR * lr + errI * li)) (rxEqRe st) lineRe lineIm
@@ -752,10 +839,12 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                        , rxLocked = latched, rxSyms = rxSyms st + 1
                        , rxTiming = timing'
                        , rxLastStep = step, rxStepRun = stepRun
-                       , rxRef = ref' }
+                       , rxRef = ref'
+                       , rxTruth = truth', rxTruthBad = if dropped then 0 else bad'
+                       , rxTruthN = rxTruthN st + maybe 0 (const 1) truthNow }
               st2 = if bad >= qrEvmGiveUp cfg || qrRestartOn cfg (QamTap step stepRun evm (rxSyms st + 1))
                       then qamRxReset p cfg st1 else st1
-          in go st2 (QamSym (ur, ui) idx err2 (yr, yi) step dev : syms)
+          in go st2 (QamSym (ur, ui) idx err2 (yr, yi) step dev truthNow ((zr, zi), (zmr, zmi)) : syms)
 
     (stSym, symsOut) = go st0 []
     carry = VS.length (rxPrevRe st0)
@@ -770,6 +859,9 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
       , rxHistRe = histRe', rxHistIm = histIm'
       , rxPrevRe = VS.drop keepFrom extRe, rxPrevIm = VS.drop keepFrom extIm
       , rxTau = rxTau stSym - fromIntegral keepFrom }
+
+dist2 :: (Double, Double) -> (Double, Double) -> Double
+dist2 (a, b) (c, d) = (a - c) * (a - c) + (b - d) * (b - d)
 
 distinct :: [Int] -> [Int]
 distinct [] = []

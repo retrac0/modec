@@ -1037,6 +1037,184 @@ it realigns every time, within about fifteen characters. That is the
 2-to-5x in the impulse, hits, dropout, bit-error and frame-loss rows of
 the live matrix, and it was nine characters of Haskell.
 
+### The cause, measured: the carrier loop loses the frequency on a dense grid (2026-09-12)
+
+Everything above read the receiver through its own `decision error`,
+the squared distance to the *nearest* point. On sixty-four or a hundred
+and twenty-eight points that number cannot see the operating point: once
+the true error is comparable to a decision cell it stops growing, at
+about d²/6 -- **0.0159 at 12000 and 0.0081 at 14400**. Every "marginal"
+14400 reading of 0.008-0.012 and every dead 12000 call at 0.02 sat at or
+above that ceiling, which means they could have been 20 dB or 5 dB and
+the metric would have said the same. The offline pump at an 18 dB input
+reports 0.0093 too (the aided table above). So the first job was a
+measurement that does not saturate.
+
+**The truth trace.** `modec replay --truth` predicts the far end's
+symbols and reports the error against them. Not from E and B1 -- that
+attempt is written up below -- but from the data pump's own decoder:
+once its descrambler and trellis decoder are in step, the descrambler's
+register is the far scrambler's, the last Y1 Y2 it decoded is the far
+differential encoder's memory, and the Viterbi path fixes the far
+convolutional encoder's state, all in the receiver's own frame. From
+those the far end's scrambled ones are encoded exactly as it encodes
+them, queued (`Modec.QAM.qamRxTruth`) and checked symbol by symbol;
+four misses in a row drop the queue (the far end has data to send, or
+the receiver has lost it) and the next block arms it again. So the true
+error is available whenever the far end idles, for as long as it
+idles, from the first block the decoder is in step -- and on the bench
+the reference idles on ones for seconds after CONNECT and between
+lines. Beside it the trace prints the share of ones among the
+descrambled bits, which needs no reference at all: a far end with
+nothing to say sends ones, a descrambled bit is one when its three
+line bits came through right, so on an idle line 100 % is a receiver
+in step and 50 % is one decoding noise, whatever it reports.
+
+**What it found**, on the recordings this file has been arguing over
+(all replayed as the answering modem, `--max-evm-v32 3`; "true" is the
+mean squared error against the predicted point over half a second of
+idle; the loop figures are the replayed receiver's own carrier
+frequency estimate, in hertz, as the start-up ends and data mode
+begins):
+
+| call | reported | ones | true | receiver | freq: R2, seam, +0.5 s, +1 s |
+| --- | --- | --- | --- | --- | --- |
+| 12000 `-ec` (the good one) | 0.003 | 100 % | 0.0028, 25.5 dB | locked | +0.1, +0.2, -0.1, -0.1 |
+| 12000 `-noec` | 0.008 | 100 % | 0.0088, 20.5 dB | locked | +0.1, +0.3, +0.5, +0.3 |
+| 12000 `ber` 40 dB (dead, flat 0.02) | 0.020 | 50-58 % | 0.3-0.4, 5 dB | **spinning** | +0.1, +0.7, -1.3, **-3.1** |
+| 14400 `-g08` | 0.009 | 50-53 % | 0.2-2, under 7 dB | spinning | +0.1, -0.8, -1.5, +0.3 |
+| 14400 `235126` (211 s) | 0.009 | 50-54 % | 0.2-2, under 7 dB | spinning | +0.1, -1.8, +0.2, -2.2 |
+| 14400 `032546` | 0.009 | 50-54 % | 0.2-2 | spinning | |
+| 14400 `031609` | 0.003 | 100 % | 0.0025, 26 dB | locked, 8/8 lines | |
+| 12000 `042805` | 0.005 | 100 % | 0.0051, 22.9 dB | locked | |
+
+Two regimes and nothing in between. A locked receiver reads the far end
+at 20 to 26 dB with the true error equal to the reported one; a dead
+one has a true error of 0.2 to 0.4 -- five to seven decibels, the
+constellation not being read at all -- while reporting 0.01 to 0.02,
+which is the nearest-point ceiling and nothing else. The "14400 is
+marginal at 20.5 dB" of the sections above was the ceiling talking.
+And 14400 is not always dead: `031609` carries all eight lines at 26 dB.
+
+What the dead receivers are doing is visible on the stretches where
+the prediction held for a few hundred symbols: within any hundred
+symbols the points fit the truth to 0.01-0.03 after one complex
+scalar, and that scalar's angle swings by ±30 degrees from one hundred
+symbols to the next. The equaliser is not it -- its taps, printed at
+the handover and a second and twenty seconds later, are the same
+filter on a good call and a dead one, and skipping the 256-symbol
+acquisition window changes nothing. Timing is not it: `sps` sits at
+3.3333 throughout. Level is not it: the received level falls 5.5 dB in
+a slow ramp starting where the far end switches to the data
+constellation (-17.1 dB to -22.6 dB; the ATA doing something to a
+signal with a real envelope, unexplained) but it does it on every call,
+good and dead alike, and the gain follows it. What differs is the
+carrier: during TRN and R2 every call's frequency estimate reads about
++0.1 Hz, and across the seam -- AR3 reading the far end's E and then its
+B1 with a four-point slicer behind a gate that a dense constellation
+passes one symbol in five, then AE and the first data blocks with the
+dense-grid slicer -- the loop's integrator walks off by one to three
+hertz on the calls that die. A decision-directed loop on 64 or 128
+points cannot bring that back: with the constellation more than a
+fraction of a cell off, its phase error against the nearest point is
+noise, and `phErr` is an unweighted `atan2`, so the inner points -- at
+a radius of 0.16 on the 128 grid, where 0.07 of noise is 24 degrees --
+weigh as much as the outer ones. The integrator random-walks, the
+constellation spins, and the call is dead from its first symbol at a
+reported error that looks marginal. Which way the walk goes is the
+call-to-call lottery; at 12000 it lands on the locked side often, at
+14400 rarely, because the 128 grid has more inner points, finer cells
+and one decision in five wrong even when locked.
+
+**The intervention that settles it.** `modec replay --v32-freq 0.1`
+sets the data pump's carrier frequency estimate to the start-up's own
+reading at the first data block and holds it there (no integral term).
+Same recordings:
+
+| call | plain | `--v32-freq 0.1` |
+| --- | --- | --- |
+| 12000 `ber` 40 dB | dead, 50 % ones | **locked from +0.5 s**: 99-100 % ones, true 0.012-0.017 (18-19 dB), whole call |
+| 14400 `235126` | dead | **locked from 18.6 s**: 82-92 % ones, true 0.010-0.013 (19-20 dB) for the next 40 s |
+| 14400 `032546` | dead until 46 s | **locked from 16 s**: 93-100 % ones, true 0.0053-0.0074 (21-23 dB) |
+| 14400 `-g08` | dead | 59-78 % ones, true 0.015-0.027 (16-18 dB) for 12 s, then lost |
+| 12000 `-ec`, `-noec`, `042805`; 14400 `031609` | locked | unchanged |
+
+Holding the handover's own value (`--v32-hold-freq`) does nothing for
+the dead calls, because by the handover the value is already wrong;
+it is the value the seam leaves behind. The tolerance is narrow: a
+preset of 0.0 Hz still locks most of the 12000 call and a fifth of the
+14400 one, 0.4 Hz locks almost nothing, 0.7 Hz and beyond nothing at
+all -- a 0.4 Hz ramp under a 0.03 proportional gain is two degrees of
+steady phase lag, and two degrees at the outer points of the 128 grid
+is half the decision margin. The receiver has to be handed the
+frequency to within a tenth of a hertz and then not allowed to lose it.
+That the 14400 calls lock from 16 or 18 s rather than from CONNECT is
+the phase half of the same weakness: with the frequency right, the
+decision-directed phase loop on 128 points still needs seconds of luck
+to find the constellation, and on `-g08` lost it again.
+
+**Where the samples stand.** A least-squares 31-tap equaliser fitted
+to the good 12000 call's own T/2 samples against the predicted symbols
+(`--dump-syms`, a scratchpad numpy fit) leaves 0.0032-0.0034 -- 24.9 dB,
+63 taps no better -- where the receiver read 0.0028-0.0029. Locked, the
+receiver is *at* the linear floor of its input. The path therefore
+supports 25 dB at the receiver's output on this bench, echo and all,
+which is what 14400 needs with room to spare; the locked 14400 calls
+read 19 to 26 dB. So nothing in the sections above about margin, echo
+under the floor, or the loops on a dense grid costing a decibel here
+and there was the cause. They are the next tier, and they are worth
+one to three decibels between them; the cause was a receiver that was
+not reading the constellation at all, and a metric that could not tell.
+
+**What the seam taught on the way**, since `aidB1` was built on it.
+Predicting B1 from E does not work against this far end, for three
+reasons found one at a time. The CX93001 sends E with B14 set, a bit
+Table 5 reserves and `decodeSeq` rightly ignores, so an E re-encoded
+from the decoded rate sequence leaves the line at that bit and the
+scrambler register predicted from it is never the far end's. The raw
+differential decision the detectors read is wrong in about one bit in
+sixteen to thirty-two on a real line (`detectE` allows for exactly
+that), and one wrong bit in the twenty-three that make a register is a
+register that is not the far end's; the equalised points read the four
+states at 0.03 and their turns are clean, but they lag the raw symbols
+by the equaliser's seven-symbol delay, so at the moment E is detected
+its last equalised point has not been produced yet and B1 has not
+arrived. And a quarter turn of a trellis sequence is not a trellis
+sequence from state zero -- Y0 flips under 90 degrees and the encoder's
+first Y0 is always 0 -- so of the four frames that fit E, only the
+receiver's own predicts B1, and a check by quadrant, which is what the
+"nine of nine" above was, cannot tell them apart: the wrong frames
+agree by quadrant and put every point in the wrong subset. Even with
+all three put right, the points received during AE did not descramble
+to ones at any encoder state, quadrant or register offset. Whether the
+far end's B1 is something other than scrambled ones from the register
+E leaves, or the receiver at the seam is simply not reading it, is
+open; the pump-state prediction sidesteps the question, and `aidB1`
+as shipped cannot have been matching on a real call.
+
+**What follows.** The fix is in the carrier loop and the seam, not in
+the equaliser or the echo: carry the start-up's frequency estimate
+into data mode and take the integrator away from the dense-grid
+decisions, or make it very slow, until they are trustworthy; weight the
+phase detector by the decision's radius or drive it from the trellis
+decoder's delayed decisions rather than the immediate slicer; keep the
+seam's four-point receiver from steering on the far end's B1 at all;
+and give the byte gate and the retrain timer a metric that does not
+saturate -- the ones share of the descrambled idle is one, the trellis
+path metric another. Then the tiers above -- echo, timing jitter, the
+2 dB the aided oracle measured -- become worth chasing, because a
+locked 14400 receiver on this bench reads 19 to 23 dB against a need
+of about 22.
+
+Tools left behind, all off unless asked: `replay --truth`,
+`--train-truth` (train the loops on the prediction: the aided oracle
+on a recording), `--v32-evm-freeze E`, `--v32-no-acq`,
+`--v32-hold-freq`, `--v32-freq HZ`, `--dump-syms FILE` (one row per
+symbol: time, the two T/2 samples into the equaliser, the equalised
+point, the decision, the predicted point), and the `loops` and `taps`
+lines that `--line` now prints through the start-up as well as data
+mode.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores
