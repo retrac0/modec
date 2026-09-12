@@ -1215,6 +1215,82 @@ point, the decision, the predicted point), and the `loops` and `taps`
 lines that `--line` now prints through the start-up as well as data
 mode.
 
+### The fix, and what it leaves (2026-09-12)
+
+Four changes, each aimed at the mechanism above, measured on the eight
+recorded calls and on the corpus.
+
+**The seam stops steering the frequency.** From R3 onward the estimate
+has had seconds of TRN and R2 on four points and is within a tenth of a
+hertz; nothing the far end sends afterwards can improve it, and the
+dense constellation it sends can destroy it. `v32SeamCfg` and the new
+`v32SeamDataCfg` therefore run AR3, AE and OB1 with no integral term,
+and with the loop gate applied from the first symbol rather than only
+once the receiver has locked -- `qamRxUnlock`, which the handover calls
+by design, used to stand the gate down at exactly the wrong moment.
+
+**Data mode has no integral term at 12000 and 14400.** The same knee as
+`narrowTiming`: above it a decision-directed integrator is a random walk
+driven by decisions that are wrong one time in five, and what it walks
+away from cannot be recovered. The proportional term cannot run away,
+and a tenth of a hertz held by a gain of 0.03 is half a degree of lag.
+Below the knee nothing changes.
+
+**The phase detector is weighted by the decision's radius** -- the cross
+product rather than `atan2` -- for trellis rates. An inner point of the
+128 set sits at radius 0.16 where a readable line's noise is 24 degrees;
+an outer one reads the same noise as 2 degrees. A/B on the eight calls:
+better or equal on every one, and decisive on the marginal two (14400
+`-g08` 15.0 dB against 8.6, 12000 `-noec` 19.2 against 17.5).
+
+**The byte gate reads the far end's idle instead of the saturating
+error.** A run of 256 descrambled ones cannot be had by a receiver out
+of step with the far end's scrambler, and B1 alone supplies it. Either
+that proof, seen within the last second, or the old error gate now
+counts as trust -- so the rates whose decision error still means
+something are untouched, and 14400 stops being refused by a gate it
+cannot pass. The retrain timer is held off for the first three seconds
+of a link, because the evidence it waits for is an idle the far end does
+not owe us.
+
+**What it does.** Every one of the eight recordings now locks, with the
+default byte gate and no `--max-evm-v32`:
+
+| call | before | after |
+| --- | --- | --- |
+| 12000 `ber` 40 dB | never locked | 16.3 dB, 4005 bytes |
+| 14400 `235126` | never locked | 17.1 dB, 7307 bytes |
+| 14400 `-g08` | never locked | 15.0 dB, 7412 bytes |
+| 14400 `032546` | never locked | 14.9 dB, 3 of 8 lines |
+| 14400 `031609` | 21.6 dB, 8 lines | 21.9 dB, 8 lines |
+| 12000 `-ec` | 21.1 dB, 8 lines | 21.2 dB, 8 lines |
+| 12000 `-noec` | 18.7 dB, 8 lines | 19.2 dB, 8 lines |
+| 12000 `042805` | 20.2 dB | 20.4 dB |
+
+**And what it leaves.** Fitted against the far end's own symbols, a
+least-squares 31-tap equaliser on the same T/2 samples now reads within
+about a decibel of what the receiver reads: 26.0 dB against a 25.3 dB
+floor on the good 14400 call (the receiver beats a fixed fit because it
+adapts), 19.9 against 20.7 on the long one, 17.1 against 19.2 on the
+noisy 12000. So the receiver is at the linear floor of its input, and
+the calls that still lose bytes lose them because that floor is 20 dB
+where 14400 wants 22. That is the line, and it is where the echo work
+and the two decibels the data-aided oracle measured belong.
+
+Two things the corpus found, which is what it is for. The third-party
+Banksia 14400 fixtures had pinned an *empty* decode with a note saying
+the two modems idled. They did not: the far end sends V.42's detection
+pattern -- 132 repetitions of "EC" on one side, 0x11 0x91 on the other
+-- and then flag-delimited LAPM frames, and modec had been reading them
+at a decision error of 0.0015 and refusing to pass them. The framer's
+old arming rule wanted half a second of data mode to have elapsed
+before it would believe a run of descrambled ones, the one run that far
+end ever sent arrived a tenth of a second early, and nothing armed it
+again for the rest of the call. Both fixtures now pin those bytes, which
+is a far stronger assertion than emptiness. And the CX93001 9600
+fixture moved by nine bytes of idle, the payload byte for byte
+unchanged, because the framer opens about a block earlier.
+
 ### Roles reversed: blocked at the ATA
 
 T1.1 wants both directions. With modec dialling, the HT802V2 **ignores

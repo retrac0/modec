@@ -164,8 +164,11 @@ replayCase _ sp expected w = do
   -- are below V.32 and cannot retrain at all; where it is stated it is
   -- the only thing that separates a rate that connects from a rate that
   -- works.  A V.32bis call at 14400 connected and delivered nothing
-  -- either side of the receiver fix that made it usable -- what changed
-  -- was that it stopped asking for a retrain four seconds in.
+  -- either side of the timing fix that made it usable -- what changed
+  -- was that it stopped asking for a retrain four seconds in.  It
+  -- delivers the far end's V.42 now, and that took a second fault:
+  -- the receiver had been reading that line perfectly all along and
+  -- the byte gate was refusing what it read.
   mapM_ (\n -> assertBool
            ("retrained " ++ show retrains ++ " times, over " ++ show n ++ trace r)
            (retrains <= n))

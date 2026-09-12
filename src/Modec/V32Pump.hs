@@ -11,6 +11,7 @@ module Modec.V32Pump
     v32Params
   , v32RxCfg
   , v32AcqCfg
+  , v32SeamDataCfg
   , v32SeamCfg
   , v32StartCfg
   , v32RollOff
@@ -47,6 +48,8 @@ module Modec.V32Pump
   , v32DataTruth
   , v32DataSyms
   , v32DataOnes
+  , v32DataInStep
+  , v32DataReading
     -- * Offline helpers
   , v32Modulate
   , v32ModulateTrained
@@ -99,7 +102,14 @@ v32RxCfg :: V32Rate -> QamRxCfg
 v32RxCfg r
   | rateTrellis r = base { qrThKp = 0.03
                          , qrEvmFreeze = guessing * guessing
-                         , qrEvmGiveUp = maxBound }
+                         , qrEvmGiveUp = maxBound
+                         -- Everything below is about a receiver that is
+                         -- handed a lock rather than finding one, which
+                         -- is what a V.32 data pump always is.
+                         , qrLoopGate = dataGate r
+                         , qrGateAtOnce = True
+                         , qrPhaseCross = True
+                         , qrThKi = if denseGrid r then 0 else qrThKi base }
   | otherwise = base
   where
     base = narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r)))
@@ -171,12 +181,99 @@ v32RxCfg r
 -- them, and steers nothing.  Before R3 nothing is gated: a line with
 -- real delay distortion starts far outside that and has to be allowed
 -- to converge the ordinary way.
+--
+-- And no integral term, for the reason 'v32SeamDataCfg' gives: by R3
+-- the frequency has had seconds of TRN and R2 on four points to
+-- converge and is within a tenth of a hertz, and nothing the far end
+-- puts on the line from here on can improve it.  The gate alone is not
+-- enough -- one symbol of a hundred and twenty-eight in eight lands
+-- within a third of the way to a training state, so four or five
+-- symbols of every block steer the loop by an angle that means
+-- nothing -- and at 0.0015 a symbol that is a random walk of hertz.
+-- Measured on the bench: the frequency estimate reads +0.1 Hz through
+-- R2 on every call and leaves AR3 at +0.7 or -1.3 on the ones that
+-- then fail.
 v32SeamCfg :: QamRxCfg
-v32SeamCfg = v32StartCfg { qrLockAt = gate, qrLoopGate = gate }
+v32SeamCfg = v32StartCfg { qrLockAt = gate, qrLoopGate = gate
+                         , qrGateAtOnce = True, qrThKi = 0 }
   where gate = (0.35 * rateMargin V32R4800) ^ (2 :: Int)
 
+-- | What a symbol has to be within, to be worth steering the carrier
+-- loop by, once the constellation is the data one.
+--
+-- Twice the decision margin.  A symbol that far out is not this
+-- constellation's -- a correct decision on the 128 set sits about 0.095
+-- from its point on this bench against a margin of 0.11, and the
+-- distance to the nearest point of a constellation being read at the
+-- wrong phase saturates at 0.10, which is the measurement that says a
+-- gate is needed and a rotation search is not: past about five degrees
+-- the nearest-point error stops telling the receiver anything at all.
+dataGate :: V32Rate -> Double
+dataGate r = (2 * rateMargin r) ^ (2 :: Int)
+
+-- | Whether this rate's decisions are too unreliable to be allowed to
+-- move the carrier frequency estimate.
+--
+-- The same knee as 'narrowTiming', and for the same reason: the
+-- receiver's own noise is a fixed number and the constellations it is
+-- divided by are not.  Above the knee an integral term is a random
+-- walk driven by decisions that are wrong one time in five, and what it
+-- walks away from cannot be recovered -- a decision-directed loop on
+-- sixty-four or a hundred and twenty-eight points has no pull-in range
+-- worth the name, so a call that loses its frequency is dead for its
+-- whole length while reporting a decision error that looks like a good
+-- link.  Measured over eight recorded bench calls: the estimate is
+-- within 0.1 Hz at the end of the start-up on every one of them, the
+-- calls that work never leave 0.13 Hz of it without an integrator, and
+-- the calls that fail leave it by one to five hertz with one.  Which
+-- makes the integral term, here, a thing that can only lose.
+--
+-- What pays for it is the proportional term, which cannot run away,
+-- and the fact that the frequency is measured rather than tracked: the
+-- start-up spends seconds of TRN and R2 on four points, which is
+-- exactly the condition an estimate wants, and the residual drift of a
+-- connection over the minutes that follow is a fraction of a hertz.  A
+-- tenth of a hertz held by a proportional gain of 0.03 is half a degree
+-- of steady phase lag.
+--
+-- Below the knee -- 4800, 7200, 9600 either way -- nothing changes.
+-- The mechanism is the same but the margin pays for it, and those
+-- rates' measurements were taken with the loop as it is.
+denseGrid :: V32Rate -> Bool
+denseGrid r = rateMargin r < 0.18
+
+-- | The receiver through the far end's B1, where it is reading the data
+-- constellation for the first time and must not learn anything from it.
+--
+-- §5.4.2's B1 is the agreed constellation, so the slicer has to be the
+-- rate's; but the receiver arrives at it unlocked by construction
+-- ('qamRxUnlock'), its decisions are worth nothing until the loops have
+-- settled on a grid they have never seen, and the loops are what would
+-- be settling on those decisions.  So the phase advances by the
+-- frequency the start-up measured and by nothing else: no integral
+-- term, and 'qrGateAtOnce' to keep the proportional one off the
+-- symbols that are not plausibly of this constellation.
+--
+-- The frequency at this moment is good -- +0.1 Hz on every call
+-- measured, after seconds of TRN and R2 on four points -- and it is
+-- the one thing the far end cannot help the receiver recover later: a
+-- decision-directed loop on sixty-four or a hundred and twenty-eight
+-- points cannot pull in an error of a hertz, and a call that leaves
+-- this seam with one is dead for its whole length at a decision error
+-- that reads like a good link.  Both halves are in
+-- docs/reference-modem.md.
+v32SeamDataCfg :: V32Rate -> QamRxCfg
+v32SeamDataCfg r = (v32RxCfg r) { qrThKi = 0 }
+
 v32AcqCfg :: V32Rate -> QamRxCfg
-v32AcqCfg r = narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r)))
+v32AcqCfg r = tune (narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r))))
+  where
+    -- The acquisition window is the wide carrier gain again, which is
+    -- right for the phase and wrong for the frequency: this is the
+    -- moment the receiver is least able to judge its own decisions and
+    -- the moment a frequency estimate is most worth keeping.
+    tune c | denseGrid r = c { qrThKi = 0, qrLoopGate = dataGate r, qrGateAtOnce = True }
+           | otherwise = c
 
 -- | The gain's own noise, taken out for every constellation that has
 -- more than one amplitude.
@@ -684,6 +781,16 @@ defaultV32Diag = V32Diag False False Nothing False False Nothing
 data V32Data = V32Data
   { vdDiag  :: !V32Diag
   , vdSyms  :: [QamSym]   -- ^ the symbols the last block decided, for measurement
+  , vdOnesRun :: !Int    -- ^ descrambled ones in a row, across blocks
+  , vdProven :: !Int
+    -- ^ symbols since a run of 'inStepOnes' was last seen.  The latch
+    -- below is for reporting; this is what anything acting on the lock
+    -- reads, because a receiver that was in step a minute ago and is
+    -- not now is not a receiver to pass bytes from.
+  , vdInStep :: !Bool
+    -- ^ a run of 'inStepOnes' descrambled ones has been seen, so the
+    -- receiver is provably reading the far end.  Latched; see
+    -- 'v32DataRx'.
   , vdOnes  :: !(Int, Int)
     -- ^ of the data bits the last block put out, how many were ones,
     -- and how many there were.  A far end with nothing to say sends
@@ -703,7 +810,8 @@ data V32Data = V32Data
 
 v32DataInit :: Double -> V32Rate -> V32Data
 v32DataInit fs r = V32Data
-  { vdDiag = defaultV32Diag, vdSyms = [], vdOnes = (0, 0)
+  { vdDiag = defaultV32Diag, vdSyms = [], vdOnesRun = 0, vdInStep = False
+  , vdProven = provenNever, vdOnes = (0, 0)
   , vdTx = qamTxInit, vdCode = txCoderInit
   , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
   , vdPend = [], vdWait = [], vdBits = [], vdAcq = v32AcqSymbols }
@@ -769,6 +877,15 @@ v32DataTruth st = (near, true, nT, qamRxTruthCount (vdRx st), qamRxTruthLive (vd
     nT = length withT
     true = mean [ (a - c) * (a - c) + (b - d) * (b - d) | ((a, b), (c, d)) <- withT ]
 
+-- | Whether a run of descrambled ones has shown the receiver to be
+-- reading the far end; see 'inStepOnes'.
+v32DataInStep :: V32Data -> Bool
+v32DataInStep = vdInStep
+
+-- | Whether that proof is recent enough to act on: see 'provenFor'.
+v32DataReading :: V32Data -> Bool
+v32DataReading st = vdProven st < provenFor
+
 -- | The symbols the last block decided, for dumping.
 v32DataSyms :: V32Data -> [QamSym]
 v32DataSyms = vdSyms
@@ -784,6 +901,32 @@ v32DataOnes = vdOnes
 -- continuous across a seam the far end knows nothing about.
 vdOverlap :: Int
 vdOverlap = 40
+
+-- | Descrambled ones in a row that prove the receiver is reading the
+-- far end rather than decoding noise.
+--
+-- §5.4.2's B1 is 128 symbol intervals of scrambled ones, which is 640
+-- bits at 12000 and 768 at 14400, so this is met inside B1 and inside
+-- any idle at all, while a quarter of it by chance is 2^-256.
+--
+-- This is the lock signal the decision error cannot be: on sixty-four
+-- or a hundred and twenty-eight points the distance to the nearest
+-- point stops growing once the true error fills a decision cell, so a
+-- receiver reading nothing at all reports 0.01 to 0.02, which is what
+-- a good link reports.  A run of descrambled ones cannot be faked by a
+-- receiver that is not in step with the far end's scrambler.
+inStepOnes :: Int
+inStepOnes = 256
+
+-- | Symbols a proof stays good for, and the value standing for "never".
+--
+-- A second.  Long enough that the far end sending a line of text --
+-- which is not ones -- does not withdraw the proof, short enough that a
+-- receiver which has actually lost the line stops being trusted inside
+-- one.
+provenFor, provenNever :: Int
+provenFor = 2400
+provenNever = maxBound `div` 2
 
 -- | Traceback depth, in symbols.  The same number the offline decoder
 -- uses, and the number of symbols the block decoder must hold back.
@@ -828,7 +971,12 @@ v32DataRx fs dir r st rx = (st', out)
     rx'' = case (vgTruth (vdDiag st) && not (qamRxTruthLive rx'), freshS) of
       (True, _ : _) -> armTruth dir r dec' (fst (last freshS)) (length stream - emitTo) rx'
       _ -> rx'
+    onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (vdOnesRun st) out
+    proven' = if onesRun' >= inStepOnes then 0
+                else min provenNever (vdProven st + length syms)
     st' = st { vdRx = rx'', vdDec = dec', vdSyms = syms
+             , vdOnesRun = onesRun', vdProven = proven'
+             , vdInStep = vdInStep st || onesRun' >= inStepOnes
              , vdOnes = (length (filter id out), length out)
              , vdWait = drop emitTo stream
              , vdPend = lastN vdOverlap (take emitTo stream)

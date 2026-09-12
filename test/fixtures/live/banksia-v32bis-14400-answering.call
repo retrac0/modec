@@ -13,7 +13,11 @@
 # missing the caller's E by a single bit, E being sent once where a rate
 # signal repeats.  Neither showed up calling out.
 #
-# Empty reference and retrains: 0, for the reasons in the other file.
+# The text here is the other half of the same V.42 exchange: the
+# Banksia's originator detection pattern, 0x11 0x91 over and over, then
+# its LAPM frames.  Byte for byte, from a recording nothing at this end
+# produced -- see the other file for what the empty reference this used
+# to carry was really pinning.  Retrains: 0, for the reasons there.
 source:    recordings/third-party/banksia-mymodem144-call.wav
 seconds:   32.0
 role:      answer

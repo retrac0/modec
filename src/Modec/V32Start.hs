@@ -610,7 +610,7 @@ observe st rx = st
     -- a frequency estimate that may already be off loses more than it
     -- saves.  Measured both ways: 12000 stops carrying one direction.
     cfgNow = case (afterFarE (vsPhase st), vsRate st) of
-      (True, Just r) -> v32RxCfg r
+      (True, Just r) -> v32SeamDataCfg r
       (True, Nothing) -> v32StartCfg { qrAdapt = False, qrTrack = False }
       (False, _) | seam (vsPhase st) -> v32SeamCfg
                  | otherwise -> v32StartCfg

@@ -1,4 +1,11 @@
 # 20260910T173744-1001.wav
+#
+# All eight payload lines, byte for byte.  The idle around them moved by
+# nine bytes when the byte gate learned to arm on a run of descrambled
+# ones rather than on half a second having passed: the framer now opens
+# about a block earlier and frames that much more of the far end's
+# pre-payload line.  The payload itself did not change and is what this
+# fixture is for.
 seconds:   16.5
 role:      answer
 modes:     v32bis

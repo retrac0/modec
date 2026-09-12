@@ -68,7 +68,7 @@ data ReplayResult = ReplayResult
   , rrTaps   :: [(Double, String, [(Double, Double)])]
     -- ^ the equaliser's taps at a few moments: the last start-up block,
     -- the first data block, and 12, 50 and 250 blocks into data mode
-  , rrPower  :: [(Double, String, (Double, Double, Double, Double))]
+  , rrPower  :: [(Double, String, (Double, Double, Double, Double, Bool))]
     -- ^ time, the modem's phase, and the V.32 receiver's received power
     -- estimate, on the 'rcEvery' cadence, in the start-up and in data
     -- mode alike

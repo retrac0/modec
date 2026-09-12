@@ -58,7 +58,7 @@ import Modec.Stream
 import Modec.V22
 import Modec.V32 (RateSeq (..), rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
 import Modec.QAM (QamSym, qamRxPower, qamRxTaps, qamRxFreq, qamRxSps, qamRxEvm)
-import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataRxState, v32DataTxState)
+import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataInStep, v32DataReading, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Mnp
@@ -117,6 +117,11 @@ defaultModemConfig fs role modes = ModemConfig
   , mcMaxEvm = 1.0
   , mcV32Diag = defaultV32Diag
   }
+
+-- | How long a V.32 link is left alone before its own receiver may ask
+-- for a retrain.  The far end asking is honoured at once.
+retrainGrace :: Double
+retrainGrace = 3.0
 
 data ModemEvent
   = EvConnected Standard Link
@@ -448,16 +453,17 @@ modemV32Truth st = case msMode st of
 
 -- | The V.32 receiver's estimate of the received power before its gain,
 -- whichever receiver has the line: the start-up's or the data pump's.
-modemV32Power :: ModemState -> Maybe (Double, Double, Double, Double)
+modemV32Power :: ModemState -> Maybe (Double, Double, Double, Double, Bool)
 modemV32Power st = case msMode st of
-  Starting32 s32 _ -> Just (loops (v32StartRx s32))
-  Retrain32 s32 _ -> Just (loops (v32StartRx s32))
-  DataV32 _ _ pump _ _ -> Just (loops (v32DataRxState pump))
+  Starting32 s32 _ -> Just (loops (v32StartRx s32) False)
+  Retrain32 s32 _ -> Just (loops (v32StartRx s32) False)
+  DataV32 _ _ pump _ _ -> Just (loops (v32DataRxState pump) (v32DataInStep pump))
   _ -> Nothing
   where
     -- power, carrier frequency estimate in radians per symbol, samples
-    -- per symbol, and the nearest-point error
-    loops rx = (qamRxPower rx, qamRxFreq rx, qamRxSps rx, qamRxEvm rx)
+    -- per symbol, the nearest-point error, and whether a run of
+    -- descrambled ones has proved the receiver to be in step
+    loops rx inStep = (qamRxPower rx, qamRxFreq rx, qamRxSps rx, qamRxEvm rx, inStep)
 
 -- | The V.32 receiver's equaliser taps, whichever receiver has the line.
 modemV32Taps :: ModemState -> Maybe [(Double, Double)]
@@ -651,7 +657,33 @@ modemStep cfg st0 rxBlock newBytes =
           -- making errors at the top, and a marginal 14400 line then
           -- spends a whole call handing the terminal noise between the
           -- bytes it gets right.
-          trust = decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate
+          -- Whether the receiver is reading the line, asked two ways.
+          --
+          -- The decision error is the distance to the nearest point,
+          -- and on sixty-four or a hundred and twenty-eight of them it
+          -- stops growing once the true error fills a decision cell:
+          -- 0.0159 at 12000 and 0.0081 at 14400.  A receiver reading
+          -- nothing at all reports what a good link reports, and a
+          -- working 14400 link reports 0.008 to 0.020 against a gate
+          -- of 0.0061 -- so this gate alone refuses every 14400 call
+          -- there has ever been and asks for a retrain a second later,
+          -- which is what the bench has been passing --max-evm-v32 to
+          -- work around.
+          --
+          -- What does not saturate is the far end's own idle.  A V.32
+          -- modem with nothing to say sends scrambled ones; a
+          -- descrambled bit is one when the three line bits it is made
+          -- of came through right; and a run of them cannot be had by a
+          -- receiver that is not in step with the far end's scrambler.
+          -- 'Modec.V32Pump.v32DataReading' is that run, seen within the
+          -- last second.
+          --
+          -- Either will do, which is what keeps every rate below the
+          -- dense ones exactly as it was: proof can only add trust, and
+          -- the rates whose decision error still means something go on
+          -- being trusted by it.
+          trust = reading || decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate
+          reading = v32DataReading pump'
           decisionError = sqrt (v32DataEvm pump')
           -- Arm on a *run* of descrambled ones -- the idle both ends send
           -- between characters -- and not on a count of them, since noise
@@ -684,7 +716,14 @@ modemStep cfg st0 rxBlock newBytes =
           -- signal and tracking it: hard to catch, easy to keep.  The
           -- half second is for the line that never gets that good, where
           -- passing bits with errors in them still beats passing none.
-          acquired = decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate / 4 || msSettled st > 0.5
+          -- ...and the same for arming the framer, where the proof is
+          -- better than the timer it used to fall back on: a run of
+          -- descrambled ones is the very thing the framer is waiting
+          -- for, measured over the whole stream rather than the eight
+          -- bits it can see.
+          acquired = reading
+                     || decisionError < mcMaxEvmV32 cfg * rateDecisionMargin rate / 4
+                     || msSettled st > 0.5
           onesRun' = foldl (\acc b -> if b then acc + 1 else 0) (msZeros st) gotBits
           (framer', line, armed') = armFramer (msMnp st) armed trust acquired onesRun' gotBits framer
           listen' = fmap (v32ListenBlock rxBlock) (msListen st)
@@ -709,6 +748,14 @@ modemStep cfg st0 rxBlock newBytes =
             -- its turn because the retrain suspends it.
             | not present = Nothing
             | maybe False (v32ListenRetrain (role)) listen' = Just RetrainFarEnd
+            -- Not in the first seconds of a link.  The evidence that
+            -- the receiver is reading is the far end's idle, and the
+            -- far end owes us none: a modem that connects and is sent
+            -- payload immediately has nothing to prove itself with
+            -- until the first gap.  A second of an unproven receiver
+            -- was enough to retrain every 14400 call before it had
+            -- read a byte, and the retrain lands in the same place.
+            | msSettled st < retrainGrace = Nothing
             | bad' >= round (1.0 / blockSecs) = Just RetrainLocal
             | otherwise = Nothing
           blockSecs = fromIntegral (max 1 n) / fs

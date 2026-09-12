@@ -548,9 +548,10 @@ runReplay ro = do
   forM_ (rrTaps r) $ \(t, ph, ts) ->
     hPrintf stderr "  %6.2f  taps %s |w|,deg: %s\n" t ph
       (unwords [ printf "%.2f/%.0f" (sqrt (a * a + b * b) :: Double) (atan2 b a * 180 / pi :: Double) | (a, b) <- ts ])
-  forM_ (rrPower r) $ \(t, ph, (pw, fr, sps, evm)) ->
-    hPrintf stderr "  %6.2f  loops power %6.1f dB  freq %6.2f Hz  sps %8.5f  evm %.4f  %s\n" t
-      (10 * logBase 10 (max 1e-12 pw) :: Double) (fr * 2400 / (2 * pi) :: Double) sps evm ph
+  forM_ (rrPower r) $ \(t, ph, (pw, fr, sps, evm, inStep)) ->
+    hPrintf stderr "  %6.2f  loops power %6.1f dB  freq %6.2f Hz  sps %8.5f  evm %.4f  %s  %s\n" t
+      (10 * logBase 10 (max 1e-12 pw) :: Double) (fr * 2400 / (2 * pi) :: Double) sps evm
+      (if inStep then "in step" else "       ") ph
   forM_ (rrEvents r) $ \(t, e) -> hPrintf stderr "  %6.2f  %s\n" t (describeEvent e)
   hPrintf stderr "%d bytes\n" (length (rrBytes r))
   case roDumpSyms ro of

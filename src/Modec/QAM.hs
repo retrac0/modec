@@ -171,6 +171,35 @@ data QamRxCfg = QamRxCfg
     -- V.22 keeps.  Both were the unexamined consequence of where each
     -- fork happened to write its reset, and each is what its own
     -- measurements were taken against.
+  , qrGateAtOnce :: !Bool
+    -- ^ apply 'qrLoopGate' from the first symbol, rather than only once
+    -- the receiver has read the line ('qrLockAt').
+    --
+    -- The gate's usual rule -- learn from everything until converged,
+    -- then reject what cannot be of this constellation -- is right for a
+    -- receiver starting cold and exactly wrong for one handed a trained
+    -- carrier and equaliser.  At the seam the far end changes to a
+    -- constellation of sixty-four or a hundred and twenty-eight points
+    -- while this receiver is deliberately marked unlocked
+    -- ('qamRxUnlock'), so the gate stands down, every symbol steers, and
+    -- the loop follows the difference between what arrived and a point
+    -- it has no reason to be near.  Measured: that is the whole of the
+    -- 12000 and 14400 receive fault -- see docs/reference-modem.md.
+  , qrPhaseCross :: !Bool
+    -- ^ take the phase error as the cross product with the reference
+    -- rather than as the angle to it: weighted by the decision's radius.
+    --
+    -- 'atan2' asks the same of every point, and on a constellation with
+    -- nine amplitudes that is not the same question.  An inner point of
+    -- the 128 set sits at a radius of 0.16, where the 0.07 of noise a
+    -- readable line carries is twenty-four degrees; an outer one at 1.7
+    -- reads the same noise as two degrees.  Weighting each by its radius
+    -- -- which is what the cross product does, since it is @|u||a| sin@
+    -- -- is the maximum-likelihood estimate for additive noise, and it
+    -- costs the four-point start-up nothing, every state there being at
+    -- one amplitude.  What it does cost is pull-in: @sin@ turns over at
+    -- ninety degrees where 'atan2' holds its sign to a hundred and
+    -- eighty, so this is for a loop that is tracking, not acquiring.
   , qrTrainTruth :: !Bool
     -- ^ while the truth queue ('qamRxTruth') is live, train the loops on
     -- it as 'qamRxRef' would, and adapt the equaliser regardless of
@@ -221,7 +250,7 @@ defaultRxCfg slice point = QamRxCfg
   , qrSteerAt = 2, qrAdaptAt = 3, qrAdaptRun = maxBound
   , qrFreqFf = 0, qrFreqFfRun = maxBound
   , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True
-  , qrTrainTruth = False }
+  , qrGateAtOnce = False, qrPhaseCross = False, qrTrainTruth = False }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -710,7 +739,8 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                 (q : qs, _)                    -> (fst q, snd q, qs)
                 ([], Just (tx, ty)) | aided    -> (tx, ty, [])
                 _                              -> (px, py, [])
-              phErr = atan2 (ui * ax - ur * ay) (ur * ax + ui * ay)
+              phErr | qrPhaseCross cfg = (ui * ax - ur * ay) / qrPower cfg
+                    | otherwise = atan2 (ui * ax - ur * ay) (ur * ax + ui * ay)
               errR = ax - ur; errI = ay - ui
               -- The decision error stays the decision's, so everything
               -- that reads it -- the lock, the gates, the byte gate and
@@ -753,7 +783,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- those would never converge at all.  So the lock has to
               -- mean converged -- 'qrLockAt', not 'qrEvmFreeze' -- and
               -- not merely "still adapting".
-              good = not (rxLocked st) || err2 < qrLoopGate cfg
+              good = (not (rxLocked st) && not (qrGateAtOnce cfg)) || err2 < qrLoopGate cfg
               -- Guarded on the weight rather than multiplied by it, so
               -- a receiver with none is bit for bit what it was.
               freqFf | qrFreqFf cfg > 0 && locked && stepRun < qrFreqFfRun cfg

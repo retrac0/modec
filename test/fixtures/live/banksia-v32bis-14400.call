@@ -8,12 +8,25 @@
 # recording can pass by agreeing with a mistake we make twice, and this
 # one cannot.
 #
-# There is no text.  The two modems trained, connected and idled, so the
-# reference is empty and stays empty -- which is an assertion in its own
-# right at 14400, where a receiver that has lost the line hands the
-# terminal a page of noise rather than nothing.
+# The text is the far end's V.42.  132 repetitions of "EC" -- the answer
+# detection pattern a V.42 modem sends before it proposes LAPM -- then
+# HDLC frames, flag-delimited, byte for byte for the length of the
+# recording.  modec speaks MNP and not V.42, so it hands all of it to
+# the terminal, which is the right thing to do with bytes it has no
+# protocol for.
 #
-# What this fixture is really for is the retrain count.  Before the
+# That is a stronger assertion than the empty reference this fixture
+# used to carry, and the empty reference was wrong: the receiver was
+# reading the line at a decision error of 0.0015 the whole time, and
+# what withheld the bytes was the byte gate's arming rule, which asked
+# for half a second of data mode to have passed before it would believe
+# a run of descrambled ones.  The one run this far end ever sent
+# arrived a tenth of a second early and was refused, and the framer
+# then had nothing to arm on for the rest of the call.  A pattern this
+# regular, decoded without a single error, is what a working 14400
+# receiver looks like; nothing else produces it.
+#
+# The retrain count matters as much.  Before the
 # timing loop was given a tracking gain of its own, this same recording
 # connected at 14400 -- the negotiation was never the problem -- and
 # then asked for a retrain four seconds later, and again ten seconds
