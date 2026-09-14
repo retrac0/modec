@@ -79,7 +79,9 @@ data Session = Session
   , seLost      :: IO Bool
     -- ^ the capture stream stopped.  'True' to carry on with a restored
     -- stream, 'False' to end the session.
-  , seStartCall :: Role -> Line              -- ^ a fresh call in this role
+  , seStartCall :: Role -> IO Line
+    -- ^ a fresh call in this role.  In IO because a Hayes session builds
+    -- it from whatever the DTE has set with AT commands by then.
   , seParams    :: ProgressParams
   , seLine      :: IORef Line
   , seBanner    :: IORef B.ByteString
@@ -160,8 +162,8 @@ runLoop se co = loop
               -- call starts on the block the last of it goes out.
               let (now, rest) = VS.splitAt blockN sig
               seWrite se (now VS.++ VS.replicate (blockN - VS.length now) 0)
-              writeIORef (seLine se)
-                (if VS.null rest then seStartCall se Originate else LineDialing rest)
+              line' <- if VS.null rest then seStartCall se Originate else return (LineDialing rest)
+              writeIORef (seLine se) line'
             LineCall st c watch -> do
               -- A real-time loop is judged by its worst block.  Anything
               -- over twelve of the twenty milliseconds is reported,

@@ -64,6 +64,9 @@ module Modec.Dtmf
   ( -- * Generating
     dtmfPair
   , dtmfDialSignal
+  , DialParams (..)
+  , defaultDialParams
+  , dtmfDialSignalWith
     -- * The keypad
   , dtmfLowTones
   , dtmfHighTones
@@ -99,15 +102,32 @@ dtmfPair c = case c of
 -- | Audio for a dial string: 80 ms tone and 80 ms silence per digit at
 -- amplitude @amp@ per tone, one second per ',', other characters ignored.
 dtmfDialSignal :: Double -> Double -> String -> Signal
-dtmfDialSignal fs amp = VS.concat . concatMap one
+dtmfDialSignal = dtmfDialSignalWith defaultDialParams
+
+-- | The timings a Hayes modem keeps in S-registers: how long to wait off
+-- hook before dialling (S6), how long each digit sounds (S11, which is
+-- also the gap after it), and how long a comma pauses (S8).
+data DialParams = DialParams
+  { dpBlindWait :: !Double   -- ^ seconds of silence before the first digit
+  , dpToneMs    :: !Int      -- ^ milliseconds of tone per digit, and of silence after it
+  , dpPauseSec  :: !Double   -- ^ seconds per ','
+  } deriving (Eq, Show)
+
+-- | What 'dtmfDialSignal' has always produced: no wait, 80 ms, 1 s.
+defaultDialParams :: DialParams
+defaultDialParams = DialParams 0 80 1
+
+dtmfDialSignalWith :: DialParams -> Double -> Double -> String -> Signal
+dtmfDialSignalWith dp fs amp str =
+  VS.concat (VS.replicate (round (fs * max 0 (dpBlindWait dp))) 0 : concatMap one str)
   where
-    onN = round (fs * 0.08) :: Int
+    onN = round (fs * fromIntegral (max 1 (dpToneMs dp)) / 1000) :: Int
     one c = case dtmfPair c of
       Just (lo, hi) ->
         [ VS.generate onN (\i -> let t = fromIntegral i / fs in amp * (sin (2 * pi * lo * t) + sin (2 * pi * hi * t)))
         , VS.replicate onN 0 ]
       Nothing
-        | c == ',' -> [VS.replicate (round fs) 0]
+        | c == ',' -> [VS.replicate (round (fs * max 0 (dpPauseSec dp))) 0]
         | otherwise -> []
 
 -- | The low group, in row order.

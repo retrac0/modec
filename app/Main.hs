@@ -267,7 +267,8 @@ cmdP = hsubparser
       <*> flag True False (long "no-echo-data"
              <> help "V.32: do not search for or cancel our own echo once the far end is talking. What the canceller did before it could, and the thing to compare against")
       <*> switch (long "aid-b1"
-             <> help "V.32: train the receiver on the far end's B1, whose 128 symbols are predictable from the scrambler, instead of reading them decision-directed. It predicts them exactly and is refused unless it can corroborate that against the B1 already received -- but it does not reliably lower the error rate, so it is off; see docs/reference-modem.md"))
+             <> help "V.32: train the receiver on the far end's B1, whose 128 symbols are predictable from the scrambler, instead of reading them decision-directed. It predicts them exactly and is refused unless it can corroborate that against the B1 already received -- but it does not reliably lower the error rate, so it is off; see docs/reference-modem.md")
+      <*> phonebookP)
     -- A modem hangs up when the network answers a call with a busy
     -- tone, congestion or the special information tone that precedes a
     -- recorded announcement, and says BUSY.  This is how to sit and
@@ -304,8 +305,7 @@ cmdP = hsubparser
                                <> help "domain to dial into (default: the one in ~/.baresip/accounts)"))
       <*> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> showDefault
                      <> help "PipeWire loopback pair shared with the softphone")
-      <*> optional (option auto (long "listen" <> metavar "PORT"
-                                 <> help "put the modem on a telnet port instead of this terminal"))
+      <*> dteP
       <*> flag True False (long "no-launch" <> help "expect baresip to be running already")
       <*> switch (long "stay" <> help "keep the AT prompt when the call ends, instead of exiting")
       <*> modemP')
@@ -316,8 +316,7 @@ cmdP = hsubparser
                                <> help "domain we answer for (default: the one in ~/.baresip/accounts)"))
       <*> strOption (long "audio-sip-loop" <> metavar "PREFIX" <> value "modec" <> showDefault
                      <> help "PipeWire loopback pair shared with the softphone")
-      <*> optional (option auto (long "listen" <> metavar "PORT"
-                                 <> help "put the modem on a telnet port instead of this terminal"))
+      <*> dteP
       <*> flag True False (long "no-launch" <> help "expect baresip to be running already")
       <*> modemP')
     -- The modem's own settings, shared with `modec modem`: how to
@@ -337,10 +336,11 @@ cmdP = hsubparser
                   <> help "do not place a call: hold a V.32 carrier and measure the echo path")
       <*> optional (option (maybeReader v32RateReader) (long "v32-rate" <> metavar "BPS"
             <> help "hold V.32 to one rate: 4800, 7200, 9600, 9600t, 12000 or 14400"))
-    mkDialModem modes v8 v8all mnp evm amp rdir ignoreBusy probe v32rate = defaultModemOpts
+      <*> phonebookP
+    mkDialModem modes v8 v8all mnp evm amp rdir ignoreBusy probe v32rate book = defaultModemOpts
       { moModes = modes, moV8 = v8, moV8All = v8all
       , moMnp = mnp, moMaxEvm = evm, moAmp = amp, moRecordDir = rdir
-      , moIgnoreBusy = ignoreBusy, moProbe = probe, moV32Rates = v32rate }
+      , moIgnoreBusy = ignoreBusy, moProbe = probe, moV32Rates = v32rate, moPhonebook = book }
     modesP =
           option (maybeReader modesReader)
             (long "mode" <> metavar "LIST"
@@ -390,6 +390,24 @@ cmdP = hsubparser
           DataListen <$> option auto (long "listen" <> metavar "PORT" <> help "telnet server")
       <|> (DataConnect <$> strOption (long "connect" <> metavar "HOST") <*> option auto (long "port" <> metavar "PORT" <> value 23))
       <|> flag' DataStdio (long "data-stdio" <> help "raw bytes on stdin/stdout")
+      <|> ptyP
+    -- A pseudo-terminal: what a terminal program opens as a serial port.
+    -- Either flag, or both in either order.  Written as a list because
+    -- optparse-applicative commits to the first alternative an option
+    -- appears in, and both would contain --pty-link.
+    ptyP = (\xs -> DataPty (last (Nothing : [ Just l | Right l <- xs ])))
+      <$> some (Left <$> flag' () (long "data-pty" <> help "a pseudo-terminal a terminal program (minicom, picocom, SyncTERM, DOSBox-X) opens as a modem's serial port; its /dev/pts path is printed on stdout. Use with --hayes. Closing the port drops DTR")
+                <|> Right <$> ptyLinkP)
+    ptyLinkP = strOption (long "pty-link" <> metavar "PATH"
+                          <> help "also make PATH a symlink to the pseudo-terminal, so the terminal program's port setting does not change from run to run (implies --data-pty)")
+    phonebookP = optional (strOption (long "phonebook" <> metavar "FILE"
+      <> help "numbers a terminal program dials and what to dial instead, one pair a line: `5551234 sip:bbs@example.org`. For programs whose dialling directory takes digits only"))
+    -- where `dial` and `answer` put the modem: the terminal they run in, unless told otherwise
+    dteP =
+          (Just . DataListen <$> option auto (long "listen" <> metavar "PORT"
+                                 <> help "put the modem on a telnet port instead of this terminal"))
+      <|> (Just <$> ptyP)
+      <|> pure Nothing
 
 specFor :: Tones -> Band -> FskSpec
 specFor TBell103 BandLow = bell103Originate

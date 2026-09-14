@@ -46,7 +46,7 @@ data DialOpts = DialOpts
   , dCtrl   :: String            -- ^ baresip ctrl_tcp address, host:port
   , dDomain :: Maybe String      -- ^ SIP domain; taken from the account when absent
   , dLoop   :: String            -- ^ PipeWire loopback prefix
-  , dListen :: Maybe Int         -- ^ put the DTE on this telnet port instead of the terminal
+  , dData   :: Maybe DataIO      -- ^ put the DTE on a telnet port or a pty instead of the terminal
   , dLaunch :: Bool              -- ^ start baresip if the control port does not answer
   , dStay   :: Bool              -- ^ keep the AT prompt after the call instead of exiting
   , dModem  :: ModemOpts         -- ^ the modem's own settings, from the shared options
@@ -59,7 +59,7 @@ data AnswerOpts = AnswerOpts
   { aCtrl   :: String            -- ^ baresip ctrl_tcp address, host:port
   , aDomain :: Maybe String      -- ^ SIP domain; taken from the account when absent
   , aLoop   :: String            -- ^ PipeWire loopback prefix
-  , aListen :: Maybe Int         -- ^ put the DTE on this telnet port instead of the terminal
+  , aData   :: Maybe DataIO      -- ^ put the DTE on a telnet port or a pty instead of the terminal
   , aLaunch :: Bool              -- ^ start baresip if the control port does not answer
   , aModem  :: ModemOpts         -- ^ the modem's own settings, from the shared options
   }
@@ -88,14 +88,16 @@ runDial o = do
           , moSip = Just (dCtrl o)
           , moSipDomain = domain
           , moAudio = AudioSipLoop (dLoop o)
-          , moData = maybe DataStdio DataListen (dListen o)
-          , moAutoType = Just ("DT" ++ dNumber o)
+          , moData = maybe DataStdio id (dData o)
+          -- D and not DT: tone is all this modem dials, and a T in front
+          -- of a SIP address would be one more letter to guess about
+          , moAutoType = Just ("D" ++ dNumber o)
           , moHangupExits = not (dStay o)
           }
-    case dListen o of
-      Just p -> say ("the modem is on telnet port " ++ show p ++ "; dialling " ++ dNumber o)
+    case dData o of
+      Just d -> say ("the modem is on " ++ dteName d ++ "; dialling " ++ dNumber o)
       Nothing -> say ("dialling " ++ dNumber o ++ " -- +++ATH hangs up, ctrl-C leaves")
-    (if dListen o == Nothing then withRawTty else id) (runModem mo)
+    (if isNothingData (dData o) then withRawTty else id) (runModem mo)
 
 -- | Register, then sit on the line until somebody calls.
 runAnswer :: AnswerOpts -> IO ()
@@ -107,7 +109,7 @@ runAnswer o = do
           , moSip = Just (aCtrl o)
           , moSipDomain = domain
           , moAudio = AudioSipLoop (aLoop o)
-          , moData = maybe DataStdio DataListen (aListen o)
+          , moData = maybe DataStdio id (aData o)
           -- S0 rather than a flag of our own: the register already means
           -- "answer without being asked", and going through it makes it
           -- work for anyone who sets it by hand as well
@@ -115,10 +117,21 @@ runAnswer o = do
           , moBanner = True
           , moHangupExits = False
           }
-    case aListen o of
-      Just p -> say ("the modem is on telnet port " ++ show p ++ "; waiting for a call")
+    case aData o of
+      Just d -> say ("the modem is on " ++ dteName d ++ "; waiting for a call")
       Nothing -> say "waiting for a call -- ATH hangs up, ctrl-C leaves"
-    (if aListen o == Nothing then withRawTty else id) (runModem mo)
+    (if isNothingData (aData o) then withRawTty else id) (runModem mo)
+
+-- | Where the modem's DTE went, for the opening message.
+dteName :: DataIO -> String
+dteName d = case d of
+  DataListen p -> "telnet port " ++ show p
+  DataConnect h p -> h ++ ":" ++ show p
+  DataStdio -> "this terminal"
+  DataPty link -> "a pseudo-terminal" ++ maybe "" (" at " ++) link
+
+isNothingData :: Maybe DataIO -> Bool
+isNothingData = maybe True (const False)
 
 -- | Run the body with baresip up, starting one if the control port does
 -- not already answer.  A baresip we started is stopped again; one that

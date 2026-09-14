@@ -68,7 +68,7 @@ scripted blocks = do
         , seSay = \m -> modifyIORef' lg (++ [m])
         , seObserve = \_ _ _ -> return ()
         , seLost = return False
-        , seStartCall = startCall
+        , seStartCall = return . startCall
         , seParams = defaultProgressParams
         , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ -> return ()
         }
@@ -212,7 +212,7 @@ callThroughLoop = do
         , seSay = \m -> modifyIORef' lg (++ [m])
         , seObserve = \_ _ _ -> return ()
         , seLost = return False
-        , seStartCall = startCall
+        , seStartCall = return . startCall
         , seParams = defaultProgressParams
         , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ -> return ()
         }

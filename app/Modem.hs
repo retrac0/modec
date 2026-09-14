@@ -6,6 +6,7 @@
 module Modem
   ( AudioIO (..)
   , DataIO (..)
+  , DteIO (..)
   , ModemOpts (..)
   , defaultModemOpts
   , runModem
@@ -58,6 +59,8 @@ import Modec.Telnet
 import Modec.Sample
 import Modec.Session
 import Serial (withSerial)
+import Pty (PtyPort (..), withPty)
+import Data.Char (toUpper)
 import Modec.Wav (closeWav, openWav16Mono, wavAppend)
 
 data AudioIO
@@ -95,6 +98,15 @@ data DataIO
   = DataListen Int                   -- ^ telnet server on this port, one connection
   | DataConnect String Int           -- ^ telnet client
   | DataStdio                        -- ^ raw bytes on stdin/stdout (no telnet)
+  | DataPty (Maybe FilePath)         -- ^ a pseudo-terminal for a terminal program, optionally linked to a name
+
+-- | The DTE as the main loop sees it.
+data DteIO = DteIO
+  { dteRecv    :: IO B.ByteString          -- ^ pending bytes, without waiting
+  , dteSend    :: B.ByteString -> IO ()
+  , dteDtr     :: IO Bool                  -- ^ the DTE is there
+  , dteDropped :: IO Bool                  -- ^ it went away since last asked (once per drop)
+  }
 
 data ModemOpts = ModemOpts
   { moRate     :: Int
@@ -138,6 +150,7 @@ data ModemOpts = ModemOpts
   , moEchoDataMu :: Double         -- ^ the canceller's step with the far end talking
   , moEchoData :: Bool             -- ^ search for and cancel the echo in data mode at all
   , moAidB1 :: Bool                -- ^ train the V.32 receiver on B1's known symbols
+  , moPhonebook :: Maybe FilePath   -- ^ numbers a terminal dials, and what to dial instead
   }
 
 -- | The settings a call is placed with when nothing says otherwise.
@@ -153,7 +166,18 @@ defaultModemOpts = ModemOpts
   , moRecordRx = Nothing, moRecordTx = Nothing, moRecordDir = Just "recordings"
   , moAutoType = Nothing, moBanner = False, moHangupExits = False, moIgnoreBusy = False, moAnsPlain = False, moLineEvery = 250, moMaxEvmV32 = 0.5
   , moLineSnr = [], moLineDir = (True, True), moLineSeed = 1
-  , moImpair = [], moChannel = Nothing, moEchoDataMu = 0.001, moEchoData = True, moAidB1 = False }
+  , moImpair = [], moChannel = Nothing, moEchoDataMu = 0.001, moEchoData = True, moAidB1 = False
+  , moPhonebook = Nothing }
+
+-- | The Hayes profile a session starts with, and that AT&F goes back to:
+-- the command line's settings.
+profileFromOpts :: ModemOpts -> HayesProfile
+profileFromOpts o = defaultProfile
+  { hpModes = moModes o
+  , hpV32 = maybe V32ByModes V32Pin (moV32Rates o)
+  , hpMnp = moMnp o
+  , hpX = if moIgnoreBusy o then 1 else 4
+  , hpVersion = showVersion version }
 
 logMsg :: String -> IO ()
 logMsg s = hPutStrLn stderr ("modec: " ++ s)
@@ -193,6 +217,10 @@ runModem o = do
   _ <- installHandler sigTERM (Catch (throwTo mainTid ExitSuccess)) Nothing
   hSetBinaryMode stdin True
   hSetBinaryMode stdout True
+  -- Line-buffered, so that a log line written from a reader thread goes
+  -- out whole instead of interleaved a character at a time with the main
+  -- loop's: unbuffered, each character was its own write.
+  hSetBuffering stderr LineBuffering
   let fs = fromIntegral (moRate o)
       blockN = moRate o * moBlockMs o `div` 1000
       -- One builder, used by both the plain path and the SIP one.  They
@@ -200,23 +228,41 @@ runModem o = do
       -- SIP path -- which is every real call -- silently dropped
       -- --max-evm, and then --probe, because each was added to whichever
       -- one the author happened to be looking at.
-      configFor role =
-        let c0 = defaultModemConfig fs role (moModes o)
-        in c0 { mcNoHandshake = moNoHandshake o, mcProbe = moProbe o, mcAnsReversals = not (moAnsPlain o), mcMaxEvmV32 = moMaxEvmV32 o, mcAidB1 = moAidB1 o
-              , mcEcho = (mcEcho c0) { ecDataMu = moEchoDataMu o
-                                     , ecFarSearch = if moEchoData o then ecFarSearch (mcEcho c0) else 0 }
-              , mcTxAmp = moAmp o, mcMaxEvm = moMaxEvm o
-              , mcV32Rates = v32Offered o, mcMnp = mnpCfg
+      configFor = configOf o
+      configOf oo role =
+        let c0 = defaultModemConfig fs role (moModes oo)
+        in c0 { mcNoHandshake = moNoHandshake oo, mcProbe = moProbe oo, mcAnsReversals = not (moAnsPlain oo), mcMaxEvmV32 = moMaxEvmV32 oo, mcAidB1 = moAidB1 oo
+              , mcEcho = (mcEcho c0) { ecDataMu = moEchoDataMu oo
+                                     , ecFarSearch = if moEchoData oo then ecFarSearch (mcEcho c0) else 0 }
+              , mcTxAmp = moAmp oo, mcMaxEvm = moMaxEvm oo
+              , mcV32Rates = v32Offered oo, mcMnp = mnpCfg oo
               , mcHandshake = (mcHandshake c0)
-                  { hcV8 = moV8 o || moV8All o
-                  , hcV8OfferAll = moV8All o } }
+                  { hcV8 = moV8 oo || moV8All oo
+                  , hcV8OfferAll = moV8All oo } }
       -- The rate and whether the link can go synchronous belong to the
       -- link rather than to the command line, so those two are left for
       -- Modec.Modem to fill in once the call is established.
-      mnpCfg = fmap (\cls -> (defaultMnpConfig 1200 True)
-                       { mnClass = cls, mnTrt = moMnpTrt o
-                       , mnLrTries = max 1 (moMnpProbes o), mnT401Lr = moMnpProbeGap o })
-                    (moMnp o)
+      mnpCfg oo = fmap (\cls -> (defaultMnpConfig 1200 True)
+                       { mnClass = cls, mnTrt = moMnpTrt oo
+                       , mnLrTries = max 1 (moMnpProbes oo), mnT401Lr = moMnpProbeGap oo })
+                    (moMnp oo)
+      -- A Hayes session's call is the command line's, with whatever the
+      -- DTE has changed since: the modes and rates (+MS, B, N), error
+      -- control (\N), how long to wait for carrier (S7) and how much of
+      -- it to lose before hanging up (S10).
+      configHayes p role =
+        let modes = hayesModes p
+            oo = o { moModes = modes, moMnp = hpMnp p
+                   , moV32Rates = case hpV32 p of { V32Pin r -> Just r; _ -> Nothing } }
+            c = configOf oo role
+            s7 = hayesReg p 7
+            s10 = hayesReg p 10
+        in c { mcV32Rates = case hpV32 p of
+                 V32Range lo hi -> Just (V32.ratesBetween lo hi (if V32bis `elem` modes then V32.v32bisRates else V32.v32Rates))
+                 _ -> mcV32Rates c
+             , mcHandshake = (mcHandshake c)
+                 { hcTimeout = fromIntegral (max 1 s7)
+                 , hcDrop = if s10 >= 255 then 1e9 else max 0.1 (fromIntegral s10 / 10) } }
   when (moNoHandshake o && length (moModes o) /= 1) $ do
     logMsg "--no-handshake needs exactly one mode, e.g. --mode v22"
     exitFailure
@@ -229,7 +275,9 @@ runModem o = do
     Nothing -> return Nothing
     Just addr -> Just <$> sipConnect addr
   withAudio (moAudio o) (audioFormat o) (moRate o) (moRole o) $ \ai ->
-    withData (moData o) $ \recvBytes sendBytes -> do
+    withData (moData o) $ \dte -> do
+      let recvBytes = dteRecv dte
+          sendBytes = dteSend dte
       trace <- (/= Nothing) <$> lookupEnv "MODEC_TRACE"
       blockRef <- newIORef (0 :: Int)
       -- Output leads input.  One block was enough for two modems joined
@@ -385,7 +433,7 @@ runModem o = do
           cfgFor = configFor
           -- A call we placed watches the line for what the network
           -- plays back at it; a call we answered does not.
-          startCall role = LineCall (modemInit (cfgFor role)) (cfgFor role)
+          plainCall role = LineCall (modemInit (cfgFor role)) (cfgFor role)
             (if role == Originate then Just (progressRxInit fs defaultProgressParams) else Nothing)
           -- The block index is handed in rather than read, which is what
           -- keeps a trace from being able to move the clock it is
@@ -468,7 +516,14 @@ runModem o = do
       -- session disagree about is a Controller, and the line state is
       -- the same in both: a plain call is a session that starts in
       -- LineCall and never leaves it.
-      lineRef <- newIORef (startCall (moRole o))
+      let hayesMode = moHayes o || sip /= Nothing
+      hayesRef <- newIORef (hayesInit (profileFromOpts o))
+      let hayesCall role = do
+            hs <- readIORef hayesRef
+            let c = configHayes (hayesProfile hs) role
+            return (LineCall (modemInit c) c
+                      (if role == Originate then Just (progressRxInit fs defaultProgressParams) else Nothing))
+      lineRef <- newIORef (plainCall (moRole o))
       let session = Session
             { seFs = fs, seBlockN = blockN
             , seRead = readBlock, seWrite = writeBlock
@@ -476,12 +531,12 @@ runModem o = do
             , seSay = say
             , seObserve = \k st st' -> traceStep k st st' >> telemetry k st'
             , seLost = audioLost
-            , seStartCall = startCall
+            , seStartCall = if hayesMode then hayesCall else return . plainCall
             , seParams = defaultProgressParams
             , seLine = lineRef, seBanner = bannerRef, seBlock = blockRef
             , seSlow = \secs at -> logMsg ("slow block: " ++ show (round (secs * 1000) :: Int) ++ " ms at " ++ show (fromIntegral (round (at * 10) :: Int) / 10 :: Double) ++ " s")
             }
-      if not (moHayes o) && sip == Nothing
+      if not hayesMode
         then do
           -- plain mode: one call in the configured role, then exit
           doneRef <- newIORef False
@@ -502,7 +557,7 @@ runModem o = do
         else do
           -- Hayes mode: an AT command interpreter controls calls on the line
           writeIORef lineRef LineIdle
-          hayesRef <- newIORef hayesInit
+          let startCall = hayesCall
           -- A command the invocation implies is typed in for the user once
           -- the line has had a moment to settle -- DT<number> for `dial`,
           -- S0=1 for `answer`.  From there on it is an ordinary Hayes
@@ -514,6 +569,15 @@ runModem o = do
           doneRef <- newIORef False
           energyRef <- newIORef (0 :: Int)
           sipLineRef <- newIORef (sipLineInit (moSipDomain o))
+          -- actions the interpreter took on an event (answering on the
+          -- S0th ring), carried out with the next block's own
+          pendingActsRef <- newIORef ([] :: [HayesAction])
+          phonebook <- case moPhonebook o of
+            Nothing -> return []
+            Just f -> do
+              book <- parsePhonebook <$> readFile f
+              logMsg ("phone book " ++ f ++ ": " ++ show (length book) ++ " entries")
+              return book
           logMsg (case sip of
                     Nothing -> "Hayes command mode (ATD to dial, ATA to answer, ATH to hang up)"
                     Just _ -> "Hayes command mode over SIP (baresip at " ++ maybe "" id (moSip o) ++ ")")
@@ -541,9 +605,12 @@ runModem o = do
                          modifyIORef' injectRef (<> BC.pack "ATH\r")
               modemEvent ev = do
                 hs <- readIORef hayesRef
-                let (hs', out) = hayesEvent hs ev
+                let (hs', out, acts) = hayesEvent hs ev
                 writeIORef hayesRef hs'
                 unless (B.null out) $ sendBytes out
+                unless (null acts) $ do
+                  when (EvRing == ev) $ logMsg ("answering on ring " ++ show (hayesReg (hayesProfile hs) 0))
+                  modifyIORef' pendingActsRef (++ acts)
 
               turn t = do
                 typed <- recvBytes
@@ -554,12 +621,28 @@ runModem o = do
                     writeIORef autoTypeRef Nothing
                     return (injected <> BC.pack ("AT" ++ cmd ++ "\r") <> typed)
                   _ -> return (injected <> typed)
-                hs0 <- readIORef hayesRef
-                let (hs1, back, fwd, acts) = hayesInput t hs0 pending
+                -- DTR: a terminal that closes the port is dealt with as
+                -- &D says, before anything it typed on the way out
+                dtr <- dteDtr dte
+                dropped <- dteDropped dte
+                hsD <- hayesDtr dtr <$> readIORef hayesRef
+                (hs0, dropActs) <- if not dropped then return (hsD, []) else do
+                  let (h, out, as) = hayesDtrDrop hsD
+                  logMsg ("DTR dropped, &D" ++ show (hpDtr (hayesProfile hsD)))
+                  unless (B.null out) $ sendBytes out
+                  return (h, as)
+                evActs <- atomicModifyIORef' pendingActsRef (\a -> ([], a))
+                let (hs1, back, fwd, typedActs) = hayesInput t hs0 pending
                     (hs2, tickOut) = hayesTick t hs1
                 writeIORef hayesRef hs2
                 unless (B.null back) $ sendBytes back
                 unless (B.null tickOut) $ sendBytes tickOut
+                -- a number the phone book knows is dialled as its entry
+                acts <- forM (dropActs ++ evActs ++ typedActs) $ \a -> case a of
+                  ActDial d | Just target <- phonebookLookup phonebook d -> do
+                    say ("phone book: " ++ d ++ " is " ++ target)
+                    return (ActDial target)
+                  _ -> return a
                 -- Every call gets its own recording, whether it was
                 -- dialled here or answered from the line, and whether
                 -- it goes out over SIP or over the audio device.
@@ -576,11 +659,7 @@ runModem o = do
                   Just cl -> do
                     evs <- sipDrain cl
                     sl0 <- readIORef sipLineRef
-                    -- S0 lives in the Hayes state, which the line
-                    -- controller cannot see; push it in each block so
-                    -- an incoming call can answer itself
-                    let sl0' = sipLineSetAuto (hayesAutoAnswer hs2) sl0
-                        (sl1, as1) = foldl (\(sl, acc) a -> let (sl', xs) = sipLineHayes sl a in (sl', acc ++ xs)) (sl0', []) acts
+                    let (sl1, as1) = foldl (\(sl, acc) a -> let (sl', xs) = sipLineHayes sl a in (sl', acc ++ xs)) (sl0, []) acts
                         (sl2, as2) = foldl (\(sl, acc) e -> let (sl', xs) = sipLineEvent t sl e in (sl', acc ++ xs)) (sl1, []) evs
                         (sl3, as3) = sipLineTick t sl2
                     writeIORef sipLineRef sl3
@@ -603,7 +682,7 @@ runModem o = do
                       stray <- pruneCompetingInputs ln
                       forM_ stray $ \l ->
                         logMsg ("removed stray audio link into " ++ plDst l ++ " from " ++ plSrc l)
-                    writeIORef lineRef (startCall role)
+                    startCall role >>= writeIORef lineRef
                   SipStopModem -> do
                     writeIORef lineRef LineIdle
                     endCall
@@ -625,12 +704,26 @@ runModem o = do
                 forM_ (if sip == Nothing then acts else []) $ \a -> do
                   line <- readIORef lineRef
                   case a of
-                    ActDial d -> do
-                      say ("dialling " ++ d)
-                      writeIORef lineRef (LineDialing (dtmfDialSignal fs (0.5 * moAmp o) (map toUpperC d)))
+                    ActDial d -> case dialTarget d of
+                      DialSip uri -> do
+                        -- There is no way to reach a SIP address from
+                        -- an audio line, and its digits dialled as tones
+                        -- would ring somebody else.
+                        say (uri ++ " is a SIP address, and this modem is on an audio line (use --sip)")
+                        writeIORef outcomeRef "not dialled: a SIP address on an audio line"
+                        modemEvent EvNoCarrier
+                        endCall
+                        when (moHangupExits o) (writeIORef doneRef True)
+                      DialNumber n -> do
+                        say ("dialling " ++ n)
+                        p <- hayesProfile <$> readIORef hayesRef
+                        let dp = DialParams { dpBlindWait = fromIntegral (hayesReg p 6)
+                                            , dpToneMs = max 50 (hayesReg p 11)
+                                            , dpPauseSec = fromIntegral (hayesReg p 8) }
+                        writeIORef lineRef (LineDialing (dtmfDialSignalWith dp fs (0.5 * moAmp o) (map toUpper n)))
                     ActAnswer -> do
                       say "answering"
-                      writeIORef lineRef (startCall Answer)
+                      startCall Answer >>= writeIORef lineRef
                     ActHangup -> case line of
                       LineIdle -> return ()
                       _ -> do
@@ -646,15 +739,12 @@ runModem o = do
               idle rxBlock = do
                 let loud = sip == Nothing && rms rxBlock > 0.01
                 n <- readIORef energyRef
-                let n' = if loud then n + 1 else 0
+                -- one ring per burst of energy, however long it lasts,
+                -- so that S0 counts rings and not half-seconds; the
+                -- interpreter answers when the count reaches S0
+                let n' = if loud then min 26 (n + 1) else 0
                 writeIORef energyRef n'
-                when (n' == 25) $ do
-                  modemEvent EvRing
-                  hs <- readIORef hayesRef
-                  when (hayesAutoAnswer hs) $ do
-                    logMsg "auto-answer"
-                    writeIORef lineRef (startCall Answer)
-                when (n' > 25) $ writeIORef energyRef 0
+                when (n' == 25) $ modemEvent EvRing
 
               onEvent ev = do
                 report ev
@@ -686,9 +776,14 @@ runModem o = do
                   EvRetrain _ -> return ()
                   EvRate _ -> return ()
 
-              onProgress e = when (refused (peKind e)) $
-                if moIgnoreBusy o
-                  then writeIORef outcomeRef (shortName (peKind e))
+              onProgress e = when (refused (peKind e)) $ do
+                detects <- hayesDetectsBusy <$> readIORef hayesRef
+                if moIgnoreBusy o || not detects
+                  then do
+                    was <- readIORef outcomeRef
+                    when (was /= shortName (peKind e)) $
+                      say (shortName (peKind e) ++ " on the line; staying on (" ++ (if detects then "--ignore-busy" else "ATX0 to X2 do not detect it") ++ ")")
+                    writeIORef outcomeRef (shortName (peKind e))
                   else do
                     writeIORef outcomeRef (shortName (peKind e))
                     modemEvent EvBusy
@@ -711,7 +806,6 @@ runModem o = do
     isFinal EvDropped = True
     isFinal (EvFailed _) = True
     isFinal _ = False
-    toUpperC ch = if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch
     -- A recording is named after who called, not after the whole URI:
     -- the host is the same on every call and only makes the stem longer.
     callerName u = case break (== '@') (drop 1 (dropWhile (/= ':') u)) of
@@ -1007,12 +1101,15 @@ withAudio' aio fmt rate role body pwLatencyEnv = case aio of
       return ()
 
 -- | Provide a non-blocking receiver of pending inbound bytes and a sender.
-withData :: DataIO -> (IO B.ByteString -> (B.ByteString -> IO ()) -> IO a) -> IO a
-withData dio body = case dio of
+withData :: DataIO -> (DteIO -> IO a) -> IO a
+withData dio body0 = case dio of
   DataStdio -> do
     buf <- newBuffer
     _ <- forkIO (pump stdin buf)
     body (drain buf) (\bs -> B.hPut stdout bs >> hFlush stdout)
+  DataPty link -> withPty logMsg link $ \port ->
+    body0 DteIO { dteRecv = ppRecv port, dteSend = ppSend port
+                , dteDtr = ppDtr port, dteDropped = ppDropped port }
   DataListen port -> withSocketsDo $ do
     addr <- head <$> getAddrInfo (Just defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }) Nothing (Just (show port))
     bracket (openSocket addr) close $ \lsock -> do
@@ -1030,6 +1127,9 @@ withData dio body = case dio of
       logMsg ("connected to " ++ host ++ ":" ++ show port)
       telnetSession sock body
   where
+    -- a transport with no DTR of its own: always there
+    body recv send = body0 DteIO { dteRecv = recv, dteSend = send
+                                 , dteDtr = return True, dteDropped = return False }
     pump h buf = do
       r <- try (B.hGetSome h 4096) :: IO (Either IOException B.ByteString)
       case r of

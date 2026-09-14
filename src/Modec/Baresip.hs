@@ -20,18 +20,17 @@ module Modec.Baresip
   , sipLineEvent
   , sipLineTick
   , sipLineInCall
-  , sipLineSetAuto
   , sipLinePeer
+  , dialUri
   ) where
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit)
-import Data.List (isPrefixOf)
 
 import Modec.Standards (Role (..))
 import Modec.Json
-import Modec.Hayes (HayesAction (..), HayesEvent (..))
+import Modec.Hayes (HayesAction (..), HayesEvent (..), DialTarget (..), dialTarget)
 
 -- | Netstring framing.
 netstringEncode :: B.ByteString -> B.ByteString
@@ -86,12 +85,11 @@ data SipLine = SipLine
   , slIncoming :: Bool            -- ^ an unanswered incoming call is ringing
   , slInCall   :: Maybe Role      -- ^ established call and the modem role we take
   , slLastRing :: Double
-  , slAuto     :: !Bool          -- ^ answer without waiting to be told (Hayes S0)
   , slPeer     :: String         -- ^ who is calling, from the INVITE
   }
 
 sipLineInit :: String -> SipLine
-sipLineInit domain = SipLine domain False False Nothing (-10) False ""
+sipLineInit domain = SipLine domain False False Nothing (-10) ""
 
 -- | What the modem should do.
 data SipAction
@@ -101,13 +99,14 @@ data SipAction
   | SipToDte HayesEvent            -- ^ tell the DTE
   deriving (Eq, Show)
 
--- | Number to a SIP URI: full URIs pass through, digits get the domain;
--- Hayes dial modifiers (T, P, W, commas) are dropped.
+-- | A dial string to a SIP URI: SIP addresses pass through (see
+-- 'dialTarget' for what counts as one, and what happens to a leading T),
+-- numbers get the domain with the Hayes dial modifiers (T, P, W, commas)
+-- dropped.
 dialUri :: String -> String -> String
-dialUri domain s
-  | "sip:" `isPrefixOf` s || "sips:" `isPrefixOf` s = s
-  | '@' `elem` s = "sip:" ++ s
-  | otherwise = "sip:" ++ filter (\c -> isDigit c || c `elem` "*#+") s ++ "@" ++ domain
+dialUri domain s = case dialTarget s of
+  DialSip uri -> uri
+  DialNumber n -> "sip:" ++ filter (\c -> isDigit c || c `elem` "*#+") n ++ "@" ++ domain
 
 -- | Hayes actions in SIP mode.
 sipLineHayes :: SipLine -> HayesAction -> (SipLine, [SipAction])
@@ -123,14 +122,14 @@ sipLineHayes st a = case a of
 -- | baresip call events.
 sipLineEvent :: Double -> SipLine -> BsMessage -> (SipLine, [SipAction])
 sipLineEvent t st msg = case msg of
-  -- S0 is answered here rather than in the modem's idle loop, which only
-  -- sees ringing as sustained line energy and so is switched off in SIP
-  -- mode.  Ring the DTE either way: a watching terminal should see the
-  -- call arrive, not just the CONNECT that follows it.
+  -- Every ring goes to the DTE, and the Hayes interpreter counts them
+  -- against S0 and answers with ATA's own action when the count is
+  -- reached; that arrives here a block later as 'ActAnswer', by which
+  -- time the call is marked incoming.
   BsEvent "call" "CALL_INCOMING" _ fields ->
     ( st { slIncoming = True, slLastRing = t
          , slPeer = maybe (slPeer st) id (lookup "peeruri" fields) }
-    , SipToDte EvRing : [ SipCommand "accept" "" | slAuto st ] )
+    , [SipToDte EvRing] )
   BsEvent "call" "CALL_ESTABLISHED" _ _ ->
     let role = if slDialing st then Originate else Answer
     in (st { slInCall = Just role, slIncoming = False }, [SipStartModem role])
@@ -148,11 +147,6 @@ sipLineTick t st
 
 sipLineInCall :: SipLine -> Maybe Role
 sipLineInCall = slInCall
-
--- | Track Hayes S0.  The register lives in the Hayes state, which this
--- module does not see, so the modem loop pushes it in each block.
-sipLineSetAuto :: Bool -> SipLine -> SipLine
-sipLineSetAuto a st = st { slAuto = a }
 
 -- | Who called, as baresip reported it; empty for a call we placed.
 sipLinePeer :: SipLine -> String

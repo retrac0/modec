@@ -140,10 +140,15 @@ and the library it links carries no dependency that could.
   serial port (`--audio-serial`, the line itself), or through baresip
   for SIP;
   data over telnet (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
-  escaped), stdio, or a terminal in raw mode. Hayes AT on the DTE side
-  (`--hayes`: ATD, ATA, ATH, ATO, ATZ, AT&F, ATS0, "+++" with its guard
-  times, and the CONNECT / RING / NO CARRIER / BUSY result codes), and
-  `modec dial NUMBER` for the whole thing in one command.
+  escaped), stdio, a terminal in raw mode, or a pseudo-terminal that a
+  terminal program opens as a modem's serial port (`--data-pty`,
+  `--pty-link`; closing the port drops DTR). Hayes AT on the DTE side
+  (`--hayes`): dialling numbers or SIP addresses, `+MS` to choose the
+  modulation and rates, S-registers for the dial, handshake and escape
+  timings, `&V`/`&W`/`&F` profiles, ring counting, a phone book for
+  terminal programs that dial digits only, and the CONNECT / RING / NO
+  CARRIER / BUSY result codes; [docs/hayes.md](docs/hayes.md) is the
+  reference. `modec dial NUMBER` does the whole thing in one command.
 - **Everything is recorded**: each call writes a WAV, a log of what the
   modem made of it stamped from the start of the call, and a line in
   `recordings/calls.log`; `--record-rx` / `--record-tx` keep a whole
@@ -240,6 +245,9 @@ scripts/smoke-serial.sh
 # Hayes mode: a terminal program talks AT commands over telnet; ATDT dials with DTMF
 cabal run modec -- modem --hayes --audio-pipewire --listen 2323
 scripts/smoke-hayes.sh
+# a serial port for minicom, picocom or SyncTERM: point it at /tmp/modem and type AT commands
+cabal run modec -- modem --hayes --sip 127.0.0.1:4444 --pty-link /tmp/modem --phonebook ~/.modec-phonebook
+scripts/smoke-pty.sh
 
 # SIP: install baresip and copy docs/baresip to ~/.baresip, edit accounts, then just
 cabal run modec -- dial +14042820600                              # starts baresip, dials, records

@@ -33,6 +33,7 @@ import Modec.Sample
 import Modec.Standards (Role (..), Standard)
 import Modec.Voice
 import Modec.Wav
+import Pty (rawMode)
 
 data FakeOpts = FakeOpts
   { fkFormat  :: SampleFormat
@@ -85,13 +86,6 @@ runFakeDongle o = do
                   | "AT" `isPrefixOf` cmd -> reply "OK" >> commands
                   | otherwise -> reply "ERROR" >> commands
   commands
-
-rawMode :: TerminalAttributes -> TerminalAttributes
-rawMode a = (`withTime` 0) . (`withMinInput` 1)
-  $ foldl withoutMode a
-      [ EnableEcho, EchoErase, EchoKill, EchoLF, ProcessInput, ProcessOutput
-      , ExtendedFunctions, KeyboardInterrupts, MapCRtoLF, MapLFtoCR, IgnoreCR
-      , StartStopInput, StartStopOutput, StripHighBit ]
 
 -- | Bytes up to a terminator, a byte at a time; 'Nothing' at end of file.
 readUntil :: Handle -> B.ByteString -> IO (Maybe B.ByteString)

@@ -79,6 +79,7 @@ module Modec.V32
   , bestCommonRate
   , restrictRates
   , ratesBelow
+  , ratesBetween
   , chosenRate
   ) where
 
@@ -748,15 +749,27 @@ decodeSeq lead bs = case bs of
 -- trellis can be interworked with; it is not a rung on this ladder.
 ratesBelow :: V32Rate -> RateSeq -> RateSeq
 ratesBelow r offer =
-  foldl clear offer [ x | x <- allV32Rates, rateBitRate x >= rateBitRate r ]
-  where
-    clear c x = case x of
-      V32R14400 -> c { rsCan14400 = False }
-      V32R12000 -> c { rsCan12000 = False }
-      V32R9600T -> c { rsTrellis = False }
-      V32R9600 -> c { rsCan9600 = False }
-      V32R7200 -> c { rsCan7200 = False }
-      V32R4800 -> c { rsCan4800 = False }
+  foldl clearRate offer [ x | x <- allV32Rates, rateBitRate x >= rateBitRate r ]
+
+-- | An offer narrowed to the rates from @lo@ to @hi@ bit/s inclusive:
+-- what @AT+MS=V32B,0,4800,9600@ asks for.  Both 9600s are in a range that
+-- reaches 9600, as they are on the modems that took the command.  B4 and
+-- B8 are left as they were, so a V.32bis offer still says V.32bis; 9600
+-- with the trellis needs B6 as well as B8, so clearing B6 is enough to
+-- take it out.
+ratesBetween :: Int -> Int -> RateSeq -> RateSeq
+ratesBetween lo hi offer =
+  foldl clearRate offer [ x | x <- allV32Rates, x /= V32R9600T
+                            , rateBitRate x < lo || rateBitRate x > hi ]
+
+clearRate :: RateSeq -> V32Rate -> RateSeq
+clearRate c x = case x of
+  V32R14400 -> c { rsCan14400 = False }
+  V32R12000 -> c { rsCan12000 = False }
+  V32R9600T -> c { rsTrellis = False }
+  V32R9600 -> c { rsCan9600 = False }
+  V32R7200 -> c { rsCan7200 = False }
+  V32R4800 -> c { rsCan4800 = False }
 
 -- | Our offer, narrowed to what the far end said it could do.
 --

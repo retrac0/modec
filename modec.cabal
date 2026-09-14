@@ -69,6 +69,7 @@ executable modec
     import:           warnings
     main-is:          Main.hs
     other-modules:    Modem
+                      Pty
                       CallLog
                       Dial
                       Serial

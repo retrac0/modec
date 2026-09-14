@@ -406,11 +406,15 @@ hangup, and no answer all behave, both directions, NO CARRIER inside
 1.3 s at modec and 2.7 s at the reference. Defects in modec:
 
 - **C7:** `ATS0=3` answers on the first ring. S0 is treated as on or off.
+  *Fixed since, not yet re-run on the bench:* the interpreter counts rings
+  in S1 and answers on the S0th.
 - **C8:** `ATO` after modec's own escape returns to data (the payload
-  after it is intact) but prints no `CONNECT`.
+  after it is intact) but prints no `CONNECT`. *Fixed since, not yet
+  re-run on the bench:* `ATO` repeats the last `CONNECT`.
 - modec's stderr is unbuffered and written from two threads, so lines
   arrive interleaved character by character ("modem role Anmsowdeerc");
   the runner matches recording paths rather than sentences because of it.
+  *Since made line-buffered.*
 
 - **C9, one modec process across calls:** fails even with the reference
   reset before every call. The first two calls are good in either order
