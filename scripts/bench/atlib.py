@@ -1,6 +1,9 @@
 import os, fcntl, struct, termios, time
 
 TIOCMGET = 0x5415
+TIOCMBIS = 0x5416
+TIOCMBIC = 0x5417
+TIOCM_DTR = 0x002
 
 class AT:
     def __init__(self, port='/dev/ttyACM0'):
@@ -31,6 +34,17 @@ class AT:
             txt = out.decode('latin1').replace('\r','\n')
             txt = ' | '.join(l for l in txt.split('\n') if l.strip())
             print(f'  {c:<22} -> {txt}')
+        return out
+    def dtr(self, on):
+        """Raise or drop DTR.  With AT&D2 a drop hangs the modem up."""
+        fcntl.ioctl(self.fd, TIOCMBIS if on else TIOCMBIC, struct.pack('I', TIOCM_DTR))
+    def read(self, secs, until=None):
+        """Whatever arrives in `secs`, stopping early at `until`."""
+        out=b''; end=time.time()+secs
+        while time.time()<end:
+            try: out += os.read(self.fd, 65536)
+            except BlockingIOError: time.sleep(0.01)
+            if until and until in out: break
         return out
     def close(self):
         os.close(self.fd)

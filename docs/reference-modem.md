@@ -1388,11 +1388,17 @@ read it correctly and cleared. The answering modem chooses R3 from what
 its receiver made of our TRN, so the CX93001 judged the line in the
 modec-to-reference direction not good enough for 14400 when modec is the
 caller, and good enough when modec answers. Our S lasts the same 1.05 s
-either way, as does the CX93001's own. Before the fixes one caller call
-did train at 14400, and the reference received garbage from it. So the
-open question is modec's *calling* transmitter at 14400 (GPC scrambler,
-caller TRN) against its answering one, which is proven. That is where to
-look next, not at the path.
+either way, as does the CX93001's own.
+
+It is not a fixed refusal, though, and the first reading of it -- that
+modec's calling transmitter is worse at 14400 -- did not survive the next
+call. In the first run of the standing test set (bench-tests.md, S0) the
+reference accepted 14400 from modec calling, received all eight of
+modec's lines intact, and it was modec's *receiver* that read none of the
+reference's; the reference logged line quality 5 and ended on a retrain
+failure. So calling at 14400 fails two ways, one at each end, and one call
+of each proves only that both happen. S3 (rate choice symmetry) is the
+test that will say how often, and whether either tracks the direction.
 
 One more thing the reversed direction shows: the ATA re-INVITEs once,
 after the far end's answer tone, on nine of the first eleven calls modec
@@ -1401,6 +1407,10 @@ carry data regardless, but it is a media renegotiation mid-call and
 "Re-INVITE After Fax Tone Detected" is the setting to check.
 
 ## Tier 1 — the questions that are open now
+
+The standing test set -- every mode both directions, repeated, with pass
+rules and a results file -- is [bench-tests.md](bench-tests.md). The
+tiers below are the first questions the bench was built to answer.
 
 ### T1.1 Does modec's 14400 receiver carry a real modem's data?
 

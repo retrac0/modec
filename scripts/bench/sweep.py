@@ -105,16 +105,136 @@ def ata_address():
     time.sleep(2)
     return addr
 
+class Stack:
+    """baresip and one modec process, as a call needs them.
+
+    one() starts and stops a stack per call; call-control tests hold one
+    across several calls.  modec is started without a role -- SIP gives
+    it one per call, Originate for a call it dialled and Answer for one
+    it took -- but with --ans-plain for the calls it answers (see one())."""
+    def __init__(self, tag, mode, extra=None):
+        self.tag = tag
+        self.rx = f'{SC}/sweep-{tag}-rx.wav'; self.tx = f'{SC}/sweep-{tag}-tx.wav'
+        self.log = open(f'{SC}/sweep-{tag}.log','wb')
+        self.bl  = open(f'{SC}/sweep-{tag}-baresip.log','wb')
+        self.bare = subprocess.Popen(['baresip','-f',os.path.expanduser('~/.baresip-bench')],
+                                     stdout=self.bl, stderr=subprocess.STDOUT)
+        time.sleep(3)
+        args = [BIN,'modem','--ans-plain','--sip','127.0.0.1:4444','--audio-sip-loop','modec',
+                '--mode',mode,'--hayes','--data-stdio','--record-rx',self.rx,'--record-tx',self.tx]+(extra or [])
+        self.mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+        nonblock(self.mo.stdout)
+        time.sleep(3)
+    def send(self, data):
+        self.mo.stdin.write(data); self.mo.stdin.flush()
+    def read(self, secs, until=None):
+        return read_for(self.mo.stdout, secs, until)
+    def alive(self):
+        return self.mo.poll() is None
+    def close(self):
+        try: self.send(b'\r')
+        except Exception: pass
+        self.mo.terminate(); self.bare.terminate()
+        try: self.mo.wait(timeout=5)
+        except Exception: self.mo.kill()
+        try: self.bare.wait(timeout=5)
+        except Exception: self.bare.kill()
+        self.log.close(); self.bl.close()
+        time.sleep(2)
+
+def call_logs(tag):
+    """The per-call logs this stack's modec wrote, oldest first.  modec
+    names each call's recording on stderr; the .log beside it has the
+    call's own timeline."""
+    import re
+    try:
+        txt = open(f'{SC}/sweep-{tag}.log','rb').read().decode('latin1')
+    except FileNotFoundError:
+        return []
+    # match the path, not the sentence: modec's stderr is unbuffered and
+    # two threads write to it, so the words around the path can arrive
+    # interleaved with another line
+    seen = []
+    for w in re.findall(r'(recordings/\d{8}T\d{6}-[^\s]*?\.wav)', txt):
+        if not w.endswith('-tx.wav') and w not in seen: seen.append(w)
+    if not seen:
+        # garbled past reading: take the per-call logs whose stamps fall
+        # inside this stack's life, which ends when its log last changed
+        import glob, datetime
+        end = os.path.getmtime(f'{SC}/sweep-{tag}.log')
+        for lg in sorted(glob.glob('recordings/2*.log')):
+            m = re.match(r'recordings/(\d{8}T\d{6})-', lg)
+            if not m: continue
+            t = datetime.datetime.strptime(m.group(1), '%Y%m%dT%H%M%S').timestamp()
+            if end - 150 <= t <= end: seen.append(lg[:-4] + '.wav')
+    return [w[:-4] + '.log' for w in seen]
+
+def read_call(path):
+    """What a per-call log says: seconds from SIP established to CONNECT,
+    the rate modec connected at, retrains, and how the call ended."""
+    import re
+    out = {'call_log': path, 't_modec_connect': None, 'modec_rate': '', 'modec_retrains': 0, 'modec_end': ''}
+    try:
+        lines = open(path, 'rb').read().decode('latin1').splitlines()
+    except FileNotFoundError:
+        return out
+    up = None
+    for ln in lines:
+        m = re.match(r'\s*([0-9.]+)\s+(.*)', ln)
+        if not m: continue
+        t, what = float(m.group(1)), m.group(2)
+        if what.startswith('SIP call up') and up is None: up = t
+        elif what.startswith('CONNECT') and out['t_modec_connect'] is None:
+            out['t_modec_connect'] = round(t - (up or 0), 2)
+            r = re.match(r'CONNECT (\S+ \d+)', what); out['modec_rate'] = r.group(1) if r else what
+        elif 'retraining the link' in what: out['modec_retrains'] += 1
+        elif what.startswith('call ended:'): out['modec_end'] = what[len('call ended:'):].strip()
+    return out
+
+UD_KEYS = {'20': 'ud_tx_carrier', '21': 'ud_rx_carrier', '26': 'ud_init_tx', '27': 'ud_init_rx',
+           '30': 'ud_carrier_losses', '31': 'ud_renegotiations', '32': 'ud_retrains_req',
+           '33': 'ud_retrains_granted', '34': 'ud_final_tx', '35': 'ud_final_rx',
+           '40': 'ud_protocol', '44': 'ud_compression', '55': 'ud_rx_lost', '60': 'ud_end_cause'}
+
+def decode_ud(compact):
+    """AT#UD's key=hex pairs, as one() compacts them, to named integers.
+    Key meanings are Conexant's #UD table; rates and counts read as hex."""
+    out = {}
+    for kv in (compact or '').split():
+        k, _, v = kv.partition('=')
+        if k in UD_KEYS:
+            try: out[UD_KEYS[k]] = int(v, 16)
+            except ValueError: pass
+    return out
+
+def decode_v1(reply):
+    """AT&V1, the Conexant last-call report, to named fields."""
+    import re
+    names = {'TERMINATION REASON': 'v1_end', 'LAST TX rate': 'v1_tx', 'HIGHEST TX rate': 'v1_tx_high',
+             'LAST RX rate': 'v1_rx', 'HIGHEST RX rate': 'v1_rx_high', 'PROTOCOL': 'v1_protocol',
+             'COMPRESSION': 'v1_compression', 'Line QUALITY': 'v1_quality', 'Rx LEVEL': 'v1_rx_level',
+             'EQM Sum': 'v1_eqm', 'Local Rtrn Count': 'v1_local_retrains', 'Remote Rtrn Count': 'v1_remote_retrains',
+             'Rate Drop': 'v1_rate_drop'}
+    out = {}
+    for ln in (reply or '').splitlines():
+        m = re.match(r'(.+?)\.{2,}\s*(.*)', ln.strip())
+        if m and m.group(1).strip() in names:
+            v = m.group(2).strip()
+            out[names[m.group(1).strip()]] = v[:-4] if v.endswith(' BPS') else v
+    return out
+
 def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
         pay_a=None, pay_b=None, settle=1.0, post=None, taketurns=False,
-        originate=False):
+        originate=False, after=None):
     """One call.  pay_a goes modec -> reference, pay_b the other way;
     settle is the pause after CONNECT before either is sent (a noise
     schedule may need to have started); post is a list of AT commands
     to run at the reference after the call, their replies returned in
     result['post'].  originate reverses the roles: modec dials the ATA
-    and the reference answers on ring.  The defaults are the original
-    sweep."""
+    and the reference answers on ring.  after is a list of AT commands
+    run at the reference once it has hung up, raw replies in
+    result['after'] -- AT&V1, the last call's statistics, is only
+    complete then.  The defaults are the original sweep."""
     extra = extra or []; ref_extra = ref_extra or []
     dial_to = f'1001@{ata_address()}' if originate else None
     pay_a = PAY_A if pay_a is None else pay_a; pay_b = PAY_B if pay_b is None else pay_b
@@ -142,10 +262,12 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
         stops = [b'CONNECT',b'NO CARRIER',b'BUSY',b'NO ANSWER',b'ERROR']
         for c in ['AT&F','AT&K0','AT%C0','AT\\N0','ATX4','ATS7=40', ms] + ref_extra:
             m.cmd(c,3,quiet=True)
+        t_dial = time.time()
         if originate:
             # the reference picks up on the first ring; modec's ATD waits
             # for the call to be established, then trains as the caller
             m.cmd('ATS0=1',3,quiet=True)
+            t_dial = time.time()
             mo.stdin.write(f'ATD{dial_to}\r'.encode()); mo.stdin.flush()
             r = b''; out = b''; t0 = time.time()
             while time.time()-t0 < 60 and not any(s in r for s in stops):
@@ -157,6 +279,7 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
             read_for(mo.stdout, 1.5)
             r = m.cmd('ATDT2001',45,stop=stops,quiet=True)
             out = b''
+        result['t_ref_result'] = round(time.time() - t_dial, 2)
         rtxt = r.decode('latin1').replace('\r',' ').strip()
         result['ref'] = 'CONNECT' if b'CONNECT' in r else rtxt.split()[-1] if rtxt else '?'
         result['ref_connect'] = next((l.strip() for l in rtxt.split('  ') if 'CONNECT' in l), '')
@@ -233,6 +356,12 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
                     return ' '.join(pairs) if pairs else reply.replace('\n', ' ').strip()
                 result['post'] = {c: compact(m.cmd(c, 3, quiet=True).decode('latin1')) for c in post}
         m.cmd('ATH',4,quiet=True)
+        if after:
+            result['after'] = {c: m.cmd(c, 4, quiet=True).decode('latin1') for c in after}
+        if post and 'post' not in result:
+            import re as _re
+            result['post'] = {c: ' '.join(_re.findall(r'DIAG <[0-9A-F]+ ([0-9A-F]+=[0-9A-F]+)>',
+                                                     m.cmd(c, 3, quiet=True).decode('latin1'))) for c in post}
     finally:
         m.close()
         try: mo.stdin.write(b'\r'); mo.stdin.flush()
@@ -244,6 +373,8 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
         except Exception: bare.kill()
         log.close(); bl.close()
         time.sleep(2)
+    logs = call_logs(tag)
+    if logs: result.update(read_call(logs[-1]))
     return result
 
 MODES = [
