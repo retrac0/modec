@@ -407,10 +407,10 @@ hangup, and no answer all behave, both directions, NO CARRIER inside
 
 - **C7:** `ATS0=3` answers on the first ring. S0 is treated as on or off.
   *Fixed since, not yet re-run on the bench:* the interpreter counts rings
-  in S1 and answers on the S0th.
+  in S1 and answers on the S0th. *Passed on the bench 2026-09-16.*
 - **C8:** `ATO` after modec's own escape returns to data (the payload
-  after it is intact) but prints no `CONNECT`. *Fixed since, not yet
-  re-run on the bench:* `ATO` repeats the last `CONNECT`.
+  after it is intact) but prints no `CONNECT`. *Fixed since:* `ATO`
+  repeats the last `CONNECT`. *Passed on the bench 2026-09-16.*
 - modec's stderr is unbuffered and written from two threads, so lines
   arrive interleaved character by character ("modem role Anmsowdeerc");
   the runner matches recording paths rather than sentences because of it.
@@ -449,6 +449,56 @@ reference's lines while the reference received all of modec's. With modec
 calling the same automode reference, none of seven calls connected
 (`&V1`: no rate, receive level 215). Neither is a conclusion yet; both are
 where S2 and S3 resume.
+
+## What the second pass found (2026-09-16, bfb363c and 89d58a0)
+
+**C9 was the transmit cushion.** Each time baresip connected or dropped its
+streams, pw-cat capture came up about 32 ms short (16 to 37 measured)
+while playback kept consuming, and the loop writes one block per block
+read. The 100 ms cushion wore away a call at a time, and after the third
+event pw-top counted an underrun on modec-tx once a second. `Modec.Cushion`
+now writes back what capture lost. `MODEC_IO_STATS=1` logs the audio clock
+and the cushion every five seconds. C9 passes both ways, four calls each,
+and a probe of eight alternating calls in one process ran with no
+underrun at all.
+
+**C7 and C8 pass** on the bench, both fixed earlier offline.
+
+**C11 was not the reference's state.** Through the ATA the far end's
+level falls by 6 dB, inside 5 ms, at a random moment on most calls. At
+2400 bit/s the slow gain let the carrier loop fit the halved four-point
+signal to the inner ring and spin, which is the "loses the signal at the
+change to 16 points" C11 recorded. `qrAgcStep` in `Modec.QAM` follows
+the step. Replayed, 63 of 73 recorded answer calls hold the line where 50
+did, with no payload lost. Live, S1 V.22bis is 10 of 10 both ways.
+
+**Automode, modec calling, was a timing window.** A CX93001 in automode
+answers with its tone, 2250 Hz for 3 s, then AC for under a second, then
+V.21. modec waited to hear AC before sending AA, and the ATA's 780 ms
+round trip put its AA past the window: 10 of 10 failed. A V.32-only caller
+now sends AA as soon as the answer tone ends. Three of three connected at
+14400. One carried both directions; two lost the reference's lines,
+which is the 14400 receive fault below.
+
+**Still open.**
+
+- modec receiving 14400 on calls it placed. A pinned call did read both
+  ways this pass, and the automode ones mostly did not. The truth trace
+  on the failing S0 recording (20260912T211730) shows a true error of
+  0.15 from the first data symbol, and holding the start-up's frequency
+  does not help, so it is not the seam fault fixed for the answering
+  side.
+- The CX93001 sometimes answers modec's R2 at 14400 with an R3 offering
+  no rate ("no common rate").
+- Once in 30-odd calls the CX93001 sent start + 6 data bits with no stop
+  bit and printed 0xFF bytes after CONNECT (probe call 20260916T194532).
+  That is the reference, not modec.
+- Every V.32 connect and retrain now logs both ends' rate signals
+  (`rates:` in the call log). In automode the reference offered 4800 only
+  on one call and 14400 on the next, so where a call lands is the
+  reference's choice.
+- A retrain that cannot finish now ends the call after 20 s rather than
+  33 s of silence.
 
 ## Order and cost
 
