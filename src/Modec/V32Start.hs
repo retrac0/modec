@@ -159,6 +159,9 @@ data V32Start = V32Start
   -- receive
   , vsRx      :: !QamRxState
   , vsRev1800 :: !RevTracker
+  , vsRev2100 :: !RevTracker     -- ^ the answer tone, for a caller that has heard nothing else yet
+  , vsAnsRun  :: !Int            -- ^ samples the answer tone has sounded, at its longest
+  , vsAnsGone :: !Int            -- ^ samples since it last did
   , vsRev600  :: !RevTracker
   , vsRev3000 :: !RevTracker
   , vsMark    :: Maybe Int       -- ^ sample index of the first reversal
@@ -180,6 +183,7 @@ data V32Start = V32Start
   , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
   , vsACSteady :: !Int           -- ^ calling modem listening: samples of AC heard without a reversal
   , vsACNeed  :: !Int            -- ^ ...and how many symbols of that it wants before sending AA
+  , vsAAWait  :: !Int            -- ^ samples to send AA waiting for AC's reversal
   , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
@@ -506,7 +510,15 @@ v32StartAfterAnswerTone fs dir offer =
        -- it moves on to V.21: a caller that spent 430 ms making sure of
        -- the AC, and then 390 ms of round trip, put its AA on the line
        -- after the answerer had stopped listening for it.
-       Originate -> st { vsACNeed = 32 }
+       --
+       -- And past the handshake there is nothing to make sure of: it only
+       -- hands over once it has heard an answer tone, and for a caller
+       -- that speaks nothing but V.32 that is enough.  So AA goes out at
+       -- once and waits for AC to reverse.  AC is steady until the
+       -- answerer has heard AA, so an AA already on the line when AC
+       -- starts is one it hears at once -- which is the only way through
+       -- that sub-second window across a 780 ms round trip.
+       Originate -> st { vsACNeed = 32, vsPhase = OAA, vsSrc = TxState StA, vsAAWait = 80000 }
 
 v32StartInit :: Double -> Role -> RateSeq -> V32Start
 v32StartInit fs dir offer = V32Start
@@ -520,11 +532,12 @@ v32StartInit fs dir offer = V32Start
   , vsAnsPh = 0, vsAnsRev = True
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
+  , vsRev2100 = revInit fs 2100, vsAnsRun = 0, vsAnsGone = 0
   , vsMark = Nothing, vsTrip = Nothing, vsSentS = Nothing
   , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vsACNeed = 256, vs1800Run = 0
+  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vsACNeed = 256, vsAAWait = 30000, vs1800Run = 0
   , vsLineErr = 1 }
   where
     role = case dir of { Originate -> Originate; Answer -> Answer }
@@ -558,6 +571,9 @@ symbols st k = round (fromIntegral k * vsSps st)
 observe :: V32Start -> Signal -> V32Start
 observe st rx = st
   { vsRev1800 = r18, vsRev600 = r6, vsRev3000 = r30
+  , vsRev2100 = r21
+  , vsAnsRun = if tone2100 then vsAnsRun st + VS.length rx else vsAnsRun st
+  , vsAnsGone = if tone2100 then 0 else vsAnsGone st + VS.length rx
   -- How long the answering modem's opening pair has been on the line.
   --
   -- A level is a coherent correlation over the signal's own tracked mean
@@ -588,6 +604,8 @@ observe st rx = st
   where
     acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
     tone1800 = revPower r18 > 1e-5 && revLevel r18 > 0.45
+    tone2100 = revPower r21 > 1e-5 && revLevel r21 > 0.45
+    (r21, _) = revBlock rx (vsRev2100 st)
     (r18, e18) = revBlock rx (vsRev1800 st)
     (r6, e6) = revBlock rx (vsRev600 st)
     (r30, e30) = revBlock rx (vsRev3000 st)
@@ -939,6 +957,15 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       OListen
         | steady && vsACSteady s + n >= sym (vsACNeed s) ->
             enter OAA (rearm s) { vsSrc = TxState StA, vsACSteady = 0 }
+        -- An answer tone has come and gone, and AC is not here yet.  A
+        -- V.32 answerer holds AC steady until it hears AA, so AA already
+        -- on the line costs nothing -- and an automode answerer that
+        -- tries V.22bis first gives AC under a second before moving on,
+        -- which across the ATA's 780 ms round trip is only reachable by
+        -- an AA that was waiting for it.  2100 Hz is not ringback, so the
+        -- guard above has nothing to guard against here.
+        | vsAnsRun s >= 4000 && vsAnsGone s >= 1600 ->
+            enter OAA (rearm s) { vsSrc = TxState StA, vsACSteady = 0, vsAAWait = 80000 }
         | tooLong 60000 s -> enter (V32Fail "no answering modem") s
         | otherwise -> s { vsACSteady = if steady then vsACSteady s + n else 0 }
         where steady = acHeard && acRev == Nothing
@@ -950,7 +977,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
                               -- A to C is a half turn, so the switch is
                               -- a reversal on its own
                               , vsSwitch = Just (switchAt s i, [], TxState StC) }
-        Nothing | tooLong 30000 s -> enter (V32Fail "no reversal in AC") s
+        Nothing | tooLong (vsAAWait s) s -> enter (V32Fail "no reversal in AC") s
                 | otherwise -> s
       OCC | vsSince s < sym 32 -> s
       OCC -> case acRev of

@@ -173,8 +173,10 @@ current.
 - FSK: V.21 tolerates an adjacent channel to about +25 dB, its channels
   being only 470 Hz apart; Bell 103 to beyond +30 dB. Dropouts lose the
   characters they hit, and clock offsets beyond ±3 % fail.
-- 2400 bit/s: re-acquisition after a jitter-buffer slip is slow, tens of
-  bytes each, and heavy sinusoidal jitter breaks the coherent path.
+- 2400 bit/s: a jitter-buffer slip costs five to ten characters, and
+  sinusoidal jitter of 0.5 % speed at 2 Hz (160 degrees of carrier swing)
+  breaks the coherent path.  A 6 dB step in the far end's level, which the
+  bench's ATA produces on most calls, is followed within two symbols.
 - 9600 bit/s: delay distortion past 1 ms breaks it where 4800 rides
   through.
 - Through an ATA, send `--ans-plain`: the V.25 phase reversals in the
