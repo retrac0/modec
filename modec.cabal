@@ -51,6 +51,8 @@ library
                       Modec.Hayes
                       Modec.Dtmf
                       Modec.Progress
+                      Modec.Speech
+                      Modec.Classify
                       Modec.Json
                       Modec.Baresip
                       Modec.Pipewire
@@ -69,6 +71,7 @@ executable modec
     import:           warnings
     main-is:          Main.hs
     other-modules:    Modem
+                      Classify
                       Pty
                       CallLog
                       Dial
@@ -86,6 +89,7 @@ executable modec
                       network,
                       process,
                       unix,
+                      containers,
                       directory,
                       filepath,
                       time
@@ -111,6 +115,7 @@ test-suite modec-test
     other-modules:    Corpus
                       Harness
                       Suite.Channel
+                      Suite.Classify
                       Suite.LiveChannel
                       Suite.Dsp
                       Suite.Fsk

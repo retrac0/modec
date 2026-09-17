@@ -1,0 +1,6 @@
+class: congestion
+detail: speech 0.5-
+source: recordings/20260908T000313-+19719104722.wav
+note: Eighteen seconds of a recorded announcement, then 480+620 Hz at a
+  quarter second on and off.  The announcement must not outvote the
+  cadence that follows it, and must still be reported as speech.

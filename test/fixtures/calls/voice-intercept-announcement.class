@@ -1,0 +1,5 @@
+class: voice
+source: recordings/20260906T000004-sursum-corda-300.wav, first 31 s
+note: A spoken network announcement ending in a short tone, heard on
+  every board of the first sweep's 300 bit/s pass.  Voice is what the
+  line carried, whoever was speaking.

@@ -1,0 +1,5 @@
+class: modem
+detail: ANSam
+source: recordings/20260906T164028-+13034944774.wav, 4 s to 24 s
+note: NIST ACTS.  The modem logged this call "no answer"; the line holds
+  ringing, ANSam at 9 s, V.22's unscrambled ones and V.32's 600+3000 Hz.

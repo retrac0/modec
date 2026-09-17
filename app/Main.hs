@@ -11,6 +11,7 @@ import Text.Printf (printf, hPrintf)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeFileName, (</>))
 
+import Classify
 import Dial
 import FakeDongle
 import qualified Modec.Channel as Ch
@@ -55,6 +56,7 @@ data Cmd
   | V32Trace Bool Input      -- ^ True = we were the answering modem
   | Replay ReplayOpts
   | ProgressOf Input
+  | ClassifyCmd ClassifyOpts
   | DtmfOf Input
   | RunModem ModemOpts
   | DialOut DialOpts
@@ -143,6 +145,7 @@ cmdP = hsubparser
   <> command "detect" (info detectP (progDesc "Identify the FSK standard/channel and tone sequence in a WAV file"))
   <> command "v32trace" (info v32traceP (progDesc "Read a V.32 start-up back out of a recording, as a timeline"))
   <> command "replay" (info replayP (progDesc "Run the whole modem over a recording: the call timeline on stderr, the bytes on stdout"))
+  <> command "classify" (info classifyP (progDesc "Say what answered each recorded call -- modem, fax, voice, busy, congestion, SIT, no answer -- from the audio"))
   <> command "progress" (info progressP (progDesc "Report the call progress tones in a WAV file: dial tone, ringing, busy, congestion, special information tone"))
   <> command "dtmf"  (info dtmfP   (progDesc "Report the DTMF digits in a WAV file"))
   <> command "dial"   (info dialP   (progDesc "Dial a number over SIP and hand the call to this terminal"))
@@ -194,6 +197,13 @@ cmdP = hsubparser
       <*> strOption (long "fixture-dir" <> value "test/fixtures/live" <> showDefault <> metavar "DIR")
       <*> inputP)
     progressP = ProgressOf <$> inputP
+    classifyP = ClassifyCmd <$> (ClassifyOpts
+      <$> switch (long "truth" <> help "compare each verdict with the outcome the modem logged, and print a confusion table")
+      <*> switch (long "by-number" <> help "sum the calls up per number, and list candidates never called")
+      <*> switch (long "all" <> help "include bench and loopback calls")
+      <*> switch (long "quiet" <> help "do not print a line per call")
+      <*> many (strOption (long "candidates" <> metavar "FILE" <> help "a list of numbers with names (dialup-candidates.txt, bbslist.txt). Repeatable"))
+      <*> many (argument str (metavar "WAV|DIR..." <> help "recordings to classify (default: recordings/)")))
     dtmfP = DtmfOf <$> inputP
     fakeP = FakeDongleCmd <$> (FakeOpts
       <$> option (maybeReader formatNamed) (long "format" <> value Pcm14 <> metavar "FMT"
@@ -480,6 +490,7 @@ main = do
       forM_ (v32Timeline fs dir x) $ \(t, what) ->
         printf "%8.3f  %s\n" t what
     Replay ro -> runReplay ro
+    ClassifyCmd co -> runClassify co
     Detect inp -> do
       (fs, x, _) <- readInput inp
       putStrLn "FSK channel scores (fraction of frames dominated by the channel's tones):"

@@ -9,6 +9,7 @@ import Test.Tasty
 
 import Corpus
 import Suite.Channel
+import Suite.Classify
 import Suite.LiveChannel
 import Suite.Dsp
 import Suite.Fsk
@@ -27,6 +28,7 @@ main = do
   fx <- fixtureTests
   live <- liveTests
   specs <- specTests
+  calls <- callFixtureTests
   defaultMain $ testGroup "modec"
     [ testGroup "primitives"
         [wavTests, sampleTests, dspTests, scramblerTests, stageTests, toneFrameTests]
@@ -50,4 +52,9 @@ main = do
         [hayesTests, baresipTests, pipewireTests, sessionTests, voiceTests, hermeticTests]
     , testGroup "tones as meaning"
         [ttyTests, dtmfTests, progressTests]
+    -- What answered a call, read from the audio rather than taken from
+    -- what the modem managed; the recorded calls are the ones the rules
+    -- were settled on.
+    , testGroup "what answered"
+        [speechTests, classifyTests, calls]
     ]

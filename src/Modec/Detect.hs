@@ -79,17 +79,26 @@ toneBank fs cfg = Stage (BankState 0 win VS.empty) step
     win = max 1 (round (fs * tbWindowSec cfg))
     hop = max 1 (round (fs * tbHopSec cfg))
     freqs = VU.fromList (tbFreqs cfg)
-    ws = VU.map (\f -> 2 * pi * f / fs) freqs
     hann = hannWindow win
     hsum = VS.sum hann
+    -- The correlation is taken against the window's own time axis rather
+    -- than the stream's.  That turns the complex result by the phase the
+    -- tone had reached at the window's first sample, and only its
+    -- magnitude is used, so nothing changes -- except that the windowed
+    -- sinusoids are now the same for every frame and are built once.
+    -- Every frame is then two dot products per frequency instead of a
+    -- sine and a cosine per sample.
+    kernels = [ ( VS.imap (\i h -> h * cos (w * fromIntegral i)) hann
+                , VS.imap (\i h -> h * sin (w * fromIntegral i)) hann )
+              | f <- tbFreqs cfg, let w = 2 * pi * f / fs ]
+    dot a b = go 0 0
+      where
+        go !i !acc | i >= win = acc
+                   | otherwise = go (i + 1) (acc + VS.unsafeIndex a i * VS.unsafeIndex b i)
     measure buf nEnd =   -- buf holds exactly the window ending at global index nEnd
-      let amps = VU.map (\w -> corrAmp w) ws
-          corrAmp w =
-            let (re, im) = VS.ifoldl' (\(!a, !b) i v ->
-                              let x = v * VS.unsafeIndex hann i
-                                  th = w * fromIntegral (nEnd - win + i)
-                              in (a + x * cos th, b + x * sin th)) (0, 0) buf
-            in toneAmplitudeW hsum (re * re + im * im)
+      let amps = VU.fromList [ let re = dot buf kc; im = dot buf ks
+                               in toneAmplitudeW hsum (re * re + im * im)
+                             | (kc, ks) <- kernels ]
       in ToneFrame (fromIntegral nEnd / fs) freqs amps (rms buf)
     step (BankState start nextEnd kept) chunk =
       let ext = kept VS.++ chunk

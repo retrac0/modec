@@ -144,8 +144,11 @@ In the order they cost least, from what the survey turned up:
 
 - The rest of V.18: annexes B to F are tone pairs this modem already
   has, and spandsp's `v18_tests` is a direct oracle.
-- A call classifier over the dial-up candidate lists, using the progress
-  and detect machinery on the recordings already collected.
+- ~~A call classifier over the dial-up candidate lists~~: done as
+  `modec classify` (Modec.Classify, Modec.Speech); what it found is in
+  [recordings/README.md](recordings/README.md).  Still open: naming SIT
+  segments, which needs a real SIT recording, and telling a person from
+  an announcement.
 - T.30 phase A and B, whose V.21 channel 2 HDLC frames are already
   built.
 - An echo canceller, which is what stands between the V.32 pump and a

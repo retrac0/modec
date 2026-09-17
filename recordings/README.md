@@ -93,3 +93,68 @@ Every one of the eleven has V.34, and none has anything modec can run
 except V.22bis/V.22 and, for seven of them, V.21. That is the whole
 picture: these are modern modems being asked to speak 1980s protocols,
 and they do, down to 1200 and occasionally 300.
+
+## What answered: the whole corpus, classified
+
+`modec classify` reads every recording afresh and says what was on the
+other end, from the audio alone. It uses:
+
+- the call-progress detector
+- ANSam
+- a steady-carrier check
+- T.30 frames on V.21 channel 2
+- a voice detector
+
+Each verdict comes with the evidence it rests on and when that evidence
+was heard.
+
+```
+cabal run modec -- classify --truth --by-number \
+  --candidates bbslist.txt --candidates dialup-candidates.txt
+```
+
+Over the 309 calls to real numbers (bench and loopback calls left out;
+about 40 s on four cores):
+
+| Heard | Calls |
+|---|---|
+| modem | 223 |
+| no audio (every sample zero: no media arrived) | 30 |
+| congestion | 12 |
+| no answer (ringing, nothing after) | 12 |
+| unclassified | 12 |
+| silence | 10 |
+| voice | 8 |
+| fax | 2 |
+
+Against the 136 calls whose logged outcome implies a class, 109 agree.
+
+- **Modem and congestion agree completely.** All 69 logged connections
+  (or lost carriers) are heard as modems, and all 12 congestion calls as
+  congestion.
+- **22 calls logged "no answer" were answered by a modem.** Each has an
+  answer tone and ANSam 7 to 15 s in. The modem gave up or failed to
+  recognise the answer at the time; the line had a modem on it. NIST
+  ACTS is one of them.
+- **The congestion calls are a recorded announcement first.** 18 s of
+  speech, then 480+620 Hz at a quarter second on and off. The classifier
+  reports both and lets the cadence decide.
+- **Two boards answered as fax machines.** Sursum Corda and Last
+  Telegraph Office, on their Bell 212A attempts, fell back to T.30 after
+  their data modes found nothing to talk to. They sent CSI and DIS every
+  five seconds. Sursum Corda's CSI is its own number, `256 895 4786`.
+- **The first sweep's 300 bit/s pass reached an announcement, not the
+  boards.** Every board on that pass played a spoken network announcement
+  ending in a short tone. That points at the pass's dial string, not the
+  boards. These are the `voice` verdicts on BBS numbers.
+- **One private number (+19208406311) rang five times and was answered by
+  a voice.** The recording is not tracked.
+- **Wizard's Rainbow's 2400 attempt is not line audio.** It is a pair of
+  tones at 1333 and 2667 Hz, 0.2 dB below full scale. No G.711 trunk
+  delivers that, so it is left unclassified and flagged as full scale.
+- **Unclassified calls are mostly fragments.** A second of a previous
+  call's carrier, a lone ring or a single word at the head of a
+  recording.
+
+Five of these calls, cut short, are fixtures in `test/fixtures/calls`
+with the class each must keep.

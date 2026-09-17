@@ -85,6 +85,7 @@ in the payload wrong, not a bit error rate.
 | MNP 2, 3 and 4 | every byte delivered where the bare link damages 3 % of them; links up at 4 dB | — |
 | DTMF | digits to 3 dB SNR | Q.24's own accept and reject limits |
 | Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
+| Call classifier (modem, fax, voice, busy, congestion, SIT, no answer) | babble as voice to 10 dB SNR | 309 recorded calls: every logged connection and congestion agrees; 22 "no answer" calls found to be modems |
 
 Twelve recorded calls are also in the suite, replayed through the whole
 modem and checked against what the far end really sent: see
@@ -216,6 +217,7 @@ cabal run modec -- probe recording.wav                            # tone energie
 cabal run modec -- detect recording.wav                           # which standard, tone runs
 cabal run modec -- progress recording.wav                        # dial tone, ringing, busy, congestion, SIT
 cabal run modec -- dtmf recording.wav                            # DTMF digits, with timings
+cabal run modec -- classify --truth --by-number recordings/      # what answered each call, against the log
 cabal run modec -- replay --mode v22bis,v22 recording.wav        # the whole modem over a recorded call
 cabal run modec -- replay --mode v22bis,v22 --channel voip --impair impulse=20 recording.wav
 # 5-bit text telephone (TTY/TDD): text in, text out, not bytes

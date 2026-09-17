@@ -1,0 +1,6 @@
+class: fax
+detail: 256 895 4786
+source: recordings/20260906T011417-sursum-corda-bell212a.wav, 4 s to 30 s
+note: Sursum Corda's data/fax modem, after its data modes found nothing
+  to talk to: ANSam, then T.30 CSI and DIS on V.21 channel 2 every five
+  seconds.  The CSI carries the board's own number, sent backwards.
