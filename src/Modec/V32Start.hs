@@ -44,6 +44,7 @@ module Modec.V32Start
   , v32Elapsed
   , v32RoundTrip
   , v32Bis
+  , v32Negotiated
   , v32EchoAdapt
   , v32Turns
   , v32LineError
@@ -178,6 +179,7 @@ data V32Start = V32Start
   , vsACHold  :: !Int            -- ^ symbols of the pair to send before reacting to AA
   , vsACRun   :: !Int            -- ^ blocks the answerer's AC pair has been up
   , vsACSteady :: !Int           -- ^ calling modem listening: samples of AC heard without a reversal
+  , vsACNeed  :: !Int            -- ^ ...and how many symbols of that it wants before sending AA
   , vs1800Run :: !Int            -- ^ samples the caller's 1800 Hz has been up
   , vsQuiet   :: !Int            -- ^ samples the line has been quiet
   , vsAdapt   :: !Bool           -- ^ the echo canceller may adapt now
@@ -378,6 +380,11 @@ aidB1 off e s
 -- | Whether this turned out to be a V.32bis call: Table 5 Note 1 makes
 -- it V.32bis only if both rate signals announce it, so both halves of
 -- the exchange are asked.  Meaningless before R1 or R2 has been read.
+-- | What this start-up offered, and the far end's latest rate signal, for
+-- the call log.  The only record of why a call landed where it did.
+v32Negotiated :: V32Start -> (RateSeq, Maybe RateSeq)
+v32Negotiated s = (vsOffer s, vsPeer s)
+
 v32Bis :: V32Start -> Bool
 v32Bis s = rateSeqV32bis (vsOffer s) && maybe False rateSeqV32bis (vsPeer s)
 
@@ -492,7 +499,14 @@ v32StartAfterAnswerTone fs dir offer =
   let st = v32StartInit fs dir offer
   in case vsRole st of
        Answer -> st { vsPhase = AAC, vsSrc = TxAltAC True }
-       Originate -> st
+       -- The 256 symbols 'OListen' wants are a guard against ringback,
+       -- and ringback is over once an answer tone has been heard.  They
+       -- cost a real call.  A CX93001 in automode answers with its tone,
+       -- 2250 Hz for three seconds, and then AC for well under one before
+       -- it moves on to V.21: a caller that spent 430 ms making sure of
+       -- the AC, and then 390 ms of round trip, put its AA on the line
+       -- after the answerer had stopped listening for it.
+       Originate -> st { vsACNeed = 32 }
 
 v32StartInit :: Double -> Role -> RateSeq -> V32Start
 v32StartInit fs dir offer = V32Start
@@ -510,7 +524,7 @@ v32StartInit fs dir offer = V32Start
   , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
-  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vs1800Run = 0
+  , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vsACNeed = 256, vs1800Run = 0
   , vsLineErr = 1 }
   where
     role = case dir of { Originate -> Originate; Answer -> Answer }
@@ -923,7 +937,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- reversal in it is more than two beats and costs a real answerer
       -- nothing.
       OListen
-        | steady && vsACSteady s + n >= sym 256 ->
+        | steady && vsACSteady s + n >= sym (vsACNeed s) ->
             enter OAA (rearm s) { vsSrc = TxState StA, vsACSteady = 0 }
         | tooLong 60000 s -> enter (V32Fail "no answering modem") s
         | otherwise -> s { vsACSteady = if steady then vsACSteady s + n else 0 }
@@ -1201,6 +1215,4 @@ v32Timeline fs dir sig = go st0 0 (chunksOf blk sig) []
                     , vsPeer = case heardRate of { Just _ -> heardRate; Nothing -> vsPeer st } }
       in go st2 (n + blk) cs (reverse (revs ++ tone ++ cond ++ rate ++ eSig) ++ acc)
     toneWas f st = revLevel (case f of { 1800 -> vsRev1800 st; 600 -> vsRev600 st; _ -> vsRev3000 st }) > 0.45
-    showRates r = unwords (["4800" | rsCan4800 r] ++ ["7200" | rsCan7200 r] ++ ["9600" | rsCan9600 r]
-                           ++ ["tcm" | rsTrellis r] ++ ["12000" | rsCan12000 r] ++ ["14400" | rsCan14400 r]
-                           ++ ["(V.32bis)" | rateSeqV32bis r])
+    showRates = describeRateSeq

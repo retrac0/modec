@@ -201,6 +201,33 @@ data QamRxCfg = QamRxCfg
     -- one amplitude.  What it does cost is pull-in: @sin@ turns over at
     -- ninety degrees where 'atan2' holds its sign to a hundred and
     -- eighty, so this is for a loop that is tracking, not acquiring.
+  , qrAgcStep :: !(Maybe (Double, Double))
+    -- ^ follow a step in the far end's level: (dB between the recent
+    -- symbols' mean power and the longer run's at which the loops stop
+    -- training, dB at which the gain takes the recent mean outright).
+    -- 'Nothing' is a gain that only ever moves at its own rate.
+    --
+    -- A slow gain is what a dense constellation needs, and it is exactly
+    -- wrong for a level that changes at once.  Through the bench's ATA
+    -- the far end's level falls by 6 dB -- a factor of two, inside five
+    -- milliseconds -- at an unpredictable moment on most calls.  With the
+    -- gain taking a third of a second to follow, every point of a
+    -- sixteen-point constellation lands on a different one for that
+    -- long, the decision-directed carrier loop and equaliser train on
+    -- the wrong answers, and the four points of the 1200 bit/s phase,
+    -- halved and turned 27 degrees, fit the inner ring well enough to be
+    -- locked to.  The receiver then spun at 10 Hz for the rest of the
+    -- call.
+    --
+    -- Windows rather than a second, faster exponential mean.  Sixteen
+    -- points put their power on three rings, and a mean over a few dozen
+    -- of them runs 3 dB low often enough that a gain snapping to one
+    -- threw away a call that had been locked.  The last 12 symbols
+    -- against the 48 before them hold the loops within about seven
+    -- symbols of a 6 dB step, at 3.5 standard deviations of the ring
+    -- noise; the last 24 against the 48 before at 4 dB is eight, and a
+    -- real step crosses it in sixteen.  After a snap the history starts
+    -- again from the new level, so one step is taken once.
   , qrTrainTruth :: !Bool
     -- ^ while the truth queue ('qamRxTruth') is live, train the loops on
     -- it as 'qamRxRef' would, and adapt the equaliser regardless of
@@ -251,7 +278,8 @@ defaultRxCfg slice point = QamRxCfg
   , qrSteerAt = 2, qrAdaptAt = 3, qrAdaptRun = maxBound
   , qrFreqFf = 0, qrFreqFfRun = maxBound
   , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True
-  , qrGateAtOnce = False, qrPhaseCross = False, qrTrainTruth = False }
+  , qrGateAtOnce = False, qrPhaseCross = False, qrTrainTruth = False
+  , qrAgcStep = Nothing }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -392,6 +420,11 @@ data QamRxState = QamRxState
   , rxSps     :: !Double
   , rxPrevSym :: !(Double, Double)
   , rxPower_  :: !Double
+  , rxPowHist :: [Double]   -- ^ 'qrAgcStep''s recent symbol powers, newest first
+  , rxEqPowHist :: [Double] -- ^ ...and the equaliser's output powers, which show the constellation's rings
+  , rxLoopHist :: [(Double, Double)] -- ^ the carrier loop's (phase, frequency) over the last symbols, newest first
+  , rxStepping :: !Bool     -- ^ 'qrAgcStep' held the loops on the last symbol
+  , rxSinceHold :: !Int     -- ^ symbols since it last did
   , rxTheta   :: !Double
   , rxFreq    :: !Double
   , rxEqRe    :: !Signal
@@ -448,7 +481,7 @@ qamRxInitWith p cfg seed = QamRxState
   , rxHistRe = VS.replicate hist 0, rxHistIm = VS.replicate hist 0
   , rxPrevRe = VS.replicate carry 0, rxPrevIm = VS.replicate carry 0
   , rxTau = fromIntegral carry + srTau0 seed, rxSps = sps
-  , rxPrevSym = srPrev0 seed, rxPower_ = srPower0 seed
+  , rxPrevSym = srPrev0 seed, rxPower_ = srPower0 seed, rxPowHist = [], rxEqPowHist = [], rxLoopHist = [], rxStepping = False, rxSinceHold = maxBound `div` 2
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
@@ -552,6 +585,11 @@ qamRxPrevSym = rxPrevSym
 agcSettleSyms :: Int
 agcSettleSyms = 512
 
+-- | How far back 'qrAgcStep' puts the carrier loop when it holds it:
+-- further than a step takes to be seen.
+stepRewind :: Int
+stepRewind = 8
+
 -- | Whether the timing loop has narrowed: see 'qrTrackAt'.  For tests
 -- and for tracing, where it is the first thing to ask of a receiver
 -- that is reading the line well and still getting the answer wrong.
@@ -652,7 +690,75 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- gets down to where a lock would be declared, because the
               -- fast estimate is most of the error.
               pwA = if rxSyms st >= agcSettleSyms then qrAgcSettled cfg else qrAgcRate cfg
-              pw = (1 - pwA) * rxPower_ st + pwA * (yr * yr + yi * yi)
+              pw0 = (1 - pwA) * rxPower_ st + pwA * (yr * yr + yi * yi)
+              -- Kept whether or not this configuration watches it, so a
+              -- receiver whose configuration changes -- V.22 moving from
+              -- four-way to sixteen-way training, say -- has a history
+              -- to judge a step by the moment it starts to.
+              h = take 72 ((yr * yr + yi * yi) : rxPowHist st)
+              (powHist, pw, stepping) = case qrAgcStep cfg of
+                Nothing -> (h, pw0, False)
+                Just (holdDb, snapDb) ->
+                  let mean xs = sum xs / fromIntegral (max 1 (length xs))
+                      dB a b = if a > 1e-12 && b > 1e-12 then abs (10 * logBase 10 (a / b)) else 0
+                      full = length h >= 72
+                      -- The snap waits for a level that has lasted 48
+                      -- symbols.  The loops hold at once, but a gain hit --
+                      -- a dip that is back within 50 ms -- is not a new
+                      -- level, and a gain snapped down to one and then back
+                      -- up again spent a hundred symbols reading the wrong
+                      -- rings.
+                      before = take 24 (drop 48 h)
+                      recent48 = take 48 h
+                      recent24 = mean recent48
+                      settledNew = spreadDb recent48 < snapDb / 2
+                      recent12 = mean (take 12 h)
+                      before12 = take 48 (drop 12 h)
+                      -- How much the symbols' power spreads by itself.  Four
+                      -- points of one amplitude hardly spread at all, and a
+                      -- step shows on them within three symbols at 1.5 dB;
+                      -- sixteen points on three rings need the full margin.
+                      -- how far the 48 run's first and second halves disagree
+                      spreadDb xs = dB (mean (take 24 xs)) (mean (drop 24 xs))
+                      spread xs = let m = mean xs
+                                  in if m <= 0 then 1 else sqrt (mean [ (x - m) * (x - m) | x <- xs ]) / m
+                      -- Judged after the equaliser: before it, the pulses
+                      -- smear into each other and four points of one
+                      -- amplitude spread as much as 0.37.
+                      constant = length (rxEqPowHist st) >= 48 && spread (rxEqPowHist st) < 0.2
+                      holdAt = if constant then min holdDb 1.5 else holdDb
+                      snapAt = if constant then min snapDb 3 else snapDb
+                      -- Past 10 dB it is not a step: it is the carrier
+                      -- going, and a gain snapped up to follow a far end
+                      -- that has hung up frames its own noise as text.
+                      within lo x = x >= lo && x < 10 && not gap
+                      -- A dropout is not a step either.  Silence in any of
+                      -- the windows makes them straddle two things that are
+                      -- both the same level, and holding the loops through
+                      -- every one of a line's dropouts, or snapping the gain
+                      -- to half a window of nothing, lost more than the
+                      -- dropouts did.
+                      gap = let quarters xs = case splitAt 4 xs of
+                                  (q, rest) | length q == 4 -> mean q : quarters rest
+                                  _ -> []
+                                ref = mean (take 72 h)
+                            in any (\q -> q < ref / 16) (quarters (take 72 h))
+                  in if full && settledNew && within snapAt (dB recent24 (mean before)) then (take 48 h, recent24, True)
+                     else (h, pw0, length h >= 60 && (within holdAt (dB recent12 (mean before12)) || quick))
+                  where
+                    -- On a constant amplitude two symbols are enough to
+                    -- see it, and they have to be: a block of sixteen-way
+                    -- decisions on four points at half their amplitude
+                    -- turned the carrier 24 degrees, which on those four
+                    -- points is a lock of its own.
+                    quick = let hh = take 72 ((yr * yr + yi * yi) : rxPowHist st)
+                                b = take 48 (drop 4 hh)
+                                eh = rxEqPowHist st
+                                m xs = sum xs / fromIntegral (max 1 (length xs))
+                                sp = let mm = m eh in if mm <= 0 then 1 else sqrt (m [ (x - mm) * (x - mm) | x <- eh ]) / mm
+                                d = let a = m (take 4 hh); c = m b in if a > 1e-12 && c > 1e-12 then abs (10 * logBase 10 (a / c)) else 0
+                                silent = any (< m b / 16) [m (take 4 hh), m (take 4 (drop 4 hh))]
+                            in length b >= 48 && length eh >= 48 && sp < 0.2 && d >= 2 && d < 10 && not silent
               eRaw = ((yr - pr) * hr + (yi - pim) * hi) / max 1e-9 pw
               e = if pw < 1e-5 then 0 else max (negate (qrClamp cfg)) (min (qrClamp cfg) eRaw)
               -- Acquiring and tracking, at two bandwidths.
@@ -788,16 +894,30 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- those would never converge at all.  So the lock has to
               -- mean converged -- 'qrLockAt', not 'qrEvmFreeze' -- and
               -- not merely "still adapting".
-              good = (not (rxLocked st) && not (qrGateAtOnce cfg)) || err2 < qrLoopGate cfg
+              good = not stepping && ((not (rxLocked st) && not (qrGateAtOnce cfg)) || err2 < qrLoopGate cfg)
               -- Guarded on the weight rather than multiplied by it, so
               -- a receiver with none is bit for bit what it was.
               freqFf | qrFreqFf cfg > 0 && locked && stepRun < qrFreqFfRun cfg
                          = (1 - qrFreqFf cfg) * rxFreq st + qrFreqFf cfg * dev
                      | otherwise = rxFreq st
-              freq' = if locked && qrTrack cfg && good then freqFf + qrThKi cfg * phErr else rxFreq st
+              -- A step is seen a few symbols after it lands, and those
+              -- few have already steered the loop: on the bench a 6 dB
+              -- drop turned the carrier 12 to 33 degrees before any
+              -- window could call it a step.  So the hold, when it
+              -- begins, puts the loop back where it was before them,
+              -- carried forward at the frequency it had then.
+              -- Only over symbols that steered freely: rewinding into a
+              -- stretch that was itself held, or half-held, undoes the
+              -- corrections made between two holds, and on a line with a
+              -- dropout a second that was most of the carrier's tracking.
+              rewind = stepping && not (rxStepping st) && rxSinceHold st >= stepRewind
+              (thBase, freqBase) = case drop (stepRewind - 1) (rxLoopHist st) of
+                ((t0, f0) : _) | rewind -> (wrapPi (t0 + fromIntegral stepRewind * f0), f0)
+                _ -> (th, rxFreq st)
+              freq' = if locked && qrTrack cfg && good then freqFf + qrThKi cfg * phErr else freqBase
               theta' | not locked = th
                      | qrTrack cfg && good = wrapPi (th + freq' + qrThKp cfg * phErr)
-                     | otherwise = wrapPi (th + freq')
+                     | otherwise = wrapPi (thBase + freq')
 
               -- The start-up signals are one point, or two alternating:
               -- their autocorrelation is singular and an LMS equaliser
@@ -866,7 +986,9 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               bad = if qrAdapt cfg && locked && evm > badAt then rxBad st + 1 else 0
               st1 = st { rxTau = tau'
                        , rxSps = max (0.9 * nominalSps) (min (1.1 * nominalSps) sps')
-                       , rxPrevSym = (yr, yi), rxPower_ = pw
+                       , rxPrevSym = (yr, yi), rxPower_ = pw, rxPowHist = powHist, rxEqPowHist = take 48 ((ur * ur + ui * ui) : rxEqPowHist st)
+                       , rxLoopHist = take stepRewind ((theta', freq') : rxLoopHist st), rxStepping = stepping
+                       , rxSinceHold = if stepping then 0 else min (maxBound `div` 2) (rxSinceHold st + 1)
                        , rxTheta = theta', rxFreq = freq'
                        , rxEqRe = eqRe', rxEqIm = eqIm'
                        , rxLineRe = lineRe, rxLineIm = lineIm

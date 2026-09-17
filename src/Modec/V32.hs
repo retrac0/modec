@@ -70,6 +70,7 @@ module Modec.V32
   , v32Rates
   , v32bisRates
   , rateSeqV32bis
+  , describeRateSeq
   , rateSeqBits
   , eSeqBits
   , decodeRateSeq
@@ -663,6 +664,12 @@ rateSeqCleardown r = not (or [ rsCan2400 r, rsCan4800 r, rsCan9600 r
 -- modem announces itself, and a plain V.32 modem cannot say it by
 -- accident -- B4 means "can receive 2400 bit/s" to V.32, a rate 2.4.3
 -- leaves for further study and no modem implements.
+-- | A rate signal as the rates it carries, for logs and traces.
+describeRateSeq :: RateSeq -> String
+describeRateSeq r = unwords (["4800" | rsCan4800 r] ++ ["7200" | rsCan7200 r] ++ ["9600" | rsCan9600 r]
+                             ++ ["tcm" | rsTrellis r] ++ ["12000" | rsCan12000 r] ++ ["14400" | rsCan14400 r]
+                             ++ ["(V.32bis)" | rateSeqV32bis r])
+
 rateSeqV32bis :: RateSeq -> Bool
 rateSeqV32bis r = rsCan2400 r && rsTrellis r
 

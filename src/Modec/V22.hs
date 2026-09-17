@@ -49,6 +49,7 @@ module Modec.V22
   , v22RxSetRate
   , v22RxSetCoherentGains
   , rxSpsEstimate
+  , v22RxQam
   , rxEvmEstimate
   , decisionMargin
   , rxOnes2400Run
@@ -335,6 +336,12 @@ v22RxCfg rate tu = (defaultRxCfg (sliceGrid rate) pointOfIndex)
   , qrFreqFf = ff, qrFreqFfRun = 16
   , qrRestartOn = \t -> qtStep t == 3 && qtStepRun t == 92
   , qrResetLine = False
+    -- At 1200 the gain is already fast enough to follow a step itself.
+    -- At 2400 it is not, and the bench's ATA drops the far end's level by
+    -- 6 dB at an unpredictable moment on most calls: see 'qrAgcStep'.
+  , qrAgcStep = case rate of
+      R1200 -> Nothing
+      R2400 -> Just (3.5, 4)
   }
   where
     agc = case rate of { R1200 -> 0.05; R2400 -> 0.005 }
@@ -403,6 +410,10 @@ v22RxSetCoherentGains (a, b, c) st =
 -- | Switch the decision rate (the handshake does this after S1).
 v22RxSetRate :: Rate -> V22RxState -> V22RxState
 v22RxSetRate r st = st { rxRate = r, rxOnes2400 = 0 }
+
+-- | The QAM receiver underneath (for tracing).
+v22RxQam :: V22RxState -> QamRxState
+v22RxQam = rxQam
 
 -- | Tracked coherent decision error power (for tracing).
 rxEvmEstimate :: V22RxState -> Double

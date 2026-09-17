@@ -33,6 +33,7 @@ library
                       Modec.Fixture
                       Modec.Loopback
                       Modec.Session
+                      Modec.Cushion
                       Modec.Telnet
                       Modec.Async
                       Modec.Baudot
@@ -124,6 +125,7 @@ test-suite modec-test
                       Suite.Sample
                       Suite.Voice
                       Suite.Session
+                      Suite.Cushion
                       Suite.Tones
                       Suite.Tools
                       Suite.V22

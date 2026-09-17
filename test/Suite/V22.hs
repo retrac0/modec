@@ -88,6 +88,45 @@ v22Tests = testGroup "V.22 data pump" $
       forM_ [ ("clean", id), ("SNR 15", applyChannel fs (telephoneChannel 15))
             , ("delay 3 ms", applyChannel fs idealChannel { chDelayDist = 3 }), ("freq +7", applyChannel fs idealChannel { chFreqOffsetHz = 7 }) ] $ \(name, f) ->
         assertEqual (name ++ " bit errors") 0 (errs (f clean))
+  -- The bench's ATA drops the far end's level by 6 dB, inside five
+  -- milliseconds, at an unpredictable moment on most calls.  At 2400 the
+  -- gain is slow on purpose, and before 'qrAgcStep' a step like that
+  -- turned the carrier onto the wrong fit and spun it: two answer calls
+  -- in eight on one bench run, and a V.22bis call that had connected
+  -- losing everything after the step.  Both places it lands are here --
+  -- on the four points of the 1200 bit/s phase with the receiver already
+  -- deciding sixteen ways, and in the middle of data.
+  , testCase "2400 bit/s through a 6 dB fall in level, before the constellation widens and during data" $ do
+      let fs = 8000
+          fr = framing8N1
+          payload = take 6000 prbs
+          (stPre, pre) = v22TxBlock fs HighChannel fr 0.5 False R1200 TxScrambledOnes [] 9600 v22TxInit
+          dataBlocks st bs
+            | null bs && null (txBitsOf st) = [snd (v22TxBlock fs HighChannel fr 0.5 False R2400 TxScrambledOnes [] 400 st)]
+            | otherwise = let (st', sig) = v22TxBlock fs HighChannel fr 0.5 False R2400 TxScrambledData [] 160 (withBits st (take 2000 bs)) in sig : dataBlocks st' (drop 2000 bs)
+          clean = pre VS.++ VS.concat (dataBlocks stPre payload)
+          stepAt k = VS.imap (\i v -> if i >= k then v * 0.5 else v)
+          decode sig =
+            let chunks v | VS.null v = [] | otherwise = VS.take 160 v : chunks (VS.drop 160 v)
+                run _ _ [] = []
+                run i st (c : cs) = let st1 = if i == (30 :: Int) then v22RxSetRate R2400 st else st
+                                        (st', o) = v22RxBlock fs HighChannel c st1 in o : run (i + 1) st' cs
+            in concatMap roBits (drop 30 (run 0 (v22RxInit fs) (chunks sig)))
+          -- errors per 400 bits of payload, at the best alignment; the
+          -- receiver's 1200 bit/s lead-in puts the payload about 1500
+          -- decoded bits in
+          windows got = let errsAt o = [ length (filter id (zipWith (/=) (take 400 (drop k payload)) (take 400 (drop (k + o) got)))) | k <- [0, 400 .. 5600] ]
+                        in snd (minimum [ (sum ws, ws) | o <- [0 .. 2000], let ws = errsAt o ])
+          line = applyChannel fs (telephoneChannel 25)
+      -- the four-point phase ends 9600 samples in, and data's step lands
+      -- 2400 bits into the payload
+      forM_ [ ("during the four-point phase", stepAt 8000, 0), ("during data", stepAt (9600 + 8000), 8) ] $ \(name, f, clearFrom) -> do
+        let ws = windows (decode (line (f clean)))
+        -- What a step costs is the symbols the loops were held through,
+        -- a few dozen bits; without the step-aware gain the first case
+        -- lost 629 and the second never came back.
+        assertBool (name ++ ": errors per 400 bits " ++ show ws) (sum ws < 200)
+        assertEqual (name ++ ": errors once it has passed") 0 (sum (drop (clearFrom + 1) ws))
   , testCase "unscrambled ones and S1 are recognised" $ do
       let (_, u11) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxU11 [] 4000 v22TxInit
           (_, s1) = v22TxBlock 8000 HighChannel framing8N1 0.5 False R1200 TxS1 [] 4000 v22TxInit
@@ -111,3 +150,8 @@ v22Tests = testGroup "V.22 data pump" $
   ]
   where
     bits = [ odd ((i * 7919 + 13) `div` 3 + i `div` 7) | i <- [1 .. 3000 :: Int] ]
+    -- A shift-register sequence: the pattern above repeats often enough
+    -- that a long lead-in lines up with the wrong copy of itself.
+    prbs = go (0xACE1 :: Int)
+      where go r = let b = (r + r `div` 4 + r `div` 8 + r `div` 32768) `mod` 2
+                   in odd r : go (r `div` 2 + b * 32768)

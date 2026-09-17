@@ -10,6 +10,7 @@ import Test.Tasty
 import Corpus
 import Suite.Channel
 import Suite.Classify
+import Suite.Cushion
 import Suite.LiveChannel
 import Suite.Dsp
 import Suite.Fsk
@@ -49,7 +50,7 @@ main = do
     , testGroup "error correction"
         [hdlcTests, mnpFrameTests, mnpTests, mnpModemTests, mnpFieldTests]
     , testGroup "around the modem"
-        [hayesTests, baresipTests, pipewireTests, sessionTests, voiceTests, hermeticTests]
+        [hayesTests, baresipTests, pipewireTests, sessionTests, cushionTests, voiceTests, hermeticTests]
     , testGroup "tones as meaning"
         [ttyTests, dtmfTests, progressTests]
     -- What answered a call, read from the audio rather than taken from

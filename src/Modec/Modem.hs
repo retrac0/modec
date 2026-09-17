@@ -13,6 +13,7 @@ module Modec.Modem
   , modemStep
   , modemStatus
   , RetrainCause (..)
+  , ratesLine
   , V32Entry (..)
   , modemConnected
   , modemV32Evm
@@ -56,7 +57,7 @@ import Modec.Handshake
 import Modec.Standards
 import Modec.Stream
 import Modec.V22
-import Modec.V32 (RateSeq (..), rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
+import Modec.V32 (RateSeq (..), describeRateSeq, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
 import Modec.QAM (QamSym, qamRxPower, qamRxTaps, qamRxFreq, qamRxSps, qamRxEvm)
 import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataInStep, v32DataReading, v32DataRxState, v32DataTxState)
 import Modec.V32Start
@@ -79,6 +80,7 @@ data ModemConfig = ModemConfig
   , mcMaxEvmV32 :: Double  -- ^ stop passing bytes when the decision error exceeds this much of the constellation's own margin
   , mcMinPowerV32 :: Double  -- ^ below this received power the V.32 carrier is gone
   , mcRetrainMax :: Int    -- ^ how many retrains one call may spend before giving up
+  , mcRetrainLimit :: Double -- ^ seconds one retrain may take before the call is given up
   , mcProbe    :: Bool     -- ^ measure an echo path instead of placing a call
   , mcAnsReversals :: Bool -- ^ V.25 phase reversals on the answer tone; see 'v32AnsReversals'
   , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols ('aidB1').  Off: it predicts B1 exactly and does not reliably help; see the measurement in docs/reference-modem.md
@@ -111,6 +113,11 @@ defaultModemConfig fs role modes = ModemConfig
   -- A line bad enough to want a fifth retrain is not going to be fixed
   -- by one; past this the call is over.
   , mcRetrainMax = 4
+  -- Each retrain measured on the bench took 9 to 11 s.  One that cannot
+  -- finish otherwise runs every phase of Figure 4 to its own timeout,
+  -- which added up to 33 s of silence with the terminal told nothing,
+  -- and on a call stepping down that was most of a minute of nothing.
+  , mcRetrainLimit = 20
   , mcProbe = False
   , mcAnsReversals = True
   , mcAidB1 = False
@@ -131,6 +138,13 @@ data ModemEvent
   | EvMnp MnpEvent         -- ^ the error-correcting protocol's state
   | EvRetrain RetrainCause -- ^ 5.5: the link is being trained again
   | EvRate V32Rate         -- ^ a retrain settled on a different rate
+  | EvRates RateSeq (Maybe RateSeq) V32Rate
+    -- ^ a V.32 start-up or retrain finished: what we offered, the far
+    -- end's last rate signal, and the rate the two came to.  Without it
+    -- a call log says where a call landed and never why, and the bench
+    -- could not tell a far end that stopped offering 7200 from a modem
+    -- that stopped choosing it.
+
   deriving (Eq, Show)
 
 data Mode
@@ -165,7 +179,15 @@ data Held = Held
   , hdFramer :: !AsyncRx
   , hdCount  :: !Int
   , hdWhy    :: !RetrainCause
+  , hdSamples :: !Int       -- ^ how long this retrain has run
   }
+
+-- | 'EvRates' for a call log.
+ratesLine :: RateSeq -> Maybe RateSeq -> V32Rate -> String
+ratesLine ours theirs r =
+  "rates: offered " ++ describeRateSeq ours
+  ++ "; far end " ++ maybe "sent no rate signal we read" describeRateSeq theirs
+  ++ "; running at " ++ show (rateBitRate r) ++ " bit/s"
 
 -- | Why a retrain started, for tracing and for deciding when to stop
 -- trying.
@@ -620,7 +642,8 @@ modemStep cfg st0 rxBlock newBytes =
                  st2 = st1 { msMode = DataV32 (hcRole hs) r pump (asyncRxInit (mcFraming cfg)) False
                            , msStatus = HsConnected std link, msSettled = 0
                            , msMnp = mnpFor cfg link }
-             in (st2, audio, [], [EvConnected std link])
+                 (ours, theirs) = v32Negotiated s32'
+             in (st2, audio, [], [EvConnected std link, EvRates ours theirs r])
            -- Nothing took the offer up, and there is a ladder waiting.
            --
            -- The handshake was never torn down -- it was simply not
@@ -733,7 +756,7 @@ modemStep cfg st0 rxBlock newBytes =
           -- carrier watchdog's: that one asks whether the far end is
           -- still there, this one whether we can still understand it.
           bad' = if present && not trust then msBad st + 1 else 0
-          held = Held role rate pump' framer' (msRetrains st) RetrainLocal
+          held = Held role rate pump' framer' (msRetrains st) RetrainLocal 0
           -- 5.5.  Either end may ask, and the far end asking is a tone
           -- where a data signal never puts one.  Ours is a receiver that
           -- has spent a second unable to read a line that is plainly
@@ -792,8 +815,16 @@ modemStep cfg st0 rxBlock newBytes =
       let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
           (s32', audio, status) = v32StartStep s32 rxClean
           st1 = st { msEcho = pushEcho audio echo' }
+          held' = held { hdSamples = hdSamples held + n }
+          overdue = fromIntegral (hdSamples held') / fs > mcRetrainLimit cfg
       in case status of
-           V32Busy -> (st1 { msMode = Retrain32 s32' held }, audio, [], [])
+           V32Busy | overdue ->
+             (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }
+             , audio, []
+             , [ EvFailed ("retrain did not finish in " ++ show (round (mcRetrainLimit cfg) :: Int)
+                           ++ " s (stuck in " ++ show (v32Phase s32') ++ ")")
+               , EvDropped ])
+           V32Busy -> (st1 { msMode = Retrain32 s32' held' }, audio, [], [])
            V32Connected r ->
              let role = hdRole held
                  link = V32Link role r
@@ -802,7 +833,8 @@ modemStep cfg st0 rxBlock newBytes =
                  st2 = st1 { msMode = DataV32 role r pump (hdFramer held) False
                            , msStatus = HsConnected (if v32Bis s32' then V32bis else V32) link
                            , msSettled = 0, msBad = 0 }
-             in (st2, audio, [], [EvRate r | r /= hdRate held])
+                 (ours, theirs) = v32Negotiated s32'
+             in (st2, audio, [], [EvRate r | r /= hdRate held] ++ [EvRates ours theirs r])
            V32Failed why ->
              (st1 { msMode = Finished, msStatus = HsDropped, msTxCmd = TxSilence }
              , audio, [], [EvFailed why, EvDropped])

@@ -34,6 +34,7 @@ import System.IO
 import System.Process
 import System.Posix.IO (OpenMode (..), defaultFileFlags, fdToHandle, openFd)
 import System.Posix.Signals (Handler (..), installHandler, sigTERM)
+import GHC.Clock (getMonotonicTime)
 
 import CallLog
 import Modec.Link
@@ -58,6 +59,7 @@ import Modec.V22 (rxEvmEstimate, rxOnes2400Run, rxSpsEstimate)
 import Modec.Telnet
 import Modec.Sample
 import Modec.Session
+import Modec.Cushion
 import Serial (withSerial)
 import Pty (PtyPort (..), withPty)
 import Data.Char (toUpper)
@@ -387,12 +389,65 @@ runModem o = do
               (True, Nothing) -> readIORef blockRef >>= (writeIORef noiseT0 . Just)
               (False, Just _) -> writeIORef noiseT0 Nothing
               _ -> return ()
+      -- MODEC_IO_STATS: every five seconds, how the audio clock has
+      -- behaved -- samples read against the wall clock, and the longest
+      -- the loop waited on a read and on a write.  A playback stream
+      -- that stops consuming shows as writes that block; a capture that
+      -- stalls, as a long read.
+      cushionRef <- newIORef (Nothing :: Maybe Cushion)
+      ioStats <- (/= Nothing) <$> lookupEnv "MODEC_IO_STATS"
+      ioRef <- newIORef (0 :: Int, 0 :: Double, 0 :: Double, 0 :: Double)
+      ioT0 <- getMonotonicTime
+      ioLast <- newIORef ioT0
+      let timed sel act
+            | not ioStats = act
+            | otherwise = do
+                a <- getMonotonicTime
+                r <- act
+                b <- getMonotonicTime
+                modifyIORef' ioRef (sel (b - a))
+                return r
+          ioReport n = when ioStats $ do
+            now <- getMonotonicTime
+            lastT <- readIORef ioLast
+            when (now - lastT >= 5) $ do
+              writeIORef ioLast now
+              (samples, rdMax, wrMax, wrSum) <- readIORef ioRef
+              writeIORef ioRef (samples, 0, 0, 0)
+              lvl <- (>>= cushionLevel) <$> readIORef cushionRef
+              logMsg (printf "io: %.1f s wall, %.3f s of samples read (%+.0f ms), longest read %.0f ms, longest write %.0f ms, writes %.0f ms in all%s"
+                        (now - ioT0) (fromIntegral samples / fs :: Double)
+                        ((fromIntegral samples / fs - (now - ioT0)) * 1000 :: Double)
+                        (rdMax * 1000) (wrMax * 1000) (wrSum * 1000)
+                        (maybe "" (printf ", transmit cushion %+.0f ms from where it settled" . (* 1000)) lvl :: String) :: String)
+            modifyIORef' ioRef (\(c, r, w, ws) -> (c + n, r, w, ws))
+      -- The cushion laid down above holds only while capture delivers
+      -- every sample the graph clock does, and on PipeWire it does not:
+      -- see "Modec.Cushion".  Pipes and serial ports are paced by their
+      -- peer, and have no graph clock to fall behind.
+      let keepCushion = case moAudio o of
+            AudioPipewire {} -> True
+            AudioSipLoop _ -> True
+            _ -> False
       let readBlock = do
-            x0 <- aiRead ai blockN
+            began <- getMonotonicTime
+            x0 <- timed (\d (c, r, w, ws) -> (c, max r d, w, ws)) (aiRead ai blockN)
+            returned <- getMonotonicTime
+            ioReport (VS.length x0)
             p <- readIORef primed
             unless p $ do
               writeIORef primed True
               aiWrite ai lead
+              when keepCushion $ writeIORef cushionRef (Just (cushionInit returned))
+            when keepCushion $ do
+              mcu <- readIORef cushionRef
+              forM_ mcu $ \cu -> do
+                let (extra, cu') = cushionStep defaultCushionParams fs began returned (VS.length x0) cu
+                writeIORef cushionRef (Just cu')
+                when (extra > 0) $ do
+                  aiWrite ai (VS.replicate extra 0)
+                  say (printf "transmit cushion: capture came up %.0f ms short; the same again in silence went to playback"
+                         (fromIntegral extra * 1000 / fs :: Double))
             mc <- readIORef callRef
             markCall (maybe False (const True) mc)
             x <- if fst (moLineDir o) then through rxLine x0 else return x0
@@ -406,7 +461,7 @@ runModem o = do
             mapM_ (\w -> wavAppend w x) recTx
             mc <- readIORef callRef
             mapM_ (\c -> callRecWriteTx c x) mc
-            aiWrite ai x
+            timed (\d (c, r, w, ws) -> (c, r, max w d, ws + d)) (aiWrite ai x)
           closeRecordings = endCall >> mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
           -- the peer closed a FIFO).  Try to put it back a few times
@@ -512,6 +567,7 @@ runModem o = do
               RetrainLocal -> "this receiver could not read the line"
               RetrainFarEnd -> "the far end asked")
             EvRate r -> say ("now running at " ++ show (rateBitRate r) ++ " bit/s")
+            EvRates ours theirs r -> say (ratesLine ours theirs r)
       -- One loop, in Modec.Session.  What a plain call and a Hayes
       -- session disagree about is a Controller, and the line state is
       -- the same in both: a plain call is a session that starts in
@@ -775,6 +831,7 @@ runModem o = do
                   -- Modec.Modem and never this.
                   EvRetrain _ -> return ()
                   EvRate _ -> return ()
+                  EvRates {} -> return ()
 
               onProgress e = when (refused (peKind e)) $ do
                 detects <- hayesDetectsBusy <$> readIORef hayesRef

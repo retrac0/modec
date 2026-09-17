@@ -627,6 +627,7 @@ describeEvent e = case e of
   -- renderer of this type must be total; there is more than one of them.
   EvRetrain _ -> "retraining"
   EvRate r -> "now " ++ show (rateBitRate r) ++ " bit/s"
+  EvRates ours theirs r -> ratesLine ours theirs r
 
 replaySpec :: ReplayOpts -> CallSpec
 -- | The fixture spec a replay is running under.  'mint' fills in what

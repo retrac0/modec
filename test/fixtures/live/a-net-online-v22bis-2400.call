@@ -7,7 +7,9 @@
 # So this fixture pins two things at once -- that the banner decodes, and
 # that the junk behind it stays the length it is now.  See
 # docs/robustness.md; 140 bytes became 60 when the decision-error gate
-# went in, and it should not go back up.
+# went in, and it should not go back up.  It came down again, from 143
+# bytes of decode to 124, when the 2400 bit/s gain learned to follow a
+# step in level (Modec.QAM, qrAgcStep); the banner itself is unchanged.
 #
 # Re-minted when the V.22bis receiver's gain stopped chasing its own
 # data (see Modec.V22): the banner is identical and the expect: line
