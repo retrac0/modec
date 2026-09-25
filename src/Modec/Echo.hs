@@ -37,6 +37,7 @@ module Modec.Echo
   , echoPush
   , echoBlock
   , echoBlockData
+  , echoScanStep
   , echoSetFar
   , echoSearch
   , echoAim
@@ -152,6 +153,7 @@ data EchoState = EchoState
   , esRxBpN  :: !Int
   , esRefFir :: !Signal       -- ^ the band-pass's history on the reference
   , esRxFir  :: !Signal       -- ^ and on the line
+  , esEstimated :: !Bool      -- ^ an estimate has been taken since the filter was last aimed
   }
 
 -- | The scan and the estimate read band-limited copies of both
@@ -208,7 +210,7 @@ echoInit cfg = EchoState
   , esEchoP = 0, esResP = 0, esEchoY = 0, esOn = False
   , esRxHist = VS.empty, esFound = Nothing, esScan = Nothing, esVote = Nothing, esEst = Nothing, esLast = (0, 0, 0, 0)
   , esVotes = [], esRefBp = [], esRefBpN = 0, esRxBp = [], esRxBpN = 0
-  , esRefFir = VS.replicate 64 0, esRxFir = VS.replicate 64 0 }
+  , esRefFir = VS.replicate 64 0, esRxFir = VS.replicate 64 0, esEstimated = False }
 
 -- | Remember a block we have just transmitted.  Called at the end of a
 -- modem step, with the audio that step produced.
@@ -324,6 +326,23 @@ echoBlockData :: EchoConfig -> Signal -> EchoState -> (EchoState, Signal)
 echoBlockData cfg rx st0
   | ecFarSearch cfg <= 0 = echoRun cfg EchoHold rx st0
   | otherwise = let (st1, out) = echoRun cfg EchoData rx st0 in (stepScan cfg st1, out)
+
+-- | Go on looking for a late reflection while the start-up is still
+-- running, without adapting to it: one block of the data-mode search.
+--
+-- The search needs seconds -- a two-second window and a scan of every
+-- lag to 900 ms -- and in data mode it started from nothing when the
+-- data did.  On a 14400 call modec placed through the bench that was
+-- six seconds of data with our own echo 20 dB under the far end's
+-- signal, which is the receiver's whole margin at that rate.  The last
+-- phases of the start-up already carry both ends talking and our own
+-- signal aperiodic (the rate signal and E are scrambled), which is all
+-- the search asks for.  Call it after 'echoBlock', which keeps the
+-- histories it reads.
+echoScanStep :: EchoConfig -> EchoState -> EchoState
+echoScanStep cfg st
+  | ecFarSearch cfg <= 0 = st
+  | otherwise = stepScan cfg st
 
 data EchoMode = EchoQuiet | EchoHold | EchoData deriving (Eq)
 
@@ -522,8 +541,15 @@ finishScan cfg st sc
     -- is right and gets moved by two noise peaks in a row would drop
     -- taps that were cancelling something, which is worth asking for
     -- more evidence before doing.
-    agreed | esFound st == Nothing = length [ v | v <- take 3 votes, abs (v - bestLag) <= 4 ] >= 2
+    agreed | esFound st == Nothing = length [ v | v <- take 3 votes, abs (v - bestLag) <= 4 ] >= 2 || unmistakable
            | otherwise = length [ v | v <- votes, abs (v - bestLag) <= 4 ] >= 3
+    -- One scan is enough when the peak is nothing a noise peak looks
+    -- like.  The reflection on the bench's 14400 calls scored nine times
+    -- the mean and nearly twice the best lag anywhere else, on its first
+    -- scan; waiting for a second to agree cost two seconds of data at a
+    -- 20 dB echo.  The noise peaks that made the vote necessary came in
+    -- under 1.5 times their rival.
+    unmistakable = best > 8 * avg && best > 1.7 * rival
     showing = best > ecPeak cfg * avg && avg > 0 && best > 1.25 * rival
               && bestLag > scLo sc + edge && bestLag < ecFarSearch cfg - edge
     moved = maybe True (\f -> abs (f - bestLag) > 4) (esFound st1)
@@ -569,7 +595,7 @@ tapOf sc d0 k =
           in if nsq' <= 0 then 0 else dt' / nsq'
 
 finishEst :: EchoConfig -> Scan -> [(Int, Double)] -> EchoState -> EchoState
-finishEst cfg sc done st = st { esTaps = taps' }
+finishEst cfg sc done st = st { esTaps = taps', esEstimated = True }
   where
     w = VS.length (scRxC sc)
     d0 = esDelay st
@@ -614,7 +640,17 @@ finishEst cfg sc done st = st { esTaps = taps' }
     -- of the weight each time means the noise of a dozen scans adds up
     -- to a twelfth of one -- which is the difference between a filter
     -- that removes the echo and one that does not.
-    taps' | VS.all (== 0) old = fresh
+    --
+    -- "Whole" used to mean "while the taps are all zero", and they are
+    -- not zero for long: the slow update starts the block the filter is
+    -- aimed, and the estimate takes eight blocks to read.  So the first
+    -- estimate went in at a quarter of its weight, averaged against
+    -- eight blocks of an update that had barely begun, and the filter
+    -- crept towards the echo over tens of seconds -- on a 14400 call
+    -- modec placed through the bench it was predicting half the echo
+    -- at 40 s, and the receiver sat at 19.5 dB where the echo removed
+    -- gives 25.  The first estimate after an aim is now taken whole.
+    taps' | not (esEstimated st) = fresh
           | otherwise = VS.zipWith (\a b -> 0.75 * a + 0.25 * b) old fresh
 
 -- | The normalised correlation of one lag of the reference against a
@@ -734,7 +770,7 @@ echoAim :: EchoConfig -> Int -> EchoState -> EchoState
 echoAim cfg l st = st
   { esDelay = max (ecDelay cfg) (l - ecPre cfg)
   , esTaps = VS.map (const 0) (esTaps st)
-  , esFound = Just l }
+  , esFound = Just l, esEstimated = False }
 
 -- | The delay the search settled on, for tracing.
 echoDelay :: EchoState -> Maybe Int

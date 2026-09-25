@@ -58,6 +58,7 @@ module Modec.V32Start
   , v32AidB1
   ) where
 
+import Data.List (sortOn)
 import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Vector.Storable as VS
 
@@ -162,6 +163,7 @@ data V32Start = V32Start
   , vsRev2100 :: !RevTracker     -- ^ the answer tone, for a caller that has heard nothing else yet
   , vsAnsRun  :: !Int            -- ^ samples the answer tone has sounded, at its longest
   , vsAnsGone :: !Int            -- ^ samples since it last did
+  , vsFreqs   :: [Double]        -- ^ the carrier frequency, read once a block while locked on the far end's training, newest first
   , vsRev600  :: !RevTracker
   , vsRev3000 :: !RevTracker
   , vsMark    :: Maybe Int       -- ^ sample index of the first reversal
@@ -532,7 +534,7 @@ v32StartInit fs dir offer = V32Start
   , vsAnsPh = 0, vsAnsRev = True
   , vsRx = qamRxInit p cfg
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
-  , vsRev2100 = revInit fs 2100, vsAnsRun = 0, vsAnsGone = 0
+  , vsRev2100 = revInit fs 2100, vsAnsRun = 0, vsAnsGone = 0, vsFreqs = []
   , vsMark = Nothing, vsTrip = Nothing, vsSentS = Nothing
   , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
@@ -598,10 +600,15 @@ observe st rx = st
   -- at either end of the window -- can only push it up.  Its floor over
   -- the window is the line; its value at whatever instant R1 happens to
   -- be recognised is the line plus whatever else was going on.
+  -- The frequency the data pump will be handed, measured rather than
+  -- sampled: see 'measuredFreq'.
+  , vsFreqs = if measuring (vsPhase st) && qamRxPower rxSt > 1e-5 && qamRxEvm rxSt < 0.01
+                then take 256 (qamRxFreq rxSt : vsFreqs st) else vsFreqs st
   , vsLineErr = if vsPhase st == OTrainR1 && qamRxPower rxSt > 1e-5
                   then min (vsLineErr st) (sqrt (qamRxEvm rxSt)) else vsLineErr st
   , vsQuiet = quiet' }
   where
+    measuring ph = ph `elem` [OTrainR1, OHoldS, OR2, ATrainR2, ACond2]
     acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
     tone1800 = revPower r18 > 1e-5 && revLevel r18 > 0.45
     tone2100 = revPower r21 > 1e-5 && revLevel r21 > 0.45
@@ -881,8 +888,47 @@ conditioningRun dir trn = (ps, sc, q)
       (lastSt : _) -> dibitOfState lastSt
       [] -> (False, False)
 
+-- | Symbol intervals of TRN in each conditioning signal this modem sends.
+--
+-- §5.2.3 allows 1280 to 8192, and the far end's receiver trains on it and
+-- judges from it what rate the line will carry.  1400, near the floor,
+-- was enough for modec's own receiver and for the CX93001 at every rate
+-- but one: calling it at 14400, it answered one R2 in four with an R3
+-- carrying no rate at all, which is a cleardown, while its own report of
+-- the calls it did accept put their line quality at 0 to 5.  The CX93001
+-- itself sends about 6700.  4096 is 1.7 s, a second more per start-up.
+trnLength :: Int
+trnLength = 4096
+
 dirOf :: V32Start -> Role
 dirOf st = case vsRole st of { Originate -> Originate; Answer -> Answer }
+
+-- | Hand the seam the frequency the far end's training measured, not
+-- the one the loop happens to hold.
+--
+-- From the seam on the frequency is not tracked at all on the dense
+-- grids ('v32SeamCfg', 'denseGrid'): a decision-directed loop on 64 or
+-- 128 points cannot pull one in, and the start-up's seconds of four-point
+-- training are the only measurement there will be.  What reached the
+-- seam, though, was the integrator's value on the block the rate signal
+-- was recognised in, and the integrator walks: block to block through
+-- the far end's TRN it read anything from +0.04 to +0.20 Hz of a true
+-- +0.09.  Two calls modec placed at 14400 through the bench saw the same
+-- offset.  One froze +0.135 and read the line for the whole call; the
+-- other froze -0.067, spun, and was dead from its first data symbol.
+--
+-- The median of the per-block readings over the training is within a
+-- few hundredths of a hertz, whichever block the rate signal lands on.
+-- Fewer than sixteen readings is a start-up that never locked, and it
+-- keeps what it has.
+measuredFreq :: V32Start -> V32Start
+measuredFreq s
+  | length fs < 16 = s
+  | otherwise = s { vsRx = qamRxSetFreq median (vsRx s) }
+  where
+    fs = vsFreqs s
+    sorted = sortOn id fs
+    median = sorted !! (length sorted `div` 2)
 
 -- | The state machine of Figure 4.
 advance :: V32Start -> Int -> V32Start
@@ -910,7 +956,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
     -- were tracking the last signal are worse than nothing for the next.
     restart s = s { vsRx = qamRxReset (v32Params (vsFs s)) v32StartCfg (vsRx s)
                   , vsTurns = [], vsBits = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0)
-                  , vsDescr = scramblerInit }
+                  , vsDescr = scramblerInit, vsFreqs = [] }
     rearm s = s { vsRev1800 = revRearm (vsRev1800 s)
                 , vsRev600 = revRearm (vsRev600 s)
                 , vsRev3000 = revRearm (vsRev3000 s)
@@ -1000,7 +1046,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
                 | otherwise -> s
       OHoldS
         | vsSince s >= maybe (sym 256) id (vsTrip s) ->
-            let (ps, sc, q) = conditioningRun dir 1400
+            let (ps, sc, q) = conditioningRun dir trnLength
                 -- 5.4.1: R2 excludes anything absent from R1
                 r2 = maybe (vsOffer s) (restrictRates (vsOffer s)) (vsPeer s)
             in enter OCond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
@@ -1049,7 +1095,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       OR2 | vsSince s < sym 128 -> s
       OR2 -> case detectRate (vsBits s) of
         Just r3 | Just rate <- bestCommonRate (vsOffer s) r3 ->
-          enter OB1 s { vsRate = Just rate
+          enter OB1 (measuredFreq s) { vsRate = Just rate
                       -- R3 is what the answering modem's E follows
                       , vsPeer = Just r3
                       , vsSrc = TxCoded (eSeqBits (chosen rate))
@@ -1114,7 +1160,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | otherwise -> s
       AGap
         | vsSince s >= sym 16 ->
-            let (ps, sc, q) = conditioningRun dir 1400
+            let (ps, sc, q) = conditioningRun dir trnLength
             in enter ACond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
                              , vsSrc = TxCoded (cycle (rateSeqBits (vsOffer s)))
                              , vsAdapt = True }
@@ -1152,7 +1198,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- caller that judges its line cuts R2 before we ever see it.
       ATrainR2 -> case detectRate (vsBits s) of
         Just r2 | Just rate <- bestCommonRate (vsOffer s) r2 ->
-          let (ps, sc, q) = conditioningRun dir 1400
+          let (ps, sc, q) = conditioningRun dir trnLength
           -- No adapting here, unlike ACond.  The calling modem is still
           -- sending the rate sequence it started in its own conditioning
           -- period and does not stop until E, so this is not one of
@@ -1169,7 +1215,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         Nothing | tooLong 80000 s -> enter (V32Fail "no rate signal R2") s
                 | otherwise -> s
       ACond2
-        | null (vsQueue s) -> enter AR3 s { vsAdapt = False }
+        | null (vsQueue s) -> enter AR3 (measuredFreq s) { vsAdapt = False }
         | otherwise -> s
       AR3 | vsSince s < sym 128 -> s
       AR3 -> case detectE (vsPeer s) (vsBits s) of

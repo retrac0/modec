@@ -48,6 +48,7 @@ module Modec.V32Pump
   , v32DataTruth
   , v32DataSyms
   , v32DataOnes
+  , v32DataOut
   , v32DataInStep
   , v32DataReading
     -- * Offline helpers
@@ -792,6 +793,7 @@ data V32Data = V32Data
     -- receiver is provably reading the far end.  Latched; see
     -- 'v32DataRx'.
   , vdOnes  :: !(Int, Int)
+  , vdOut     :: [Bool]            -- ^ the data bits the last block put out, for tracing
     -- ^ of the data bits the last block put out, how many were ones,
     -- and how many there were.  A far end with nothing to say sends
     -- ones, and a descrambled bit is one when the three line bits it is
@@ -811,7 +813,7 @@ data V32Data = V32Data
 v32DataInit :: Double -> V32Rate -> V32Data
 v32DataInit fs r = V32Data
   { vdDiag = defaultV32Diag, vdSyms = [], vdOnesRun = 0, vdInStep = False
-  , vdProven = provenNever, vdOnes = (0, 0)
+  , vdProven = provenNever, vdOnes = (0, 0), vdOut = []
   , vdTx = qamTxInit, vdCode = txCoderInit
   , vdRx = qamRxInit (v32Params fs) (v32RxCfg r), vdDec = rxCoderInit
   , vdPend = [], vdWait = [], vdBits = [], vdAcq = v32AcqSymbols }
@@ -889,6 +891,10 @@ v32DataReading st = vdProven st < provenFor
 -- | The symbols the last block decided, for dumping.
 v32DataSyms :: V32Data -> [QamSym]
 v32DataSyms = vdSyms
+
+-- | The data bits the last block put out, for tracing.
+v32DataOut :: V32Data -> [Bool]
+v32DataOut = vdOut
 
 -- | Ones among the data bits the last block put out, and the bits.
 v32DataOnes :: V32Data -> (Int, Int)
@@ -978,6 +984,7 @@ v32DataRx fs dir r st rx = (st', out)
              , vdOnesRun = onesRun', vdProven = proven'
              , vdInStep = vdInStep st || onesRun' >= inStepOnes
              , vdOnes = (length (filter id out), length out)
+             , vdOut = out
              , vdWait = drop emitTo stream
              , vdPend = lastN vdOverlap (take emitTo stream)
              , vdAcq = max 0 (vdAcq st - length syms) }

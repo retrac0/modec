@@ -23,6 +23,8 @@ module Modec.Modem
   , modemV32Ones
   , modemV32Power
   , modemV32Taps
+  , modemV32Rx
+  , modemV32DataBits
   , modemEchoErle
   , modemEchoData
   , modemEchoDelay
@@ -58,8 +60,8 @@ import Modec.Standards
 import Modec.Stream
 import Modec.V22
 import Modec.V32 (RateSeq (..), describeRateSeq, rateDecisionMargin, ratesBelow, rateSeqCleardown, v32Rates, v32bisRates)
-import Modec.QAM (QamSym, qamRxPower, qamRxTaps, qamRxFreq, qamRxSps, qamRxEvm)
-import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataInStep, v32DataReading, v32DataRxState, v32DataTxState)
+import Modec.QAM (QamRxState, QamSym, qamRxPower, qamRxTaps, qamRxFreq, qamRxSps, qamRxEvm)
+import Modec.V32Pump (V32Data, V32Diag (..), defaultV32Diag, v32DataDiag, v32DataInit, v32DataFrom, v32DataResume, v32DataRx, v32DataTx, v32DataEvm, v32DataSps, v32DataPower, v32DataTruth, v32DataSyms, v32DataOnes, v32DataOut, v32DataInStep, v32DataReading, v32DataRxState, v32DataTxState)
 import Modec.V32Start
 import Modec.Echo
 import Modec.Mnp
@@ -488,6 +490,20 @@ modemV32Power st = case msMode st of
     loops rx inStep = (qamRxPower rx, qamRxFreq rx, qamRxSps rx, qamRxEvm rx, inStep)
 
 -- | The V.32 receiver's equaliser taps, whichever receiver has the line.
+-- | The data bits the V.32 pump put out on the last block, for tracing.
+modemV32DataBits :: ModemState -> [Bool]
+modemV32DataBits st = case msMode st of
+  DataV32 _ _ pump _ _ -> v32DataOut pump
+  _ -> []
+
+-- | The V.32 receiver itself, start-up or data pump, for tracing.
+modemV32Rx :: ModemState -> Maybe QamRxState
+modemV32Rx st = case msMode st of
+  Starting32 s32 _ -> Just (v32StartRx s32)
+  Retrain32 s32 _ -> Just (v32StartRx s32)
+  DataV32 _ _ pump _ _ -> Just (v32DataRxState pump)
+  _ -> Nothing
+
 modemV32Taps :: ModemState -> Maybe [(Double, Double)]
 modemV32Taps st = case msMode st of
   Starting32 s32 _ -> Just (qamRxTaps (v32StartRx s32))
@@ -626,7 +642,7 @@ modemStep cfg st0 rxBlock newBytes =
           presence = if n == 0 then 1 else VS.sum (dPresent d) / fromIntegral n
       in finishData st (DataFsk s tx rx disc' framer') (FskLink tx rx) (presence >= 0.5) (LineOctets bytes)
     Starting32 s32 entry ->
-      let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
+      let (echo', rxClean) = scanLate s32 (cancelEcho (v32EchoAdapt s32) st n rxBlock)
           (s32', audio, status) = v32StartStep s32 rxClean
           st1 = st { msEcho = pushEcho audio echo' }
       in case status of
@@ -812,7 +828,7 @@ modemStep cfg st0 rxBlock newBytes =
     -- longer than hcDrop by design, so a watchdog left on would drop
     -- every retrain it was there to make possible.
     Retrain32 s32 held ->
-      let (echo', rxClean) = cancelEcho (v32EchoAdapt s32) st n rxBlock
+      let (echo', rxClean) = scanLate s32 (cancelEcho (v32EchoAdapt s32) st n rxBlock)
           (s32', audio, status) = v32StartStep s32 rxClean
           st1 = st { msEcho = pushEcho audio echo' }
           held' = held { hdSamples = hdSamples held + n }
@@ -1021,6 +1037,20 @@ modemStep cfg st0 rxBlock newBytes =
           | Just _ <- echoDelay e = e
           | Just (l, _) <- echoSearch (mcEcho cfg) e = echoAim (mcEcho cfg) l e
           | otherwise = e
+
+    -- The late reflection is looked for before data mode, too, in the
+    -- start-up's last phases: both ends are talking by then, our own
+    -- signal is the scrambled rate signal and E, and the search needs
+    -- seconds it would otherwise spend in data.  See 'echoScanStep'.
+    -- Three slices a block, because the start-up is not also running the
+    -- trellis pump: on a 14400 call modec placed through the bench that
+    -- aimed the canceller half a second before the first data symbol
+    -- instead of two and a half seconds after it, and the receiver
+    -- opened at 21 dB rather than 19.5.
+    scanLate s32 (echo', rxClean)
+      | v32Phase s32 `elem` [OR2, OB1, ACond2, AR3, AE] =
+          (fmap (\e -> iterate (echoScanStep (mcEcho cfg)) e !! 3) echo', rxClean)
+      | otherwise = (echo', rxClean)
 
     -- Data mode: the far end is talking for the rest of the call, and
     -- the canceller has its own way of working under that; see
