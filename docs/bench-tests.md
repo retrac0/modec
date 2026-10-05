@@ -779,10 +779,6 @@ more times, six clean, no step in any.
   nothing. At 14400 an uncancelled reflection at 0.6 % of the line is
   most of the margin, so the rule wants a longer look before it lets
   go.
-- A start-up that fails grows the heap while it waits: by the time a
-  caller gives up on an answerer it cannot hear, forty seconds in, a
-  block every few seconds takes 160 ms. It costs nothing a failing
-  call had left, and is not right.
 - The softphone's streams joining still costs a graph cycle on some
   calls -- three of forty, 20 ms each, before either modem has spoken.
 - The echo's delay still steps on one call in fifty with nothing in
@@ -806,6 +802,123 @@ more times, six clean, no step in any.
   since. It may always have been holes in our TRN: the
   quiet-window echo search that this pass took out of live calls cost
   most of every block for exactly as long as the TRN lasted.
+
+## The same afternoon: a call out, and what a block costs (2026-10-05, from 84ca34e)
+
+One call to 2600.network's Patton on +1 760 330 2600 through voip.ms,
+asked for at 14400 and with the question of what kept timing out. V.8,
+14400 by the rate signals, MNP class 4, the banner and the prompt; a
+carriage return typed and answered; then eighty seconds of nothing
+typed, and hung up from this end. A decision error of 0.0003 for the
+length of it, no retrain, a capture clock that did not move, no
+reflection to speak of on the path. Its first forty seconds are a
+fixture.
+
+**Nothing timed out, at any layer, on that call or the two placed by
+hand before it.** The softphone's log has all three ended from this
+end and no transaction lost; the only SIP timeouts in it are from
+12 September. The start-up took 21 s of the 45 that S7 allows. And
+`MODEC_MNP_TRACE=1`, which is new, puts every error-control frame in
+the call's log: every frame sent was acknowledged within a second, and
+an idle link is the two ends exchanging an acknowledgement every three.
+What modec itself had sent on the earlier call was read back by
+replaying its transmit recording to an answering modem: the login name,
+acknowledged, and nothing after the password prompt before ctrl-C.
+
+**What the call did show was 159 reports of a slow block in 100
+seconds**, on the terminal the session is typed at. A block is 20 ms
+and the loop reports any that takes over 12. The report now says where
+the time went -- the modem, the write, or listening to what the network
+is playing -- and it was the modem every time.
+
+*The heap grew through every start-up.* With the runtime's census on
+(`GHCRTS="-hT -i0.5 -s"`) a bench call's live heap went from half a
+megabyte to twenty-one over the twelve seconds of a V.32 start-up, and
+fell back at the connect. A collection takes as long as there is heap
+to go through: 20 ms about once a second at the start, 40 by the end,
+the longest 50 -- and 160 on a start-up that waited forty seconds for
+an answerer it could not hear, which is the item this file listed as
+open. What was growing was promises. A history kept as `take n (new :
+old)` is not cut until somebody reads that far; the start-up's recent
+points wait for B1 to be read at all, its turns and bits are read only
+in the phases looking for something, and the receiver's own symbol
+powers and loop history are read only when a level step is being
+watched for. Each block's list was that block's symbols and a promise
+to cut the list before it. They are cut as they are made now.
+`scripts/diag/heapcall.py` runs the live loop over a recorded call
+with the census on, and over each mode's S0 recording it says the rest:
+
+| | before: live heap, longest collection | after |
+| --- | --- | --- |
+| V.32 and V.32bis start-up | climbs to 18-20 MB, 22-24 ms | 7-10 MB at a scan, 1.5-3 ms |
+| V.32 4800, data | still climbing at 20 MB when the call ends | level at 3 MB |
+| V.22 and Bell 212A at 1200, data | 0.17 MB a second for the whole call, 6 ms after 28 s | level at about 3 MB, 2.5 ms |
+| V.22bis, the FSK modes | level, 2-5 MB | the same |
+
+(Those collections are with the loop run flat out; on a call, where the
+processor has slowed down between blocks, they were twice as long.) A
+call at 1200 bit/s was ten megabytes heavier every minute it lasted.
+
+*The four tone trackers of the start-up were lists too*: forty cells
+made and read three times over for every sample of each. Profiled over
+the start-up of the live call, 29 % of the modem's time and 71 % of
+everything it allocated. A ring of unboxed samples, summed in the same
+order, so nothing they decide has moved; the suite, which is mostly
+start-ups, runs in 100 s where it took 148.
+
+*The echo search's transforms did not fit in a block.* One had been
+measured at two milliseconds, seven on a busy machine. Run the way a
+call runs it -- a burst of work, then asleep until the next block -- on
+an idle machine whose processor has slowed to match, it was 6 to 24,
+and the search ran three of them a second for as long as there was no
+reflection to find, which on a trunk is the whole call. A transform is
+now taken three stages a block, begun in a block of its own, and a
+search that has shown nothing four times running waits twice as long,
+to eight seconds.
+
+What a block costs is only what it costs when the processor is asleep
+between blocks, so the recording of the live call was fed to the live
+loop a block every 20 ms, before and after:
+
+| a block's work, ms | median | 99 % | worst | over 12 ms |
+| --- | --- | --- | --- | --- |
+| the start-up, 10 s: before | 7.1 | 29.1 | 31.6 | 24 |
+| after | 4.5 | 8.8 | 14.8 | 1 |
+| data at 14400, 37 s: before | 8.7 | 21.7 | 24.9 | 80 |
+| after | 6.5 | 9.7 | 18.2 | 3 |
+
+A hundred and eleven reports in that minute before, four after. On the
+bench: a call placed had 30 to 48 slow blocks and a worst of 35 to
+45 ms, and has 6 to 13 and 15 to 20; a call answered had 14 to 26 and
+has one to three, with one call of six at fifteen.
+
+**And one call of the fifty placed that afternoon was unreadable from
+its first data symbol**, with nothing wrong on the line
+(20261005T163040). Figure 4 has the answering modem silent for the
+caller's conditioning signal, 2.4 s, and the receiver waits that out
+with its loops still. Its symbol clock was held at whatever rate the
+timing loop stood at on the last symbol before the quiet -- and a
+loop's rate is the far end's plus the loop's own noise: between 3.3326
+and 3.3338 samples a symbol through the answerer's training, about a
+mean of 3.33315. It stopped on 3.33291. Over 5760 symbols that is 1.4
+samples; the answerer came back 0.41 of a symbol from where the
+receiver was looking, the loop was kicked 2400 ppm getting there, and
+it was still ringing when the data began. The clock now coasts through
+a quiet line on its average over the signal before it. The recording
+is a fixture; the same recording through the code before reads the
+answerer's return at an error of 0.3 and the data at 0.015, and through
+this at 0.005 and 0.0005. One test moved with it: a calling modem
+deafened by half a second of noise now comes back reading and asks for
+no retrain, so the test of 5.5 uses a second.
+
+Fourteen bench calls on the result -- six placed, six answered, two in
+automode -- fourteen clean.
+
+Still over twelve milliseconds, and mostly under twenty: a handful of
+blocks a call, around the handover to data and where the far end's
+training returns. Data mode's ordinary block is 6.5 ms with the
+processor asleep between blocks, which is over half way to a report
+before anything unusual happens.
 
 ## Order and cost
 

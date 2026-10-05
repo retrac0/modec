@@ -101,15 +101,16 @@ in the payload wrong, not a bit error rate.
 | Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
 | Call classifier (modem, fax, voice, busy, congestion, SIT, no answer) | babble as voice to 10 dB SNR | 309 recorded calls: every logged connection and congestion agrees; 22 "no answer" calls found to be modems |
 
-Thirty-one recorded calls are also in the suite, replayed through the
+Thirty-two recorded calls are also in the suite, replayed through the
 whole modem and checked against what the far end really sent: see
 [test/fixtures/live/](test/fixtures/live/). Nine of them are
 2600.network, a Patton 3120, and carry its banner, at 300, 1200/75,
 2400, 9600, 12000 and 14400 bit/s. Two are one third-party V.32bis call at
-14400, split by direction. Three are 14400 calls through the bench,
+14400, split by direction. Four are 14400 calls through the bench,
 with what this modem sent beside what it heard, kept for a lost packet,
-for a silence, and for 80 ms at twice the level. Two must not connect
-at all. `cabal test`
+for a silence, for 80 ms at twice the level, and for a symbol clock
+held through a silence at the wrong rate. Two must not connect at all.
+`cabal test`
 never places a call and never opens a device, and the library it links
 carries no dependency that could.
 
@@ -174,7 +175,10 @@ carries no dependency that could.
   measures the capture clock only when a burst
   arrives, because a loop running behind the audio reads it high.
   `MODEC_IO_STATS=1` logs the audio clock, and `MODEC_IO_TRACE=FILE`
-  writes it out a block at a time. pw-cat's capture is run unbuffered:
+  writes it out a block at a time. A block that takes over 12 of its
+  20 ms is reported, with where the time went; the heap stays level
+  through a call, which it did not until a 1200 bit/s call was found
+  to be ten megabytes heavier every minute. pw-cat's capture is run unbuffered:
   buffered, it handed over 256 ms at a time. Both pw-cats are made
   real-time through rtkit, because pw-cat copies each graph cycle in a
   thread that is not and loses the cycle when it is late; and the
@@ -251,7 +255,10 @@ current.
   through a lost packet, where it trained on what was left -- one with
   no rule for the far end's level doubling for 80 ms, and a canceller
   aimed at nothing after a silence of its own. All fixed, each from a
-  recording or a measurement of the path with no modem in it. Since:
+  recording or a measurement of the path with no modem in it. One
+  placed call in fifty then still opened unreadable: the symbol clock
+  had been held through Figure 4's silence at whatever rate its loop
+  stood on, and now coasts on its average. Since:
   placing calls, sixteen of sixteen at a pinned rate and eight of
   eight against the reference's automode; answering, twenty-four of
   twenty-four with the reversals and fourteen of sixteen without. A
