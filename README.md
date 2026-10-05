@@ -12,6 +12,7 @@ over it, with error correction if the far end has any.
 - [docs/line-interface.md](docs/line-interface.md) -- hooking a real modem to a sound card
 - [docs/sip-options.md](docs/sip-options.md), [docs/voipms.md](docs/voipms.md) -- why the SIP path is built this way, and dialling out through voip.ms
 - [docs/robustness.md](docs/robustness.md) -- what recorded calls survive when the simulator degrades them
+- [docs/bench-tests.md](docs/bench-tests.md) -- the standing bench against a CX93001, and what its passes found
 - [docs/recordings/](docs/recordings/) -- recorded handshakes, with an annotated timeline
 
 ## Pre-alpha
@@ -21,9 +22,11 @@ stable: interfaces, subcommands and option names change from commit to
 commit, and there is no release, no packaging and no compatibility
 promise. What has been measured is marked below as measured -- through
 the channel simulator, against minimodem and spandsp, or over recorded
-calls -- and the rest has met nothing but itself. Several modulations
-here have never carried a byte over a real telephone line, and one of
-them cannot yet be put on a call at all. Expect to read the source.
+calls -- and the rest has met nothing but itself. The text telephone
+cannot be put on a call. As the code now stands, 14400 carried data
+both ways on forty-three of forty-four calls through the bench, and on
+all thirty-six made the way the bench is now set up. Expect to read
+the source.
 
 ## Modulations
 
@@ -36,15 +39,23 @@ them cannot yet be put on a call at all. Expect to read the source.
 | V.22 | 1200 bit/s duplex | 600 Bd differential 4-PSK, 1200/2400 Hz | yes |
 | V.22bis | 2400 bit/s duplex | 600 Bd 16-QAM on the same carriers | yes |
 | V.18 Annex A (TTY/TDD) | 45.45 or 50 baud half duplex | FSK, 1400/1800 Hz, 5-bit Baudot text | offline only |
-| V.32 | 4800 and 9600 bit/s, plain and trellis coded | 2400 Bd QAM on 1800 Hz | bench only |
+| V.32 | 4800 and 9600 bit/s, plain and trellis coded | 2400 Bd QAM on 1800 Hz | yes |
+| V.32bis | 7200, 12000 and 14400 bit/s, plus the V.32 rates | the same carrier and baud | 12000 and 14400; 7200 has no recording |
 
-The first six are what `--mode` chooses between and what automode
-negotiates. The text telephone is `modec encode`/`decode` only: it
-carries characters rather than bytes, so it has no place in a byte pipe.
-V.32 has a coding layer, a start-up, a data pump and an echo canceller.
-The canceller reaches about 18 dB of return loss on a call, but that is
-not yet what decides whether a call through an echo carries data: see
-the limits.
+The first six are what `--mode` offers by default, and what automode
+negotiates. Naming `v32` or `v32bis` adds them. `v32` offers 4800 and
+both 9600s; `v32bis` adds 7200, 12000 and 14400, or `--v32-rate` pins
+one. 12000 has carried a real session, MNP included. 14400 holds on
+recorded calls and now on calls through the bench; what made it
+unreliable there has been found, and most of it was not the receiver:
+see the limits. 7200 is in the suite and has never been recorded off a
+line. They stay out of the default offer because announcing V.32bis
+means offering 14400, and a rate that connects and then damages the
+session is worse than one that was never offered. The text telephone
+is `modec encode`/`decode` only: it carries characters rather than
+bytes, so it has no place in a byte pipe. V.32 has a coding layer, a
+start-up, a data pump and an echo canceller; what the canceller decides
+is in the limits.
 
 ## What works
 
@@ -81,19 +92,25 @@ in the payload wrong, not a bit error rate.
 | Bell 212A, V.22 | 8 dB SNR | spandsp's V.22bis test program |
 | V.22bis | 12 dB SNR, ±7 Hz carrier, ±0.5 % clock, 3 ms delay distortion, echo, +30 dB adjacent channel | spandsp, BERT with no PRBS-11 failure |
 | V.32 4800 | 12 dB SNR, and everything else the simulator offers, echo included | the Recommendation's own test vectors, on the coding layer |
-| V.32 9600 | 18 dB SNR, 16 dB trellis coded, ±7 Hz carrier, ±0.5 % clock | ditto |
+| V.32bis 7200, V.32 9600 trellis | 16 dB SNR, ±7 Hz carrier, ±0.5 % clock, 1 ms delay distortion | ditto |
+| V.32 9600 plain | 18 dB SNR, ±7 Hz carrier, ±0.5 % clock | ditto |
+| V.32bis 12000 and 14400 | 25 dB SNR, ±7 Hz carrier, ±0.5 % clock, 1 ms delay distortion | ditto, on the trained pump |
 | MNP 2, 3 and 4 | every byte delivered where the bare link damages 3 % of them; links up at 4 dB | — |
 | DTMF | digits to 3 dB SNR | Q.24's own accept and reject limits |
 | Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
 | Call classifier (modem, fax, voice, busy, congestion, SIT, no answer) | babble as voice to 10 dB SNR | 309 recorded calls: every logged connection and congestion agrees; 22 "no answer" calls found to be modems |
 
-Twelve recorded calls are also in the suite, replayed through the whole
-modem and checked against what the far end really sent: see
-[test/fixtures/live/](test/fixtures/live/). Five of them are the same
-access server answering at 300, 1200, 1200/75, 2400 and 9600 bit/s with
-the same fixed banner, which is the closest thing to an oracle a dial-up
-line offers. `cabal test` never places a call and never opens a device,
-and the library it links carries no dependency that could.
+Thirty recorded calls are also in the suite, replayed through the
+whole modem and checked against what the far end really sent: see
+[test/fixtures/live/](test/fixtures/live/). Eight of them are
+2600.network, a Patton 3120, and carry its banner, at 300, 1200/75,
+2400, 9600 and 12000 bit/s. Two are one third-party V.32bis call at
+14400, split by direction. Three are 14400 calls through the bench,
+with what this modem sent beside what it heard, kept for a lost packet,
+for a silence, and for 80 ms at twice the level. Two must not connect
+at all. `cabal test`
+never places a call and never opens a device, and the library it links
+carries no dependency that could.
 
 ## Protocols and signal path
 
@@ -107,11 +124,17 @@ and the library it links carries no dependency that could.
   1 + x^-14 + x^-17 scrambler, Gardner timing recovery; differential
   4-PSK at 1200 bit/s, and at 2400 a coherent path of AGC,
   decision-directed carrier loop and a 15-tap T/2 LMS equaliser.
-- **V.32** (`Modec.V32`, `Modec.V32Pump`) on `Modec.QAM`, which is the
-  V.22 receiver with baud, carrier, shaping, tap count, loop gains and
-  constellation lifted out into arguments. The coding layer is free of
-  any sample rate, so its tables can be read against the Recommendation
-  with no DSP in the way.
+- **V.32** (`Modec.V32`, `Modec.V32Pump`, `Modec.V32Start`) on
+  `Modec.QAM`, which is the V.22 receiver with baud, carrier, shaping,
+  tap count, loop gains and constellation lifted out into arguments.
+  The coding layer is free of any sample rate, so its tables can be
+  read against the Recommendation with no DSP in the way. V.32bis is
+  the same pump at 7200, 12000 and 14400. A caller offering only V.32
+  sends AA when the answer tone ends: waiting to hear AC missed a
+  CX93001's window across the bench ATA's 780 ms round trip, and every
+  automode call placed that way failed. Conditioning is 4096 symbols
+  of TRN. The carrier handed to the data pump is the median frequency
+  measured over that training.
 - **Call establishment** (`Modec.Handshake`): the V.25 answer sequence
   and the fallback ladder, V.22 §6.3 with the S1 exchange and the 270 ms
   rate switch, both roles, verified by duplex simulation.
@@ -143,7 +166,23 @@ and the library it links carries no dependency that could.
   data over telnet (BINARY and SUPPRESS-GO-AHEAD negotiated, IAC
   escaped), stdio, a terminal in raw mode, or a pseudo-terminal that a
   terminal program opens as a modem's serial port (`--data-pty`,
-  `--pty-link`; closing the port drops DTR). Hayes AT on the DTE side
+  `--pty-link`; closing the port drops DTR). A transmit cushion
+  (`Modec.Cushion`) writes back the samples capture loses when the
+  graph is rearranged -- a cycle, on some calls, as baresip's streams
+  join -- so the cushion does not wear away a call at a time. It
+  measures the capture clock only when a burst
+  arrives, because a loop running behind the audio reads it high.
+  `MODEC_IO_STATS=1` logs the audio clock, and `MODEC_IO_TRACE=FILE`
+  writes it out a block at a time. pw-cat's capture is run unbuffered:
+  buffered, it handed over 256 ms at a time. Both pw-cats are made
+  real-time through rtkit, because pw-cat copies each graph cycle in a
+  thread that is not and loses the cycle when it is late; and the
+  softphone path stays on PipeWire's dummy driver at a quantum of its
+  own (one 20 ms block; `MODEC_PW_QUANTUM`), so that whatever else on
+  the desktop plays, records or meters audio does not re-time a call.
+  `--channel`
+  and `--impair` degrade a live call the way `replay` degrades a
+  recording, one block at a time. Hayes AT on the DTE side
   (`--hayes`): dialling numbers or SIP addresses, `+MS` to choose the
   modulation and rates, S-registers for the dial, handshake and escape
   timings, `&V`/`&W`/`&F` profiles, ring counting, a phone book for
@@ -179,19 +218,48 @@ current.
   bench's ATA produces on most calls, is followed within two symbols.
 - 9600 bit/s: delay distortion past 1 ms breaks it where 4800 rides
   through.
-- Through an ATA, send `--ans-plain`: the V.25 phase reversals in the
-  V.32 answer tone tell the ATA's echo canceller to stand down, and the
-  hybrid's reflection then returns through the softphone too late for
-  modec's own canceller to reach. Plain, the reflection is gone and
-  12000 bit/s carries data; with reversals every V.32 call sat at a
-  decision error of 0.015.
-- Echo on a V.32 call: a reflection at -26 dB is carried end to end; the
-  same path 6 dB louder is not. The canceller is not what decides that.
-  It reaches 18 dB of return loss at the louder setting and the call
-  still fails, exactly as it failed when the canceller was wired in but
-  switched off and removing nothing at all. Whatever breaks 9600 through
-  an echo is upstream of the cancelling, and finding it is the next
-  piece of work.
+- Through an ATA, the V.25 phase reversals in the V.32 answer tone
+  tell the ATA's echo canceller to stand down, and the reflection that
+  leaves is this modem's to cancel. It does: twenty-four 14400 calls
+  answered that way on the bench, twenty-four clean. `--ans-plain`
+  sends the tone without the reversals and leaves the ATA's canceller
+  in the path, which was the bench's answer while modec's could not
+  reach the reflection, and which lost a 14400 call about one time in
+  ten, when the ATA's did not take it out either.
+- Echo. A reflection at -26 dB is carried end to end. The same path
+  6 dB louder failed with the canceller removing nothing, so at 9600
+  the fault sat upstream of it. Through the bench our own signal comes
+  back about half a second late and 20 dB under the far end. It is
+  looked for from the first conditioning signal on, where the far end
+  is silent and it stands alone, and the filter is trained on it
+  there: 20 to 28 dB out before the first data symbol when this modem
+  places the call. When it answers `--ans-plain` through an ATA whose
+  own canceller is half working, what is left is not a steady path and
+  7 to 12 dB is all a filter can take from it; answering with the
+  reversals, the path is steady and the filter takes it out.
+- 14400. Fourteen bench calls of twenty carried both directions before
+  the causes were found, and most of them were not the receiver. The
+  data pump took most of every block, so the loop fell behind the
+  audio; capture arrived a quarter of a second at a time, through a
+  pw-cat that was the one client of the graph not running real-time;
+  the cushion keeper answered a loop that was behind by writing
+  silence into the carrier; the graph the call ran on followed the
+  desktop's sound card and its mixer; and with a mixer open this modem
+  removed its own links to the softphone. Behind those were a receiver
+  that followed a quiet line down -- through Figure 4's silences, and
+  through a lost packet, where it trained on what was left -- one with
+  no rule for the far end's level doubling for 80 ms, and a canceller
+  aimed at nothing after a silence of its own. All fixed, each from a
+  recording or a measurement of the path with no modem in it. Since:
+  placing calls, sixteen of sixteen at a pinned rate and eight of
+  eight against the reference's automode; answering, twenty-four of
+  twenty-four with the reversals and fourteen of sixteen without. A
+  lost packet or a gain hit still costs the line or two of payload
+  that was in it, which is what error control is for. A rate pinned
+  with `--v32-rate` cannot retrain. The CX93001 has answered an R2 at
+  14400 with an R3 that offers no rate, once, under load, and not in
+  the ninety calls since. All of it is in
+  [docs/bench-tests.md](docs/bench-tests.md).
 - Offline `modec detect` names V.23's backward channel but not its
   forward one: at 1200 bit/s no analysis window can both separate
   1300 Hz from the Bell 103 mark 30 Hz away and stay short enough for a
@@ -220,13 +288,19 @@ cabal run modec -- detect recording.wav                           # which standa
 cabal run modec -- progress recording.wav                        # dial tone, ringing, busy, congestion, SIT
 cabal run modec -- dtmf recording.wav                            # DTMF digits, with timings
 cabal run modec -- classify --truth --by-number recordings/      # what answered each call, against the log
+cabal run modec -- v32trace recording.wav                          # a V.32 start-up, read back as a timeline
 cabal run modec -- replay --mode v22bis,v22 recording.wav        # the whole modem over a recorded call
 cabal run modec -- replay --mode v22bis,v22 --channel voip --impair impulse=20 recording.wav
+cabal run modec -- replay --mint NAME --mode v32bis --seconds 32 recordings/SOURCE.wav
+cabal run modec -- replay --mode v32bis --line --truth --tx CALL-tx.wav CALL.wav   # a V.32 call with its own echo, as it happened
 # 5-bit text telephone (TTY/TDD): text in, text out, not bytes
 printf 'HELLO GA SK' | cabal run modec -- encode --tty45 -o tty.wav
 cabal run modec -- decode --tty45 tty.wav                         # --tty50 for the 50 baud line
 cabal run modec-bench -- --channel answer --bytes 400             # impairment sweep (also v21, v22low/high, v22bislow/high)
 cabal run modec-bench -- v32-survey                               # V.32 against every impairment axis, per rate
+cabal run modec-bench -- v32-bench                                # the ATA path: mu-law, +47 ppm, +0.7 Hz, by SNR
+scripts/bench/suite.py S0                                         # the standing bench: smoke, both directions
+scripts/bench/probe.py NAME 8 originate pinned                    # eight 14400 calls, every log kept
 
 # live modem: answer calls arriving on the default PipeWire source, serve telnet on 2323
 cabal run modec -- modem --answer --audio-pipewire --listen 2323
@@ -258,7 +332,8 @@ cabal run modec -- dial +14042820600                              # starts bares
 cabal run modec -- dial +14042820600 --mode v21 --listen 2323    # on telnet instead of this terminal
 # the other direction: register, wait, answer, and tell the caller what we agreed on
 cabal run modec -- answer
-cabal run modec -- answer --mode v32bis,v32,v22bis,v22,v21,bell103   # offer V.32 too
+cabal run modec -- answer --mode v32bis,v32,v22bis,v22,v21,bell103   # offer V.32bis too
+cabal run modec -- modem --originate --mode v32bis --v32-rate 12000 --audio-pipewire --listen 2323
 # the long form, for an existing baresip or a hand-built answering side
 cabal run modec -- modem --sip 127.0.0.1:4444 --sip-domain sip.provider.example --audio-sip-loop modec --listen 2323
 # and from a terminal program: ATDT<number> dials the BBS, ATA answers an incoming SIP call

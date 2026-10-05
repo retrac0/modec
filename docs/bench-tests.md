@@ -16,9 +16,11 @@ does not do yet, it says so under **Needs**.
 
 - **Both directions, always.** A test that runs one way is half a test.
   modec answering and modec calling exercise different start-up code,
-  different scramblers, and a different echo path: the CX93001's answer
-  tone carries V.25 reversals that stand the ATA's echo canceller down,
-  modec's `--ans-plain` tone does not. Every result below is a pair.
+  different scramblers, and a different echo path. Since 2026-10-05
+  both answer tones carry the V.25 reversals that stand the ATA's echo
+  canceller down; before that modec answered `--ans-plain` on the
+  bench, which did not, and results from then are with the ATA's
+  canceller in the path one way. Every result below is a pair.
 - **One variable per run.** The reference is pinned (`AT+MS=<mod>,0,...`)
   unless the test is about negotiation. Error control and compression are
   off at the reference (`AT&K0 AT%C0 AT\N0`) unless the test is about
@@ -50,6 +52,14 @@ does not do yet, it says so under **Needs**.
   compared with anything.
 - **Nothing else on the CPU.** No `cabal test`, no replays, while a call
   is up: the audio loop starves and the failure looks like the modem's.
+  That includes other sessions on the machine, which nothing here can
+  stop: with the load at ten to thirty, modec's blocks took 100 to 450
+  ms and every call failed. `sweep.py` therefore starts baresip and
+  modec in a systemd scope with a CPU weight a hundred times the
+  default (`first_in_line`), which is the most this user may ask for;
+  pre-flight says when the machine is busy; and a row is only as good
+  as its slow blocks. `scripts/bench/probe.py` prints them, with the
+  load, beside each call.
 
 ## Pre-flight (before any suite, about 30 s)
 
@@ -308,8 +318,8 @@ with, and does it matter to the result?
 
 | test | modec answers with | measure |
 | --- | --- | --- |
-| A1 | `--ans-plain` (bench default) | echo level at modec, payload at 12000 and 14400 |
-| A2 | V.25 reversals (drop `--ans-plain`) | same |
+| A1 | `--ans-plain` (`BENCH_ANS_PLAIN=1`; the bench default until 2026-10-05) | echo level at modec, payload at 12000 and 14400 |
+| A2 | V.25 reversals (the default) | same |
 | A3 | `--v8` (ANSam) | same |
 | A4 | modec calls (the CX93001's tone) | same |
 
@@ -499,6 +509,303 @@ which is the 14400 receive fault below.
   reference's choice.
 - A retrain that cannot finish now ends the call after 20 s rather than
   33 s of silence.
+
+## What the third pass found (2026-10-04, from 65386d0)
+
+The question was the open one: 14400 connects and then, too often, one
+direction is lost. Twenty calls at 65386d0 on an idle machine set the
+baseline -- ten pinned with modec calling, five pinned with modec
+answering, five with the reference in automode and modec calling. The
+reference read every line modec sent on all twenty. Modec read every
+line on fourteen, lost all of them on four, and some on two.
+
+None of the six was the receiver failing to read a line it had been
+given. Each cause below was measured on a recording, most of them by
+`modec replay --tx`, which is new: a replay regenerates its transmit,
+which is not what the echo in the recording is an echo of, so until now
+no replay could reproduce a call whose trouble was its own echo. Given
+the call's `-tx.wav` as the canceller's reference, it reproduces the
+live call to the retrain.
+
+**The loop was losing a race, and the cushion keeper was writing
+silence into the carrier.** At 14400 the data pump took 13 to 15 ms of
+every 20 ms block. Two thirds of that was the trellis decoder building
+each subset's list of points afresh for each of thirty-two branches a
+symbol, fifty thousand lists a block; it now reads eight metrics a
+symbol from tables, and the pump takes 2 ms. Replay traces are bit for
+bit what they were. And capture was arriving in lumps of thirteen
+blocks: pw-cat 1.6 writes raw audio through a C stream, a stream into a
+pipe is block buffered, and 4096 bytes at 8 kHz is 256 ms. So the loop
+had to work through thirteen blocks at 14 ms each in the 256 ms before
+the next thirteen. When it could not, no read waited; the keeper, which
+stamped every block of a burst with the last arrival it had seen, read
+the capture clock high, let its settled level follow, and on catching
+up found a "loss" of 12 to 44 ms and wrote that much silence to
+playback. Our own echo then came back later by exactly the silence
+(`scripts/diag/echolag.py`: 6045 samples before, 6145 after, on a
+12.5 ms top-up), the canceller's taps were set for where it had been,
+and the receiver went from 28 dB to 17. Four of the six. The keeper now
+measures only at arrivals -- samples read before a read that waited,
+against the instant it returned -- which cannot read high; a model of a
+loop that falls behind is in the suite, and the old keeper adds 370 ms
+of silence in it. Capture runs under `stdbuf -o0` and arrives a graph
+cycle at a time, which took 250 ms off the round trip besides.
+
+**The canceller ran away once, at 10^20 times the line.** An answering
+modem is silent for three seconds between its two conditioning signals.
+The first far scan after that silence held a reference that was empty
+but for sixteen samples of the second signal's leading edge; nine lags
+in ten scored nothing, so the mean was nearly nought and the rival was
+nought, a score of nothing much at 38 ms stood alone, the filter was
+aimed there, and its taps were read off the same sixteen samples --
+each a correlation divided by the energy of a pulse's first rise. A lag
+is now scored only where the reference under it holds half what the
+fullest window does.
+
+**The far search was too slow for an answerer, and is now a
+transform.** It scored a few dozen lags a block because seven thousand
+dot products would not fit in one, so a scan took one to three seconds
+and two had to agree. A caller has been sending for four seconds before
+data and was aimed in time; an answerer starts its second conditioning
+signal 2.7 s before data and was not. Through `--ans-plain` the ATA's
+own canceller usually takes our echo out -- what arrives in the quiet
+window is digital silence -- but on two of the first ten answered calls
+it did not, and such a call opened at 16 dB and retrained at three
+seconds.
+All the lags are now scored at once (`Modec.Xcorr`, three transforms
+taken a block apart), from the first conditioning signal on, where
+Figure 4 keeps the far end silent and the reflection stands alone: 0.6
+against a floor of 0.02. With modec calling, the filter is then trained
+by the full step for the rest of that signal, to 20 to 28 dB, and the
+receiver opens at 27 to 31 dB instead of climbing to it. With modec
+answering and the ATA's canceller half working, what is left is not a
+steady path -- the best fixed filter takes out 7 to 12 dB of it -- and
+that call is still marginal. Whether subtracting helps is now measured
+(the prediction's correlation with the line) rather than assumed from
+how much is predicted, so a reflection that the ATA takes away half a
+second later is no longer subtracted for the rest of the call.
+
+The machine then stopped being idle -- other sessions, load ten to
+thirty for most of the night -- and the calls that failed under it, and
+after it, showed the rest: each reproduced from its recording, or
+measured on the audio path with no modem in it.
+
+**A receiver that follows the line down reads whatever is left on it.**
+Two of the failures were one fault. With our echo taken out, the line
+is silent for two seconds while the caller sends its conditioning
+signal, and the gain went up sixty decibels after it. The timing
+detector divides by the level being tracked; when the answerer's
+signal returned it put out its limit until the gain came back down,
+and the symbol rate estimate was left 3700 ppm out, from which the
+narrowed loop did not return. The receiver read the second TRN at an
+error of 0.2, missed E, and handed the data pump a line it had not
+trained on. While the echo was still on the line the gain had that to
+hold on to and rose 23 dB instead, and the same kick was smaller: this
+is the "true error of 0.15 from the first data symbol" this file
+listed as open, and that recording (20260912T211730), replayed with
+its transmit, now reads 25 to 27 dB from the first symbol.
+
+The other was a lost RTP packet in the middle of a call: 20 ms of
+exact zeros (20261005T013747, at 23.34 s). For those 20 ms the
+receiver was handed the canceller's prediction of our echo subtracted
+from nothing -- a clean V.32 signal twenty decibels down -- and the
+equaliser, whose step is divided by the power in its window, trained
+on it. The line was the same line afterwards, to the last tap; the
+equaliser was not. It read 18 dB where it had read 30, which is over
+the freeze, so it stayed, and one line of the reference's eight
+arrived.
+
+The receiver now waits through a quiet line (`qrFadeHold`): four
+symbols in a row sixteen times under the level, and the gain is held
+and nothing adapts until the signal is back and has filled the
+equaliser. Three seconds of that in the start-up, half a second in
+data. Both recordings are fixtures, each with what modec sent beside
+it, and each fails on the build before.
+
+**Playback came up a block short after one 57 ms block**, with capture
+still buffered: 20 ms of silence in the carrier and the echo 20 ms
+late. Unbuffered, ten calls at a load of fifteen had blocks to 58 ms
+and no step in any echo's delay.
+
+**pw-cat was the one client in the graph that was not real-time.** The
+machine went nearly idle at the end of a run, and three of that run's
+last six calls still lost capture: 43 ms out of the middle of an
+answered call at a load of two (20261005T035323), and the receiver could
+not read the line after it. The I/O trace has it as one read that
+waited 70 ms, after which the capture clock is 43 ms down and stays
+there -- four graph cycles that were never delivered. Every other
+client of the graph works in a real-time thread, which PipeWire's
+library starts and rtkit grants. pw-cat 1.6 has no such thread; it
+copies each cycle in its main one, at whatever priority it was started
+with, and the graph does not wait for a client. Taken apart with no
+modem in it -- a loopback, one pw-cat playing silence into it, another
+recording it, every arrival stamped -- at a load of eight to ten and a
+quantum of 256 frames: 166 ms of capture lost in 45 s and 160 ms in 40,
+a cycle to five cycles at a time; with pw-cat's thread made real-time,
+nothing, both times. modec now asks rtkit for that for both pw-cats
+each time it starts them (`MakeThreadRealtimeWithPID`, which rtkit
+grants for a thread of any process its caller owns), and says so if it
+is refused. This, and not PipeWire, is what was losing cycles at a load
+of thirty earlier in the night, and the CPU weight the harness gives a
+call was the same remedy from further away.
+
+**The graph was not ours.** The softphone path is wired to no device,
+and PipeWire runs a graph with no device in it on whichever driver is
+going: its dummy driver while the machine is silent, the sound card's
+once anything plays. During that run a browser began to play (rtkit's
+log has its audio thread at 03:55:27), and from the next call every
+arrival was the sound card's: its quantum, and its crystal, 16 ppm off
+the machine's clock where the calls before show none. Then a mixer
+window was opened. Its level meters ask a few milliseconds' latency of
+every node they watch, ours among them, and the quantum went from 512
+frames to 256 in the middle of a measurement; that run lost 19 ms of
+capture where the runs either side of it lost none, and a meter
+attached on purpose, 256 to 128, cost 3 ms at the instant it attached.
+Two properties on our nodes now: `node.group = pipewire.dummy`, the
+dummy driver's own group, which keeps them on it whatever the sound
+card is doing, and `node.force-quantum = 960`, which nothing linked to
+them can ask its way past. 960 frames of the graph's 48 kHz is the
+loop's 20 ms block, so capture arrives a block at a time. With the
+browser playing, the mixer open and a load of nineteen, the capture
+clock of a 50 s call stayed within 0.1 ms of where it began. The
+softphone's streams joining still costs a cycle on some calls, 20 ms
+where it was 9, before either modem has said anything.
+
+**modec was cutting its own line.** With the mixer open, five calls of
+eleven heard nothing or were not heard. Snapshots of the graph through
+them: the link from the line to the softphone's input gone, or the one
+from the softphone's output to us. The softphone's capture sometimes
+gets the default microphone linked in beside the line, and modec takes
+such links out when a call comes up -- any link into a node the line
+feeds, by the node's name. A mixer's meter on the line is a node the
+line feeds, and every meter the mixer has open goes by the mixer's
+name, so the link into each of them from the sound card, the browser
+and everything else was a stray: sixty in one call. They were removed
+by link id, each twice because the listing shows a link at both its
+ends, and PipeWire gives a freed id to the next object made (remove
+link 186, make a link, it is link 186) -- which, as a call comes up, is
+one of the softphone's. The rule goes by port now, and a link is
+removed once, named by the two ports it joins. None of this was in any
+earlier run because no mixer was open in any earlier run.
+
+**A gain hit, and a receiver with no rule for one.** With those three
+in, the machine went quiet and twenty calls were taken: nineteen clean.
+The twentieth (20261005T050643, modec answering) connected, read the
+line at an error of 0.001 for eight seconds, and then could not read it
+at all. The recording has the far end's level doubling at 20.95 s and
+halving again 80 ms later -- four packets -- with the symbol clock
+running straight through; the same recording with those 641 samples
+halved reads through them at the error it had before. It is the ATA,
+which has stepped levels by 6 dB since the first V.22bis call through
+it. The V.32 receiver's gain is slow on purpose and had no rule for a
+step: it went 3 dB after the hit, took half a second to come back, and
+for all of that every point landed on another. At 14400 a decision is
+never far from some point, so nothing that guards the loops saw
+anything wrong, and they trained on it. V.22bis's rule -- hold the loops
+when the last dozen symbols' power leaves the run before them, take the
+new level outright once it has lasted -- is now on every V.32 rate with
+the slow gain. The recording is a fixture. Without the rule it retrains
+two seconds after the hit, at a pinned rate with nothing to retrain to;
+with it the receiver is reading a quarter of a second after, and the
+reference's eight lines, which the live call never saw, all arrive.
+
+**What the fixtures said.** Three had been failing since the TRN went
+from 1400 to 4096 symbols. A replay regenerates its transmit, and a
+recording's far end is answering the transmit of the day; with a
+longer TRN the replay was still sending when the far end had moved on.
+A fixture now says which TRN it was recorded under (`trn:`), and two
+of the three pass as they were. The third pinned three hundred bytes
+of a far end's last half second, a pattern repeating every six bits
+that does not decode to one thing; it and its twin stop at 31 s now,
+with every byte before that unchanged. And a fixture can carry what
+modec sent on the call (`NAME.sent`), which is what lets a bench call
+with its echo be one at all.
+
+**Where it stands.** The baseline was fourteen of twenty. With the
+audio path mended the machine went quiet -- a load of one to four -- and
+stayed in use as a desktop, a browser playing and a mixer open, and two
+runs of twenty were taken: nineteen clean, and nineteen clean. Placing
+calls at a pinned 14400, sixteen of sixteen. Placing them against the
+reference's automode, eight of eight, each at 14400. Answering with the
+plain tone, fourteen of sixteen. One of those two was the gain hit,
+mended between the runs. The other is what the plain tone has always
+risked: the ATA's canceller left in charge of our echo and not taking
+it out (20261005T052950 -- the reflection at 525 ms, a decision error
+of 0.0088 from the first symbol, and modec's canceller, aimed at a path
+that was not steady, not helping).
+
+So S10's A2 was run, which this file had listed as untried since
+modec's canceller could reach the reflection. Answering with the V.25
+reversals, which stand the ATA's canceller down for the call: twenty
+four of twenty four, eight lines each way on every one, no retrain.
+The reflection is there on each -- 0.5 to 1.2 % of the line, at 495 to
+545 ms -- modec's canceller is on, and the receiver's error is 0.0014
+at the median of 120 reports. `--ans-plain` was the bench's answer for
+as long as modec's canceller could not do that; the harness answers
+with the reversals now, and `BENCH_ANS_PLAIN=1` is the old way.
+
+Under load, where the night's calls came apart: three of three at a
+load of seventeen once pw-cat was real-time, with capture not a
+millisecond short.
+
+And S0 on the committed code (2c200d9), every mode both ways once, as
+the check that none of this cost the other ten modes: twenty of twenty
+two. Answering, all eleven, the six V.32 rates with the reversals.
+Calling, nine of eleven, and neither miss is the receiver this pass
+worked on. V.32 at 9600 uncoded lost seven characters of one line. The
+recording loses the same seven with this pass's receiver changes and
+without them, there is no hole and no hit under them, and that rate
+reads the line at 0.003 to 0.007 with moments of 0.02 where 14400 reads
+it at 0.001: the sixteen-point receiver's own loops, which were short a
+line in September too. V.21 calling: the reference read one line of
+eight and misframed the rest, after our echo came back 32 samples
+sooner from one second to the next -- 4 ms, a bit and a fifth at 300
+bit/s -- with nothing in modec's log. V.21 calling was then run six
+more times, six clean, no step in any.
+
+**Still open.**
+
+- Lost packets: 20 to 60 ms of the received audio gone, once every few
+  calls. They no longer cost the call, and still cost the line or two
+  of an unprotected payload that was in them. The path, and what error
+  control is for. The same goes for a gain hit, which costs a quarter
+  of a second.
+- A pinned call cannot retrain: the offer below the pinned rate is
+  empty, so a receiver that loses the line stays lost. Right for the
+  bench, where the rate is the test; wrong anywhere else.
+- The canceller's on-and-off rule let go once in the twenty-four
+  answered calls, for one report, with the reflection where it had
+  been; the error went to 0.0073 while it was off and the call lost
+  nothing. At 14400 an uncancelled reflection at 0.6 % of the line is
+  most of the margin, so the rule wants a longer look before it lets
+  go.
+- A start-up that fails grows the heap while it waits: by the time a
+  caller gives up on an answerer it cannot hear, forty seconds in, a
+  block every few seconds takes 160 ms. It costs nothing a failing
+  call had left, and is not right.
+- The softphone's streams joining still costs a graph cycle on some
+  calls -- three of forty, 20 ms each, before either modem has spoken.
+- The echo's delay still steps on one call in fifty with nothing in
+  modec's log: by 80 samples, which is one of the ATA's 10 ms frames
+  and is in September's recordings as often, and once by 32 the other
+  way, the V.21 call above, which is in none of the 380 calls looked
+  at before it and whose origin is not known. At 14400 a 10 ms slip is
+  twenty-four symbols and eighteen turns of the carrier exactly, and
+  the receiver rides through it; but the canceller's taps are then
+  10 ms out, and for the seconds it takes the search to find the
+  reflection again the receiver is at 0.0086, which at 14400 is not
+  reading (S0's 14400 call, after its payload). The search should be
+  told at once when a canceller that was helping stops.
+- V.32 at 9600 uncoded, as above: the loops of the sixteen-point
+  receiver put more into the decision than the line does.
+- The CX93001 sent five-bit characters for a whole call once, the first
+  call after the host was rebooted (20261005T012108). The reference,
+  as before.
+- The no-rate R3 was seen once in thirty-odd calls, under load, on a
+  call whose start-up had blocks of 72 ms in it, and not in the ninety
+  since. It may always have been holes in our TRN: the
+  quiet-window echo search that this pass took out of live calls cost
+  most of every block for exactly as long as the TRN lasted.
 
 ## Order and cost
 

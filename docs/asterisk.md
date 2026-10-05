@@ -79,7 +79,7 @@ speech default that is wrong for data:
 | Preferred Vocoder 1 | PCMU | and leave 2-8 blank |
 | Voice Frames per TX | 2 | 20 ms, matching the loopback block size |
 | Silence Suppression | No | CNG during a V.8 silence wrecks [Modec.V8](../src/Modec/V8.hs) |
-| Disable Line Echo Canceller | No | keep it on -- and run modec with `--ans-plain`, or the V.25 reversals in its answer tone tell the ATA's canceller to stand down for the call, and the hybrid's reflection comes back through the softphone 1.2 s later where modec's own canceller cannot reach it. See reference-modem.md, "The fix was one bit in the answer tone" |
+| Disable Line Echo Canceller | No | keep it on. A V.32 answer tone carries V.25 reversals, which tell this canceller to stand down for the call, and the hybrid's reflection then comes back through the softphone half a second later for modec's own canceller to take out -- which it does: twenty-four 14400 calls of twenty-four answered that way on the bench (bench-tests.md, "What the third pass found"). `--ans-plain` sends the tone without the reversals and leaves this canceller in the path instead; that was the advice here while modec's could not reach the reflection (reference-modem.md, "The fix was one bit in the answer tone"), and it lost about one 14400 call in ten, when this canceller did not take the reflection out either |
 | Disable Network Echo Suppressor | Yes | |
 | Jitter Buffer Type | Fixed | adaptive buffers insert and drop samples |
 | Jitter Buffer Length | High | latency is free, dropped samples are not |
