@@ -88,6 +88,7 @@ import Data.Maybe (listToMaybe)
 import Data.Bits (setBit, testBit, (.|.))
 import Control.Monad (replicateM)
 import Data.List (foldl')
+import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 
 import Modec.Link
@@ -358,12 +359,38 @@ constellation r i = pointsFor r VU.! (i `mod` VU.length (pointsFor r))
 -- altogether at 14400, where they are 0.11.  Anything that compares a
 -- decision error against a fixed number is really comparing it against
 -- six different things depending on the rate.
+--
+-- Worked out once per rate and kept.  It is every pair of points -- eight
+-- thousand of them at 14400 -- and the receiver's configuration asks for
+-- it four times a block: recomputed each time it was a tenth of what the
+-- 14400 pump allocated.
 rateMargin :: V32Rate -> Double
-rateMargin r = 0.5 * sqrt (minimum [ dist2 (ps VU.! i) (ps VU.! j)
-                                   | i <- [0 .. n - 1], j <- [i + 1 .. n - 1] ])
-  where
-    ps = pointsFor r
-    n = VU.length ps
+rateMargin r = case r of
+  V32R4800 -> margin4800
+  V32R7200 -> margin7200
+  V32R9600 -> margin9600
+  V32R9600T -> margin9600T
+  V32R12000 -> margin12000
+  V32R14400 -> margin14400
+
+margin4800, margin7200, margin9600, margin9600T, margin12000, margin14400 :: Double
+margin4800 = marginOf pts4800
+margin7200 = marginOf pts7200
+margin9600 = marginOf pts9600
+margin9600T = marginOf pts9600T
+margin12000 = marginOf pts12000
+margin14400 = marginOf pts14400
+{-# NOINLINE margin4800 #-}
+{-# NOINLINE margin7200 #-}
+{-# NOINLINE margin9600 #-}
+{-# NOINLINE margin9600T #-}
+{-# NOINLINE margin12000 #-}
+{-# NOINLINE margin14400 #-}
+
+marginOf :: VU.Vector (Double, Double) -> Double
+marginOf ps = 0.5 * sqrt (minimum [ dist2 (ps VU.! i) (ps VU.! j)
+                                  | i <- [0 .. n - 1], j <- [i + 1 .. n - 1] ])
+  where n = VU.length ps
 
 -- | The margin a /decision/ actually has, which on a trellis alternative
 -- is not the distance between neighbouring points.
@@ -384,8 +411,17 @@ rateDecisionMargin r
   | otherwise = rateMargin r
 
 slicePoint :: V32Rate -> Point -> Int
-slicePoint r p = snd (minimum [ (dist2 p (ps VU.! i), i) | i <- [0 .. VU.length ps - 1] ])
-  where ps = pointsFor r
+slicePoint r p = go 1 0 (dist2 p (VU.unsafeIndex ps 0))
+  where
+    ps = pointsFor r
+    n = VU.length ps
+    -- the first of the nearest, which is what the minimum of
+    -- (distance, index) pairs chose
+    go !i !k !best
+      | i >= n = k
+      | otherwise =
+          let d = dist2 p (VU.unsafeIndex ps i)
+          in if best <= d then go (i + 1) k best else go (i + 1) i d
 
 dist2 :: Point -> Point -> Double
 dist2 (a, b) (c, d) = (a - c) * (a - c) + (b - d) * (b - d)
@@ -395,9 +431,70 @@ dist2 (a, b) (c, d) = (a - c) * (a - c) + (b - d) * (b - d)
 -- decoder's branch metric.  How many uncoded bits there are is the only
 -- thing that changes between 7200 and 14400.
 subsetPoint :: V32Rate -> Point -> (Bool, Bool, Bool) -> (Double, [Bool])
-subsetPoint r p (y0, y1, y2) = minimum
-  [ (dist2 p (constellation r (bitsToInt ([y0, y1, y2] ++ q))), q)
-  | q <- replicateM (rateUncoded r) [False, True] ]
+subsetPoint r p (y0, y1, y2) = subsetBest (V.unsafeIndex (subsetsFor r) (subsetIndex y0 y1 y2)) p
+
+-- | One trellis subset: its points, and the uncoded bits that name each,
+-- in the order those bits count up in.
+data Subset = Subset !(VU.Vector (Double, Double)) !(V.Vector [Bool])
+
+-- | Y0 Y1 Y2 as a number, Y0 most significant: which of the eight
+-- subsets a branch of the trellis sends.
+subsetIndex :: Bool -> Bool -> Bool -> Int
+subsetIndex y0 y1 y2 = (if y0 then 4 else 0) + (if y1 then 2 else 0) + (if y2 then 1 else 0)
+
+-- | The nearest point of one subset.
+--
+-- This is the receiver's inner loop -- every symbol is measured against
+-- every point -- and it used to build the subset afresh each time it was
+-- asked: a list of bit lists, each turned into an index and looked up.
+-- On the 128-point set that was sixteen lists a subset, and the decoder
+-- asked once for each of its thirty-two branches rather than once for
+-- each of the eight subsets, so one 20 ms block of 14400 cost fifty
+-- thousand of them.  Live, the pump took thirteen of the twenty
+-- milliseconds, the loop fell behind the audio, and calls died of it.
+--
+-- The same distances in the same order, and the first of the nearest
+-- kept, which is what the minimum of (distance, bits) pairs chose: the
+-- bits are listed counting up, so the earlier of two equal distances is
+-- also the smaller pair.
+subsetBest :: Subset -> Point -> (Double, [Bool])
+subsetBest (Subset ps qs) p = go 1 0 (dist2 p (VU.unsafeIndex ps 0))
+  where
+    n = VU.length ps
+    go !i !k !best
+      | i >= n = (best, V.unsafeIndex qs k)
+      | otherwise =
+          let d = dist2 p (VU.unsafeIndex ps i)
+          in if best <= d then go (i + 1) k best else go (i + 1) i d
+
+subsetsFor :: V32Rate -> V.Vector Subset
+subsetsFor r = case r of
+  V32R4800 -> subsets4800
+  V32R7200 -> subsets7200
+  V32R9600 -> subsets9600
+  V32R9600T -> subsets9600T
+  V32R12000 -> subsets12000
+  V32R14400 -> subsets14400
+
+subsets4800, subsets7200, subsets9600, subsets9600T, subsets12000, subsets14400 :: V.Vector Subset
+subsets4800 = subsetsOf V32R4800
+subsets7200 = subsetsOf V32R7200
+subsets9600 = subsetsOf V32R9600
+subsets9600T = subsetsOf V32R9600T
+subsets12000 = subsetsOf V32R12000
+subsets14400 = subsetsOf V32R14400
+{-# NOINLINE subsets4800 #-}
+{-# NOINLINE subsets7200 #-}
+{-# NOINLINE subsets9600 #-}
+{-# NOINLINE subsets9600T #-}
+{-# NOINLINE subsets12000 #-}
+{-# NOINLINE subsets14400 #-}
+
+subsetsOf :: V32Rate -> V.Vector Subset
+subsetsOf r = V.fromList
+  [ Subset (VU.fromList [ constellation r (bitsToInt (y ++ q)) | q <- qs ]) (V.fromList qs)
+  | y <- replicateM 3 [False, True] ]
+  where qs = replicateM (rateUncoded r) [False, True]
 
 bitsToInt :: [Bool] -> Int
 bitsToInt = foldl' (\acc b -> acc * 2 + (if b then 1 else 0)) 0
@@ -532,16 +629,35 @@ viterbiDecodeStates rate depth = go start (0 :: Int)
 
     bestOf sts = snd (minimum [ (m, (m, h)) | (m, h) <- sts ])
 
+    -- Eight branch metrics a symbol, one per subset, shared by the four
+    -- branches that send each; and the branches into a state read from a
+    -- table rather than found by running the encoder from every state
+    -- and keeping the ones that land.  The candidates into each state
+    -- are the same ones in the same order, so the survivor is the same.
+    subsets = subsetsFor rate
     step sts p =
       [ pick s' | s' <- [0 .. 7] ]
       where
-        cands =
-          [ (s', (m + bm, take (depth + 1) ((ConvState s', (y1, y2, q)) : hist)))
-          | (s, (m, hist)) <- zip [0 ..] sts
-          , (y1, y2) <- [(False, False), (False, True), (True, False), (True, True)]
-          , let (ConvState s', y0) = convStep (ConvState s) (y1, y2)
-          , let (bm, q) = subsetPoint rate p (y0, y1, y2) ]
-        pick s' = minimum [ c | (t, c) <- cands, t == s' ]
+        bms = V.map (\sub -> subsetBest sub p) subsets
+        from = V.fromListN 8 sts
+        pick s' = minimum
+          [ (m + bm, take (depth + 1) ((ConvState s', (y1, y2, q)) : hist))
+          | (s, y1, y2, sub) <- V.unsafeIndex trellisInto s'
+          , let (m, hist) = V.unsafeIndex from s
+          , let (bm, q) = V.unsafeIndex bms sub ]
+
+-- | The branches into each state of the trellis: the state each leaves,
+-- the Y1 Y2 that takes it, and the subset (Y0 Y1 Y2) it puts on the
+-- line.  In the order the states and dibits count up in.
+trellisInto :: V.Vector [(Int, Bool, Bool, Int)]
+trellisInto = V.fromList
+  [ [ (s, y1, y2, subsetIndex y0 y1 y2)
+    | s <- [0 .. 7]
+    , (y1, y2) <- [(False, False), (False, True), (True, False), (True, True)]
+    , let (ConvState t, y0) = convStep (ConvState s) (y1, y2)
+    , t == s' ]
+  | s' <- [0 .. 7 :: Int] ]
+{-# NOINLINE trellisInto #-}
 
 -- | Segment 3 of the receiver conditioning signal (§5.2.3): binary ones
 -- scrambled at 4800 bit\/s from an all-zero register, with the
