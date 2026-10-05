@@ -463,12 +463,14 @@ data QamRxState = QamRxState
   , rxSps     :: !Double
   , rxPrevSym :: !(Double, Double)
   , rxPower_  :: !Double
-  , rxPowHist :: [Double]   -- ^ 'qrAgcStep''s recent symbol powers, newest first
-  , rxEqPowHist :: [Double] -- ^ ...and the equaliser's output powers, which show the constellation's rings
-  , rxLoopHist :: [(Double, Double)] -- ^ the carrier loop's (phase, frequency) over the last symbols, newest first
+  , rxPowHist :: ![Double]  -- ^ 'qrAgcStep''s recent symbol powers, newest first.  This and the two below are built by 'keep'
+  , rxEqPowHist :: ![Double] -- ^ ...and the equaliser's output powers, which show the constellation's rings
+  , rxLoopHist :: ![(Double, Double)] -- ^ the carrier loop's (phase, frequency) over the last symbols, newest first
   , rxStepping :: !Bool     -- ^ 'qrAgcStep' held the loops on the last symbol
   , rxFadeRun :: !Int       -- ^ 'qrFadeHold': symbols the line has been quiet for
   , rxSinceFade :: !Int     -- ^ and symbols since it last was
+  , rxSpsMean :: !Double    -- ^ the symbol clock, averaged while there was a signal to steer by: what a quiet line is coasted through on
+  , rxSpsMeanN :: !Int      -- ^ symbols in that average, to its limit
   , rxSinceHold :: !Int     -- ^ symbols since it last did
   , rxTheta   :: !Double
   , rxFreq    :: !Double
@@ -527,7 +529,7 @@ qamRxInitWith p cfg seed = QamRxState
   , rxPrevRe = VS.replicate carry 0, rxPrevIm = VS.replicate carry 0
   , rxTau = fromIntegral carry + srTau0 seed, rxSps = sps
   , rxPrevSym = srPrev0 seed, rxPower_ = srPower0 seed, rxPowHist = [], rxEqPowHist = [], rxLoopHist = [], rxStepping = False, rxSinceHold = maxBound `div` 2
-  , rxFadeRun = 0, rxSinceFade = maxBound `div` 2
+  , rxFadeRun = 0, rxSinceFade = maxBound `div` 2, rxSpsMean = sps, rxSpsMeanN = 0
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
@@ -554,7 +556,7 @@ qamRxReset _ cfg st = st
   , rxLineRe = if qrResetLine cfg then VS.replicate taps 0 else rxLineRe st
   , rxLineIm = if qrResetLine cfg then VS.replicate taps 0 else rxLineIm st
   , rxEvm_ = srEvm0 (rxSeed st), rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
-  , rxTiming = False, rxFadeRun = 0, rxSinceFade = maxBound `div` 2 }
+  , rxTiming = False, rxFadeRun = 0, rxSinceFade = maxBound `div` 2, rxSpsMeanN = 0 }
   where taps = qrEqTaps cfg
 
 -- | Forget that the receiver has ever locked, keeping everything it has
@@ -635,6 +637,36 @@ agcSettleSyms = 512
 -- further than a step takes to be seen.
 stepRewind :: Int
 stepRewind = 8
+
+-- | Symbols the symbol clock's average runs over: the better part of a
+-- second at 2400 baud, which is most of a far end's training.
+spsMeanSpan :: Int
+spsMeanSpan = 2048
+
+-- | The first @n@ of a list, cut now, each element worked out with it.
+--
+-- The receiver's short histories are a new value on the front of the
+-- last few, every symbol, and 'take' does not cut the rest off until
+-- somebody reads that far.  A configuration with no step rule never
+-- reads the powers at all, and none reads the loop's history except at
+-- a step; so each symbol's list was the new value and a promise to cut
+-- the list before it, which was the same, all the way back to the
+-- receiver's first symbol -- with the two samples each power was to be
+-- worked out from kept alongside.  Measured on recorded calls run
+-- through the live loop: 0.8 MB a second through a V.32 start-up, which
+-- then began again from nothing in data mode unless the rate was 4800,
+-- where it went on for the length of the call; and 0.17 MB a second for
+-- the whole of a call at 1200 bit/s, ten megabytes a minute.  A
+-- collection takes as long as there is heap to go through, and in a
+-- loop with 20 ms a block every one of them is a block that goes out
+-- late: 40 ms by the end of a start-up on a live call, and whatever an
+-- hour at 1200 had grown to.
+keep :: Int -> [a] -> [a]
+keep n xs
+  | n <= 0 = []
+  | otherwise = case xs of
+      [] -> []
+      (y : ys) -> let rest = keep (n - 1) ys in y `seq` rest `seq` (y : rest)
 
 -- | Whether the timing loop has narrowed: see 'qrTrackAt'.  For tests
 -- and for tracing, where it is the first thing to ask of a receiver
@@ -872,7 +904,27 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- thousands of symbols, which is a cost with nothing
               -- bought by it -- the wander was never information.
               steer = if moving then e else 0
-              sps' = sps - kiNow * steer
+              -- Through a quiet line the clock coasts, and on its average
+              -- rather than on wherever the loop happened to be when the
+              -- line went quiet.  The loop's rate is the far end's plus
+              -- the loop's own noise, which read block to block through
+              -- a far end's training runs 3.3326 to 3.3338 samples a
+              -- symbol about a mean it holds to a few parts in a hundred
+              -- thousand.  Figure 4 has an answering modem silent for the
+              -- 2.4 s of the caller's conditioning signal.  Held at the
+              -- last reading -- 3.33291 on bench call 20261005T163040,
+              -- against a mean of 3.33315 -- the clock came back 0.41 of a
+              -- symbol out, the loop was kicked 2400 ppm getting there,
+              -- had not settled when the data began, and the call was
+              -- lost at an error of 0.015.  Coasting on the mean it comes
+              -- back where it left.
+              (spsMean', spsMeanN')
+                | fadedNow || waiting || not (rxTiming st) || not moving = (rxSpsMean st, rxSpsMeanN st)
+                | otherwise = let k = min spsMeanSpan (rxSpsMeanN st + 1)
+                              in (rxSpsMean st + (sps - rxSpsMean st) / fromIntegral k, k)
+              coast = fadedNow && rxSpsMeanN st >= spsMeanSpan `div` 8
+              sps' | coast = rxSpsMean st
+                   | otherwise = sps - kiNow * steer
               tau' = tau + max (0.5 * sps) (sps' - kpNow * steer)
 
               agc = if pw < 1e-9 then 0 else sqrt (qrPower cfg / pw)
@@ -1048,13 +1100,15 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               bad = if qrAdapt cfg && locked && evm > badAt then rxBad st + 1 else 0
               st1 = st { rxTau = tau'
                        , rxSps = max (0.9 * nominalSps) (min (1.1 * nominalSps) sps')
-                       , rxPrevSym = (yr, yi), rxPower_ = pw, rxPowHist = powHist, rxEqPowHist = take 48 ((ur * ur + ui * ui) : rxEqPowHist st)
-                       , rxLoopHist = take stepRewind ((theta', freq') : rxLoopHist st), rxStepping = stepping
+                       , rxPrevSym = (yr, yi), rxPower_ = pw, rxPowHist = keep 72 powHist
+                       , rxEqPowHist = keep 48 ((ur * ur + ui * ui) : rxEqPowHist st)
+                       , rxLoopHist = keep stepRewind ((theta' `seq` freq' `seq` (theta', freq')) : rxLoopHist st), rxStepping = stepping
                        , rxSinceHold = if stepping then 0 else min (maxBound `div` 2) (rxSinceHold st + 1)
                        , rxFadeRun = if fadedNow then rxFadeRun st + 1
                                      else if recent4 * maybe 1 fst (qrFadeHold cfg) < rxPower_ st then rxFadeRun st
                                      else 0
                        , rxSinceFade = if fadedNow then 0 else min (maxBound `div` 2) (rxSinceFade st + 1)
+                       , rxSpsMean = spsMean', rxSpsMeanN = spsMeanN'
                        , rxTheta = theta', rxFreq = freq'
                        , rxEqRe = eqRe', rxEqIm = eqIm'
                        , rxLineRe = lineRe, rxLineIm = lineIm

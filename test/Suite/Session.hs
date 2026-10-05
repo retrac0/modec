@@ -70,7 +70,7 @@ scripted blocks = do
         , seLost = return False
         , seStartCall = return . startCall
         , seParams = defaultProgressParams
-        , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ -> return ()
+        , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ _ -> return ()
         }
   return (se, out, toDte, lg)
 
@@ -214,7 +214,7 @@ callThroughLoop = do
         , seLost = return False
         , seStartCall = return . startCall
         , seParams = defaultProgressParams
-        , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ -> return ()
+        , seLine = line, seBanner = banner, seBlock = blk, seSlow = \_ _ _ -> return ()
         }
 
   connected <- newIORef False

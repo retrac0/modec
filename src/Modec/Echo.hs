@@ -52,7 +52,7 @@ import qualified Data.Vector.Storable as VS
 
 import Modec.DSP
 import qualified Data.Vector.Unboxed as VU
-import Modec.Xcorr (Spectrum, correlationFrom, crossSpectrum, prefixSums, transformReal, transformSize)
+import Modec.Xcorr (Spectrum, Staged, correlationFrom, prefixSums, stageCross, stageDone, stageReal, stageRun, transformSize)
 
 data EchoConfig = EchoConfig
   { ecTaps  :: !Int      -- ^ filter length, samples
@@ -143,6 +143,7 @@ data EchoState = EchoState
   , esVote   :: !(Maybe Int)  -- ^ what the last completed scan found
   , esLast   :: !(Int, Double, Double, Double)  -- ^ the last finished scan: lag, best, mean, rival
   , esVotes  :: [Int]         -- ^ the best lags of the last few scans, newest first
+  , esMisses :: !Int          -- ^ scans in a row that showed no peak worth the name
   , esRefBp  :: [Signal]      -- ^ the reference, band-limited, for the scan: blocks, newest first
   , esRefBpN :: !Int          -- ^ how many samples those blocks hold
   , esRxBp   :: [Signal]      -- ^ the line, band-limited, likewise
@@ -194,14 +195,24 @@ data Scan = Scan
   , scXc      :: Signal    -- ^ the window against the reference, by offset into it
   }
 
--- | A scan under way.  It is three transforms, and they are taken a
--- block apart: one transform of this size is two milliseconds on an
--- idle machine and seven on a busy one, and a real-time loop is judged
--- by its worst block.
+-- | A scan under way.  It is three transforms, and each is taken a few
+-- stages a block ('scanWork'): a whole one was two milliseconds when it
+-- was measured alone and 6 to 24 in the middle of a live call, on a
+-- processor that had slowed down between blocks, and a real-time loop
+-- is judged by its worst block.
 data ScanJob
-  = ScanHeard !Scan !Spectrum            -- ^ the line's window is transformed
-  | ScanSent !Scan !Spectrum !Spectrum   -- ^ and the reference
-  | ScanDone !Scan                       -- ^ and the two are correlated: to be judged
+  = ScanBegun !Scan                       -- ^ the windows are cut and nothing else yet
+  | ScanHearing !Scan !Staged             -- ^ the line's window, being transformed
+  | ScanSending !Scan !Spectrum !Staged   -- ^ then the reference
+  | ScanCrossing !Scan !Staged            -- ^ then the two against each other
+  | ScanDone !Scan                        -- ^ correlated: to be judged
+
+-- | How much of a transform one block takes, in butterflies: three
+-- stages of the 32768 points a scan with the far end talking needs, six
+-- of the 16384 a short one does.  A fifth of a transform, or under five
+-- milliseconds of the slowest measured.
+scanWork :: Int
+scanWork = 49152
 
 echoInit :: EchoConfig -> EchoState
 echoInit cfg = EchoState
@@ -210,7 +221,7 @@ echoInit cfg = EchoState
   , esTaps = VS.replicate (ecTaps cfg) 0
   , esEchoP = 0, esResP = 0, esEchoY = 0, esOn = False
   , esRxHist = VS.empty, esFound = Nothing, esScanAt = 0, esScan = Nothing, esVote = Nothing, esLast = (0, 0, 0, 0)
-  , esVotes = [], esRefBp = [], esRefBpN = 0, esRxBp = [], esRxBpN = 0
+  , esVotes = [], esMisses = 0, esRefBp = [], esRefBpN = 0, esRxBp = [], esRxBpN = 0
   , esRefFir = VS.replicate 64 0, esRxFir = VS.replicate 64 0, esEstimated = False
   , esCorYD = 0, esCorYY = 0, esCorN = 0, esTrained = False }
 
@@ -544,29 +555,48 @@ echoRun cfg mode rx st0 = (st', out)
 -- far end talking, more when it is known to be silent.
 stepScan :: EchoConfig -> Int -> EchoState -> EchoState
 stepScan cfg short0 st = case esScan st of
-  Just (ScanHeard sc heard) ->
-    let sent = transformReal (VU.length (fst heard)) (scRef sc)
-    in ready sent `seq` st { esScan = Just (ScanSent sc heard sent) }
-  Just (ScanSent sc heard sent) ->
-    let xc = correlationFrom (VS.length (scRef sc) - VS.length (scRxC sc) + 1) (crossSpectrum heard sent)
-    in xc `seq` st { esScan = Just (ScanDone sc { scXc = xc }) }
+  -- A block either begins a transform or takes some stages of one, and
+  -- never both: beginning is a pass over the points and their
+  -- rearrangement, a stage and a half's worth, and on top of a block's
+  -- share of stages it was the one block of a scan that ran long.
+  Just (ScanBegun sc) ->
+    st { esScan = Just (ScanHearing sc (stageReal (transformSize (VS.length (scRef sc))) (scRxC sc))) }
+  Just (ScanHearing sc job) -> case stageDone job of
+    Just heard -> st { esScan = Just (ScanSending sc heard (stageReal (VU.length (fst heard)) (scRef sc))) }
+    Nothing -> st { esScan = Just (ScanHearing sc (stageRun scanWork job)) }
+  Just (ScanSending sc heard job) -> case stageDone job of
+    Just sent -> st { esScan = Just (ScanCrossing sc (stageCross heard sent)) }
+    Nothing -> st { esScan = Just (ScanSending sc heard (stageRun scanWork job)) }
+  Just (ScanCrossing sc job) -> case stageDone job of
+    Just cross ->
+      let xc = correlationFrom (VS.length (scRef sc) - VS.length (scRxC sc) + 1) cross
+      in xc `seq` st { esScan = Just (ScanDone sc { scXc = xc }) }
+    Nothing -> st { esScan = Just (ScanCrossing sc (stageRun scanWork job)) }
   Just (ScanDone sc) -> (finishScan cfg st sc) { esScan = Nothing }
   Nothing
     | esRxAt st < esScanAt st -> st
     | otherwise -> case startScan cfg (ecFarWindow cfg `div` short) st of
         -- not enough heard, or nothing sent to look for: ask again soon
         Nothing -> st { esScanAt = esRxAt st + ecFarEvery cfg `div` 8 }
-        Just sc ->
-          let heard = transformReal (transformSize (VS.length (scRef sc))) (scRxC sc)
-          in ready heard `seq` st { esScan = Just (ScanHeard sc heard)
-                                 , esScanAt = esRxAt st + ecFarEvery cfg `div` short }
+        Just sc -> st { esScan = Just (ScanBegun sc)
+                      , esScanAt = esRxAt st + (ecFarEvery cfg `div` short) * patience }
   where
-    ready (re, im) = re `seq` im `seq` ()
     -- Often and short only until the reflection is found: after that
     -- the filter is adapting to it and the search has nothing to add
     -- that is worth four transforms a quarter second, in the stretch of
     -- the start-up where a late block is a hole in our own TRN.
     short = if esFound st == Nothing then short0 else 1
+    -- And less often the longer there is nothing to find.  A line with
+    -- no reflection on it -- a call out through a trunk, where the
+    -- far end's hybrid is the far end's business -- was searched once a
+    -- second for as long as the call lasted, a third of every second
+    -- spent with a scan's stages on top of the block's own work.  With
+    -- the far end talking and nothing ever aimed at, every four scans
+    -- in a row that show no peak double the wait, to eight seconds; a
+    -- scan that shows one puts it back.
+    patience
+      | esFound st == Nothing && short0 == 1 = min 8 (2 ^ (esMisses st `div` 4 :: Int))
+      | otherwise = 1
 
 startScan :: EchoConfig -> Int -> EchoState -> Maybe Scan
 startScan cfg window st
@@ -688,7 +718,8 @@ finishScan cfg st sc
     moved = maybe True (\f -> abs (f - bestLag) > 4) (esFound st1)
     -- only around where the aim put the peak -- 'ecPre' in from the start
     estimateFrom s = finishEst cfg sc [ (k, tapOf sc (esDelay s) k) | k <- [0 .. ecTaps cfg - 1], abs (k - ecPre cfg) <= 48 ] s
-    st1 = st { esLast = (bestLag, best, avg, rival), esVotes = votes }
+    st1 = st { esLast = (bestLag, best, avg, rival), esVotes = votes
+             , esMisses = if showing then 0 else esMisses st + 1 }
     scores = scanScores sc
     best = maximum (map fst scores)
     bestLag = snd (head [ p | p <- scores, fst p == best ])

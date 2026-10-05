@@ -44,6 +44,14 @@ level. Build any of them against the library:
 - `iotrace.py FILE [FROM TO]` -- a `MODEC_IO_TRACE` taken apart: how
   capture arrived, the capture clock after each arrival, and whether the
   loop kept up with it.
+- `heapcall.py RECORDING.wav [modem options]`, or `heapcall.py --s0` --
+  the live modem loop (not `replay`, which keeps everything) over a
+  recorded call as fast as it goes, with the runtime's heap census on:
+  how much was live through the run, what it was made of at the peak,
+  and the longest collection. A heap that climbs for as long as a phase
+  lasts is a call that gets later the longer it stays in it. A live
+  modem takes the same census with `GHCRTS="-hT -i0.5 -s"` in its
+  environment, and leaves `modec.hp` where it was started.
 - `pwstall.py SECONDS [rt] [group NAME] [force FRAMES] [meter] [poke]
   [load N]` -- the softphone path's audio with no modem and no telephone
   in it: a loopback and two pw-cats, every arrival stamped, pw-mon's

@@ -618,7 +618,10 @@ runModem o = do
             , seStartCall = if hayesMode then hayesCall else return . plainCall
             , seParams = defaultProgressParams
             , seLine = lineRef, seBanner = bannerRef, seBlock = blockRef
-            , seSlow = \secs at -> logMsg ("slow block: " ++ show (round (secs * 1000) :: Int) ++ " ms at " ++ show (fromIntegral (round (at * 10) :: Int) / 10 :: Double) ++ " s")
+            , seSlow = \secs at (modem, write, heard) ->
+                let ms x = show (round (x * 1000) :: Int)
+                in logMsg ("slow block: " ++ ms secs ++ " ms at " ++ show (fromIntegral (round (at * 10) :: Int) / 10 :: Double) ++ " s"
+                           ++ " (modem " ++ ms modem ++ ", write " ++ ms write ++ ", listening " ++ ms heard ++ ")")
             }
       if not hayesMode
         then do

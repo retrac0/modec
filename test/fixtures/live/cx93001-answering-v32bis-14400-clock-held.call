@@ -1,0 +1,36 @@
+# 20261005T163040-1001-192-168-30-104-26668.wav
+#
+# A 14400 call modec placed through the bench that connected and could
+# not be read from the first data symbol: one of fifty that afternoon,
+# with nothing wrong on the line.
+#
+# Figure 4 has the answering modem stop for as long as the caller's
+# conditioning signal lasts, here 2.4 s, and the receiver waits that
+# out with its loops still ('Modec.QAM.qrFadeHold').  Its symbol clock
+# was held at the rate the timing loop stood at on the last symbol
+# before the line went quiet -- and a loop's rate is the far end's plus
+# the loop's own noise.  Through the answerer's training this one read
+# between 3.3326 and 3.3338 samples a symbol about a mean of 3.33315,
+# and it stopped on 3.33291.  Over 5760 symbols that is 1.4 samples: the
+# answerer's second training came back 0.41 of a symbol from where the
+# receiver was looking, the loop was kicked 2400 ppm chasing it, was
+# still ringing when B1 arrived, and the data pump was handed a
+# receiver at an error of 0.015.  It asked for a retrain three seconds
+# later, at a pinned rate that has none to offer.
+#
+# The clock now coasts through a quiet line on its average over the
+# signal before it, and comes back where it left: an error of 0.005
+# half a second after the answerer returns, 0.0009 a second after that,
+# and data at 0.0005.
+#
+# Nothing in the text: the far end idles for all of what is kept, and
+# the two bytes are the seam.  The recording stops at 22.0 s because
+# the far end retrains at 22.2, answering the request the live call
+# made at 21.9.
+seconds:   22.0
+role:      originate
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+tolerance: 2

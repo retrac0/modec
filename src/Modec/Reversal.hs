@@ -15,7 +15,10 @@ module Modec.Reversal
   , revPower
   ) where
 
+import Control.Monad.ST (ST, runST)
 import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Unboxed.Mutable as MVU
 
 import Modec.DSP (Signal)
 
@@ -45,7 +48,10 @@ data RevTracker = RevTracker
   { rtW      :: !Double          -- ^ radians per sample at the tone
   , rtN      :: !Int             -- ^ global sample index
   , rtWin    :: !Int
-  , rtHist   :: [(Double, Double)]  -- ^ recent mixed samples, newest first
+  , rtHistRe :: !(VU.Vector Double) -- ^ the last 'rtWin' mixed samples, in a ring
+  , rtHistIm :: !(VU.Vector Double)
+  , rtHistAt :: !Int                -- ^ where in the ring the newest is
+  , rtHistN  :: !Int                -- ^ how many of them there are yet
   , rtAcc    :: !(Double, Double)   -- ^ running sum over the window
   , rtRef    :: !(Maybe (Double, Double))  -- ^ phase before the event
   , rtProj   :: !Double
@@ -65,9 +71,11 @@ revInit fs f = RevTracker
   -- resolution to reject the low ones: three cycles of 3000 Hz is 8
   -- samples, over which a 2100 Hz answer tone does not average away at
   -- all, and the tracker reads it as its own.
-  , rtWin = max 8 (round (fs / 200))
-  , rtHist = [], rtAcc = (0, 0)
+  , rtWin = win
+  , rtHistRe = VU.replicate win 0, rtHistIm = VU.replicate win 0, rtHistAt = win - 1, rtHistN = 0
+  , rtAcc = (0, 0)
   , rtRef = Nothing, rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
+  where win = max 8 (round (fs / 200))
 
 -- | Forget what has been heard so far, but not what time it is.
 --
@@ -79,7 +87,7 @@ revInit fs f = RevTracker
 -- measures a negative delay.
 revRearm :: RevTracker -> RevTracker
 revRearm t = t
-  { rtHist = [], rtAcc = (0, 0), rtRef = Nothing
+  { rtHistN = 0, rtAcc = (0, 0), rtRef = Nothing
   , rtProj = 0, rtLevel = 0, rtPow = 0, rtAge = 0, rtSeen = False, rtHold = 0 }
 
 -- | How much of what is arriving is this tone, from 0 to about 0.71.
@@ -105,21 +113,50 @@ revPower = rtPow
 
 -- | Feed a block; returns the global sample indices at which the tone
 -- reversed phase.
+--
+-- The window is a ring of unboxed samples, summed afresh for every
+-- sample from the newest back.  It was a list -- the new sample on the
+-- front, 'take' to cut it, a fold to add it up, 'length' to see whether
+-- it was full -- forty cells made and forty read three times over for
+-- each sample of each of the four tones a V.32 start-up listens for.
+-- Profiled over the start-up of a live call, that was 29 % of the time
+-- the modem took and 71 % of everything it allocated.  The sum is the
+-- same sum in the same order, so nothing the tracker decides has moved.
 revBlock :: Signal -> RevTracker -> (RevTracker, [Int])
-revBlock chunk st0 = go 0 st0 []
+revBlock chunk st0 = runST $ do
+  re <- VU.thaw (rtHistRe st0)
+  im <- VU.thaw (rtHistIm st0)
+  revLoop chunk re im st0
+
+revLoop :: Signal -> MVU.MVector s Double -> MVU.MVector s Double -> RevTracker -> ST s (RevTracker, [Int])
+revLoop chunk re im = \st0 -> go 0 st0 []
   where
     n = VS.length chunk
+    win = MVU.length re
+    -- newest first, as the list was added up
+    total !at !cnt = sumFrom at cnt 0 0
+    sumFrom !j !left !x !y
+      | left <= 0 = return (x, y)
+      | otherwise = do
+          a <- MVU.unsafeRead re j
+          b <- MVU.unsafeRead im j
+          sumFrom (if j == 0 then win - 1 else j - 1) (left - 1) (x + a) (y + b)
     go !i st acc
-      | i >= n = (st, reverse acc)
-      | otherwise =
+      | i >= n = do
+          re' <- VU.freeze re
+          im' <- VU.freeze im
+          return (st { rtHistRe = re', rtHistIm = im' }, reverse acc)
+      | otherwise = do
           let t = rtN st
               v = VS.unsafeIndex chunk i
               c = cos (rtW st * fromIntegral t)
               sn = sin (rtW st * fromIntegral t)
-              p = (v * c, negate v * sn)
-              hist' = take (rtWin st) (p : rtHist st)
-              (ar, ai) = foldl (\(x, y) (a, b) -> (x + a, y + b)) (0, 0) hist'
-              mag = sqrt (ar * ar + ai * ai) / fromIntegral (rtWin st)
+              at' = if rtHistAt st + 1 >= win then 0 else rtHistAt st + 1
+              cnt' = min win (rtHistN st + 1)
+          MVU.unsafeWrite re at' (v * c)
+          MVU.unsafeWrite im at' (negate v * sn)
+          (ar, ai) <- total at' cnt'
+          let mag = sqrt (ar * ar + ai * ai) / fromIntegral (rtWin st)
               pow = 0.995 * rtPow st + 0.005 * (v * v)
               -- until there is something on the line at all, the ratio
               -- is meaningless rather than large: an empty line divided
@@ -144,7 +181,7 @@ revBlock chunk st0 = go 0 st0 []
               -- silence of 5.4.1's fifth paragraph, where it stopped
               -- transmitting the very signal 5.5.2 needs to see.
               tone = rtAge st >= 4 * rtWin st && lvl > 0.25 && pow > 1e-10
-              full = length hist' >= rtWin st
+              full = cnt' >= rtWin st
               -- the phase to measure against: whatever was established
               -- before, adopted once the tone is steady
               ref = case rtRef st of
@@ -164,13 +201,13 @@ revBlock chunk st0 = go 0 st0 []
               seen = rtSeen st || (full && tone && proj > 0.5 * mag)
               crossed = full && rtHold st == 0 && seen && tone
                         && rtProj st > 0 && proj <= 0
-              st1 = st { rtN = t + 1, rtHist = hist', rtAcc = (ar, ai)
+              st1 = st { rtN = t + 1, rtHistAt = at', rtHistN = cnt', rtAcc = (ar, ai)
                        , rtRef = if crossed then Nothing else ref
                        , rtProj = proj, rtLevel = lvl, rtPow = pow
                        , rtAge = rtAge st + 1
                        , rtSeen = not crossed && seen && tone
                        , rtHold = if crossed then rtWin st * 2 else max 0 (rtHold st - 1) }
-          in if crossed
+          if crossed
                -- the crossing lies between this sample and the last;
                -- the correlation is linear across it, so interpolate
                -- Interpolate between the two samples that straddle the

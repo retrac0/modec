@@ -36,6 +36,7 @@ module Modec.Session
   , runLoop
   ) where
 
+import Control.Exception (evaluate)
 import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as B
 import Data.IORef
@@ -88,7 +89,9 @@ data Session = Session
     -- ^ a greeting held until the link can carry it and the DTE is
     -- online to send it.
   , seBlock     :: IORef Int
-  , seSlow      :: Double -> Double -> IO ()
+  , seSlow      :: Double -> Double -> (Double, Double, Double) -> IO ()
+    -- ^ a block that took too long: how long, when in the call, and how
+    -- much of it was the modem, the write and the listening
     -- ^ told of a block that took longer than it should: seconds it took, seconds into the session
   }
 
@@ -170,9 +173,9 @@ runLoop se co = loop
               -- because the far end reads a late block as a gap in the
               -- carrier and the recording shows nothing.
               t0 <- getMonotonicTime
-              call k turn st c watch raw
+              parts <- call k turn st c watch raw
               t1 <- getMonotonicTime
-              when (t1 - t0 > 0.012) $ seSlow se (t1 - t0) (fromIntegral (k * blockN) / seFs se)
+              when (t1 - t0 > 0.012) $ seSlow se (t1 - t0) (fromIntegral (k * blockN) / seFs se) parts
           modifyIORef' (seBlock se) (+ 1)
           done <- coDone co
           unless done loop
@@ -183,16 +186,25 @@ runLoop se co = loop
                  else return B.empty
       let dte = if tuOnline turn then B.unpack (greet <> tuDte turn) else []
           (st', audio, rxBytes, events) = modemStep c st rx dte
+      -- Where a block's time went, for the report of a slow one: the
+      -- modem (forced here, by asking for what it has to say), the
+      -- write, and the listening for what the network is playing.
+      ta <- getMonotonicTime
+      _ <- evaluate (VS.length audio)
       seObserve se k st st'
+      tb <- getMonotonicTime
       seWrite se audio
       when (tuOnline turn && not (null rxBytes)) $ seSend se (B.pack rxBytes)
+      tc <- getMonotonicTime
       watch' <- listen st' watch rx
+      td <- getMonotonicTime
       -- The watcher may have hung the call up between here and there.
       line' <- readIORef (seLine se)
       case line' of
         LineIdle -> return ()
         _ -> writeIORef (seLine se) (LineCall st' c watch')
       mapM_ (coEvent co) events
+      return (tb - ta, tc - tb, td - tc)
 
     -- What the network is playing back, until the modems are talking;
     -- after that the line carries a carrier and nothing else.

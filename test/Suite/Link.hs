@@ -208,15 +208,23 @@ modemTests = testGroup "full modem duplex" $
       assertBool ("answer to originate: " ++ show rxO) (textA `isInfixOf` rxO)
       assertBool ("originate to answer: " ++ show rxA) (textO `isInfixOf` rxA)
   , testCase "a V.32 call wrecked mid-session retrains and carries on" $ do
-      -- 5.5.  Half a second of noise loud enough that no receiver could
+      -- 5.5.  A second of noise loud enough that no receiver could
       -- read through it, on one direction only, and then the line is
       -- fine again.  Before this there was no way out of data mode
       -- except the end of the call: a link that went bad stayed bad and
       -- went on handing up whatever it could make of the noise.
+      --
+      -- A second, where it was half of one.  Since the receiver's
+      -- clock began to coast through a quiet line on its average rate
+      -- ('Modec.QAM', the timing loop), a calling modem made deaf for
+      -- half a second comes back reading and asks for nothing, both
+      -- texts delivered: measured with that on and off, no retrain
+      -- against two.  That is the better outcome and no test of 5.5,
+      -- so the noise lasts long enough that both ends still need one.
       let cfg role = defaultModemConfig 8000 role [V32]
       forM_ [(False, "the answering modem goes deaf"), (True, "the calling modem does")] $ \(wreckCaller, what) -> do
        let (rxO, rxA, evO, evA) =
-             modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA wreckCaller 14 14.5
+             modemDuplexDisturb (cfg Originate) (cfg Answer) 30 textO textA wreckCaller 14 15
        assertBool (what ++ ": events " ++ show (evO ++ evA))
          (any (\e -> case e of EvRetrain _ -> True; _ -> False) (evO ++ evA))
        -- and the session is still there afterwards: the second text is

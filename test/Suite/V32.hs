@@ -2,7 +2,7 @@
 -- Figure 4, and the echo canceller that makes it possible.
 module Suite.V32 (table1, table2, bitPair, pairBits, Quad, quadsFrom, enc16, dec16, enc32, dec32, rot90, v32Tests, v32PumpTests, v32FloorTests, modulateStates2, modulateStates, v32SignalTests, runEcho, runEchoFrom, echoTests, v32StartDuplex, v32PumpDuplex, v32CallEvm, v32ListenTests, v32StartTests, rateTests) where
 
-import Control.Monad (forM_, replicateM)
+import Control.Monad (forM_, replicateM, when)
 import Data.List (nub)
 import qualified Data.Vector.Storable as VS
 import Test.Tasty
@@ -19,7 +19,7 @@ import Modec.Reversal
 import Modec.V32Pump
 import Modec.V32Start
 import Modec.Echo
-import Modec.Xcorr (xcorrValid)
+import Modec.Xcorr (crossSpectrum, stageCross, stageDone, stageReal, stageRun, transformReal, transformSize, xcorrValid)
 import qualified Modec.V32 as V32
 import Data.Bits (testBit)
 
@@ -525,6 +525,30 @@ echoTests = testGroup "echo cancellation"
       forM_ [0, 1, 17, 2048, 3999, 4000] $ \o ->
         assertBool ("offset " ++ show o ++ ": " ++ show (c VS.! o) ++ " against " ++ show (brute o))
                    (abs (c VS.! o - brute o) < 1e-9)
+
+  , testCase "a transform taken a few stages at a time is the transform" $ do
+      -- The echo search takes its transforms a block's share at a time,
+      -- because a whole one in one block was a late block on a live
+      -- call.  However it is cut -- one stage a go, the search's own
+      -- share, or all at once -- the points that come out are the same
+      -- ones, to the last bit, and nothing handed in is changed by it.
+      let x = gaussianNoise 33 3000 1
+          y = gaussianNoise 34 4096 1
+          n = transformSize (VS.length y)
+          whole = transformReal n x
+          finish work job = case stageDone job of
+            Just sp -> (sp, 0 :: Int)
+            Nothing -> let (sp, k) = finish work (stageRun work job) in (sp, k + 1)
+          begun = stageReal n x
+      assertEqual "nothing is done before the first stage" Nothing (stageDone begun)
+      forM_ [1, 49152, maxBound] $ \work -> do
+        let (sp, steps) = finish work begun
+        assertBool ("cut at " ++ show work ++ " butterflies") (sp == whole)
+        when (work == 1) $ assertEqual "one stage a go is twelve goes at 4096 points" 12 steps
+      assertBool "the transform begun is still only begun" (stageDone begun == Nothing)
+      let wholeY = transformReal n y
+          (cross, _) = finish 5000 (stageCross whole wholeY)
+      assertBool "and the correlation's transform likewise" (cross == crossSpectrum whole wholeY)
 
   , testCase "the first scan after a silence of our own aims at nothing" $ do
       -- An answering modem is silent for three seconds between its two

@@ -165,20 +165,20 @@ data V32Start = V32Start
   , vsRev2100 :: !RevTracker     -- ^ the answer tone, for a caller that has heard nothing else yet
   , vsAnsRun  :: !Int            -- ^ samples the answer tone has sounded, at its longest
   , vsAnsGone :: !Int            -- ^ samples since it last did
-  , vsFreqs   :: [Double]        -- ^ the carrier frequency, read once a block while locked on the far end's training, newest first
+  , vsFreqs   :: ![Double]       -- ^ the carrier frequency, read once a block while locked on the far end's training, newest first
   , vsRev600  :: !RevTracker
   , vsRev3000 :: !RevTracker
   , vsMark    :: Maybe Int       -- ^ sample index of the first reversal
   , vsTrip    :: Maybe Int       -- ^ NT or MT, in samples
   , vsSentS   :: Maybe Int       -- ^ calling modem: sample index its conditioning signal began
-  , vsTurns   :: [Int]           -- ^ recent quadrant changes, newest first
-  , vsPrevSym :: (Double, Double) -- ^ last raw symbol, for the difference
-  , vsPrevEq  :: (Double, Double) -- ^ last equalised symbol, for the difference
-  , vsPts     :: [(Double, Double)] -- ^ recent equalised points, newest first, for 'aidB1'
+  , vsTurns   :: ![Int]          -- ^ recent quadrant changes, newest first
+  , vsPrevSym :: !(Double, Double) -- ^ last raw symbol, for the difference
+  , vsPrevEq  :: !(Double, Double) -- ^ last equalised symbol, for the difference
+  , vsPts     :: ![(Double, Double)] -- ^ recent equalised points, newest first, for 'aidB1'
   , vsAidB1   :: !Bool           -- ^ train the receiver on B1's known symbols; see 'aidB1'
   , vsTrn     :: !Int            -- ^ symbol intervals of TRN in each conditioning signal we send
   , vsDescr   :: !Scrambler
-  , vsBits    :: [Bool]          -- ^ recent descrambled bits, newest first
+  , vsBits    :: ![Bool]         -- ^ recent descrambled bits, newest first
   , vsSeenS   :: !Bool
   , vsSeenTrn :: !Bool
   , vsFar     :: !Role      -- ^ the far end's scrambler
@@ -608,8 +608,21 @@ observe st rx = st
   -- answering modem acts on it, which is a duration and not an instant.
   , vs1800Run = if tone1800 then vs1800Run st + VS.length rx else 0
   , vsRevAt = [ (1800, i) | i <- e18 ] ++ [ (600, i) | i <- e6 ] ++ [ (3000, i) | i <- e30 ]
-  , vsRx = rxSt, vsTurns = turns', vsPrevSym = prev', vsPrevEq = prevEq', vsDescr = descr', vsBits = bits'
-  , vsPts = take 128 (reverse (map qsPoint syms) ++ vsPts st)
+  -- Every history below is read off now, to its end.  Each is a few
+  -- hundred values cut from a longer list with 'take', and 'take' cuts
+  -- nothing until somebody looks: left alone, the list a block made was
+  -- a promise to cut it, holding that block's symbols and the promise
+  -- before it, and so on back to the first block of the start-up.  The
+  -- points wait for B1 to be read at all; the turns and the bits are
+  -- read only in the phases that are looking for something.  Measured
+  -- on a live call: the heap went from half a megabyte to twenty one
+  -- over the twelve seconds of a start-up, every collection of it took
+  -- as long as there was heap -- 20 ms a second at first, 40 by the
+  -- end, 160 on a start-up that waited forty seconds for an answerer it
+  -- could not hear -- and each of those was a block that went out late.
+  , vsRx = rxSt, vsTurns = kept (`seq` ()) turns', vsPrevSym = pair prev', vsPrevEq = pair prevEq'
+  , vsDescr = descr', vsBits = kept (`seq` ()) bits'
+  , vsPts = kept (\q -> pair q `seq` ()) (take 128 (reverse (map qsPoint syms) ++ vsPts st))
   -- The best look at the far end's training, not the last one.  The
   -- error is an exponential mean, so anything that disturbs it -- the
   -- receiver still converging when TRN starts, a click, the turn-around
@@ -619,11 +632,17 @@ observe st rx = st
   -- The frequency the data pump will be handed, measured rather than
   -- sampled: see 'measuredFreq'.
   , vsFreqs = if measuring (vsPhase st) && qamRxPower rxSt > 1e-5 && qamRxEvm rxSt < 0.01
-                then take 256 (qamRxFreq rxSt : vsFreqs st) else vsFreqs st
+                then kept (`seq` ()) (take 256 (qamRxFreq rxSt : vsFreqs st)) else vsFreqs st
   , vsLineErr = if vsPhase st == OTrainR1 && qamRxPower rxSt > 1e-5
                   then min (vsLineErr st) (sqrt (qamRxEvm rxSt)) else vsLineErr st
   , vsQuiet = quiet' }
   where
+    -- a list evaluated to its end, each element as far as @each@ takes it
+    kept :: (a -> ()) -> [a] -> [a]
+    kept each xs = go xs `seq` xs
+      where go [] = ()
+            go (y : ys) = each y `seq` go ys
+    pair q@(a, b) = a `seq` b `seq` q
     measuring ph = ph `elem` [OTrainR1, OHoldS, OR2, ATrainR2, ACond2]
     acNow = revPower r6 > 1e-5 && (revLevel r6 > 0.45 || revLevel r30 > 0.45)
     tone1800 = revPower r18 > 1e-5 && revLevel r18 > 0.45
