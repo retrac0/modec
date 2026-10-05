@@ -56,6 +56,8 @@ module Modec.V32Start
   , v32Bits
   , v32AnsReversals
   , v32AidB1
+  , v32Trn
+  , trnLength
   ) where
 
 import Data.List (sortOn)
@@ -174,6 +176,7 @@ data V32Start = V32Start
   , vsPrevEq  :: (Double, Double) -- ^ last equalised symbol, for the difference
   , vsPts     :: [(Double, Double)] -- ^ recent equalised points, newest first, for 'aidB1'
   , vsAidB1   :: !Bool           -- ^ train the receiver on B1's known symbols; see 'aidB1'
+  , vsTrn     :: !Int            -- ^ symbol intervals of TRN in each conditioning signal we send
   , vsDescr   :: !Scrambler
   , vsBits    :: [Bool]          -- ^ recent descrambled bits, newest first
   , vsSeenS   :: !Bool
@@ -276,6 +279,19 @@ v32AnsReversals b st = st { vsAnsRev = b }
 -- | Whether the receiver trains on B1's known symbols; see 'aidB1'.
 v32AidB1 :: Bool -> V32Start -> V32Start
 v32AidB1 b st = st { vsAidB1 = b }
+
+-- | How long a TRN this modem sends: see 'trnLength', which is what it
+-- sends unless told otherwise.
+--
+-- Told otherwise by a replay.  A recording is of a far end answering
+-- what this modem sent on the day, and its timeline is set by how long
+-- that took: replayed with a TRN a second longer, the replay is still
+-- sending its own conditioning signal when the recorded far end has
+-- already started the next thing, trains on what is left of it, and
+-- reads the call worse than the call was.  A fixture recorded under the
+-- shorter TRN says so, and is replayed with it.
+v32Trn :: Int -> V32Start -> V32Start
+v32Trn n st = st { vsTrn = n }
 
 -- | Train the receiver on the far end's B1, whose symbols are known.
 --
@@ -536,7 +552,7 @@ v32StartInit fs dir offer = V32Start
   , vsRev1800 = revInit fs 1800, vsRev600 = revInit fs 600, vsRev3000 = revInit fs 3000
   , vsRev2100 = revInit fs 2100, vsAnsRun = 0, vsAnsGone = 0, vsFreqs = []
   , vsMark = Nothing, vsTrip = Nothing, vsSentS = Nothing
-  , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True
+  , vsTurns = [], vsPrevSym = (0, 0), vsPrevEq = (0, 0), vsPts = [], vsAidB1 = True, vsTrn = trnLength
   , vsDescr = scramblerInit, vsFar = far dir, vsBits = []
   , vsSeenS = False, vsSeenTrn = False, vsRevAt = [], vsQuiet = 0, vsAdapt = False
   , vsACLimit = 60000, vsACHold = 128, vsACRun = 0, vsACSteady = 0, vsACNeed = 256, vsAAWait = 30000, vs1800Run = 0
@@ -1046,7 +1062,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
                 | otherwise -> s
       OHoldS
         | vsSince s >= maybe (sym 256) id (vsTrip s) ->
-            let (ps, sc, q) = conditioningRun dir trnLength
+            let (ps, sc, q) = conditioningRun dir (vsTrn s)
                 -- 5.4.1: R2 excludes anything absent from R1
                 r2 = maybe (vsOffer s) (restrictRates (vsOffer s)) (vsPeer s)
             in enter OCond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
@@ -1160,7 +1176,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
         | otherwise -> s
       AGap
         | vsSince s >= sym 16 ->
-            let (ps, sc, q) = conditioningRun dir trnLength
+            let (ps, sc, q) = conditioningRun dir (vsTrn s)
             in enter ACond s { vsQueue = ps, vsTxScr = sc, vsTxQ = q
                              , vsSrc = TxCoded (cycle (rateSeqBits (vsOffer s)))
                              , vsAdapt = True }
@@ -1198,7 +1214,7 @@ advance st0 n = step st { vsN = vsN st + n, vsSince = vsSince st + n }
       -- caller that judges its line cuts R2 before we ever see it.
       ATrainR2 -> case detectRate (vsBits s) of
         Just r2 | Just rate <- bestCommonRate (vsOffer s) r2 ->
-          let (ps, sc, q) = conditioningRun dir trnLength
+          let (ps, sc, q) = conditioningRun dir (vsTrn s)
           -- No adapting here, unlike ACond.  The calling modem is still
           -- sending the rate sequence it started in its own conditioning
           -- period and does not stop until E, so this is not one of

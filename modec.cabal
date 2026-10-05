@@ -12,6 +12,7 @@ common warnings
 library
     import:           warnings
     exposed-modules:  Modec.DSP
+                      Modec.Xcorr
                       Modec.Stream
                       Modec.Sample
                       Modec.Voice

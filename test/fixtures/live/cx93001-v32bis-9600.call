@@ -10,6 +10,7 @@ seconds:   16.5
 role:      answer
 modes:     v32bis
 v8:        no
+trn:       1400
 connect:   V32 9600
 retrains:  0
 expect:    

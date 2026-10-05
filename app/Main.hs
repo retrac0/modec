@@ -1,11 +1,12 @@
 module Main (main) where
 
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.Maybe (isJust)
 import qualified Data.ByteString as B
 import qualified Data.Vector.Storable as VS
 import Options.Applicative
 import System.IO
+import System.Exit (die)
 import Text.Printf (printf, hPrintf)
 
 import System.Directory (createDirectoryIfMissing)
@@ -71,10 +72,12 @@ data ReplayOpts = ReplayOpts
   , roAnswer  :: Bool
   , roV8      :: Bool
   , roMnp     :: Maybe Int
+  , roTrn     :: Maybe Int
   , roMaxEvm  :: Double
   , roMaxEvmV32 :: Double
   , roSeconds :: Maybe Double
   , roLine    :: Bool
+  , roLineEvery :: Double
   , roTruth   :: Bool
   , roTrainTruth :: Bool
   , roEvmFreeze :: Maybe Double
@@ -82,6 +85,7 @@ data ReplayOpts = ReplayOpts
   , roHoldFreq :: Bool
   , roFreqHz  :: Maybe Double
   , roDumpSyms :: Maybe FilePath
+  , roTx      :: Maybe FilePath
   , roImpair  :: [String]
   , roChannel :: Maybe String
   , roMint    :: Maybe String
@@ -175,12 +179,14 @@ cmdP = hsubparser
       <*> (flag' (Just 4) (long "mnp" <> help "MNP error correction was in use")
            <|> option (fmap Just auto) (long "mnp-class" <> metavar "N" <> help "as --mnp, offering only up to class N")
            <|> pure Nothing)
+      <*> optional (option auto (long "v32-trn" <> metavar "SYMBOLS" <> help "V.32: the TRN this modem sent on the recorded call, where that is not what it sends now (1400 before 2026-09-25). A replay regenerates its transmit, and the far end's timeline in the recording is the one that answered the original"))
       <*> option auto (long "max-evm" <> value 1.0 <> showDefault <> metavar "E"
              <> help "stop passing bytes to the DTE above this decision error (V.22 family)")
       <*> option auto (long "max-evm-v32" <> value 0.5 <> showDefault <> metavar "E"
              <> help "the same gate for V.32, as a fraction of the constellation's own margin")
       <*> optional (option auto (long "seconds" <> metavar "S" <> help "stop after this much of the recording"))
       <*> switch (long "line" <> help "report the receiver's decision error and symbol timing twice a second")
+      <*> option auto (long "line-every" <> metavar "S" <> value 0.5 <> showDefault <> help "with --line, seconds between reports")
       <*> switch (long "truth" <> help "V.32: predict the far end's B1 and the idle after it, and report the receiver's true error against it every half second, beside the nearest-point error it reports live")
       <*> switch (long "train-truth" <> help "V.32: and train the loops on those predicted symbols while they last (the oracle of modec-bench v32-aided, on this recording)")
       <*> optional (option auto (long "v32-evm-freeze" <> metavar "E" <> help "V.32: let the data-mode equaliser adapt under this decision error power instead of the rate's own freeze (0.0052 at 14400, 0.0102 at 12000)"))
@@ -188,6 +194,7 @@ cmdP = hsubparser
       <*> switch (long "v32-hold-freq" <> help "V.32: hold the carrier frequency estimate through data mode (no integral term)")
       <*> optional (option auto (long "v32-freq" <> metavar "HZ" <> help "V.32: with --v32-hold-freq, start data mode from this carrier offset rather than what the start-up left"))
       <*> optional (strOption (long "dump-syms" <> metavar "FILE" <> help "V.32: write every decided symbol, one per line: t zr zi zmr zmi ur ui idx tx ty (tx ty are nan without a prediction)"))
+      <*> optional (strOption (long "tx" <> metavar "FILE-tx.wav" <> help "V.32: the call's own transmit recording, as the echo canceller's reference. With it the canceller runs as it did on the call, data mode included; without it a replay regenerates its transmit, which stops matching at the first payload byte, and leaves data-mode cancelling off"))
       <*> many (strOption (long "impair" <> metavar "K=V"
              <> help "degrade the recording first, on top of --channel. Line: snr, freq, rate, gain, dc, band, clip, hum, seed. Analogue: softclip, harm2, harm3, sing, singgain, wobble, phasejit. Time: jitter, slips, wow, flutter. Digital span: ulaw, alaw, biterr, loss, burst, stuck. Transient: impulse, hits. Repeatable"))
       <*> optional (strOption (long "channel" <> metavar "NAME"
@@ -556,16 +563,27 @@ runReplay ro = do
         Nothing -> samples
         Just s -> VS.take (round (s * fs)) samples
       x = Ch.applyChannel fs (impairments (roChannel ro) (roImpair ro)) trimmed
-      rc = (defaultReplayConfig cfg)
-             { rcEvery = if roLine ro then Just 0.5 else Nothing
-             , rcSyms = isJust (roDumpSyms ro) }
+  sent <- forM (roTx ro) $ \f -> do
+    (fsTx, tx, _) <- readInput (roInput ro) { inPath = f }
+    when (fsTx /= fs) $ die ("--tx: " ++ f ++ " is at " ++ show (round fsTx :: Int) ++ " Hz and the recording at " ++ show (round fs :: Int))
+    -- A call's two recordings open between a read and the write that
+    -- answers it, so the transmit file starts a block before the
+    -- receive one and runs that much longer.  Lined up by their ends,
+    -- block i of one is what was sent on hearing block i of the other.
+    let lead = VS.length tx - VS.length samples
+    return (if lead > 0 && lead <= round (0.04 * fs) then VS.drop lead tx else tx)
+  let rc = (defaultReplayConfig cfg)
+             { rcEvery = if roLine ro then Just (roLineEvery ro) else Nothing
+             , rcSyms = isJust (roDumpSyms ro)
+             , rcTx = sent }
       r = replay rc x
   forM_ (rrPhases r) $ \(t, ph) -> hPrintf stderr "  %6.2f  %s\n" t ph
   forM_ (rrLine r) $ \(t, evm, sps) ->
     hPrintf stderr "  %6.2f  evm %7.4f  sps %8.5f\n" t evm sps
-  forM_ (rrEcho r) $ \(t, lag, erle) ->
-    hPrintf stderr "  %6.2f  echo %s  return loss %5.1f dB\n" t
+  forM_ (rrEcho r) $ \(t, lag, erle, dat) ->
+    hPrintf stderr "  %6.2f  echo %s  return loss %5.1f dB%s\n" t
       (maybe "unaimed" (\l -> "at " ++ show (round (fromIntegral l / (fs / 1000) :: Double) :: Int) ++ " ms") lag) erle
+      (maybe "" (\(on, share) -> printf "  canceller %s predicting %.2f%%" (if on then "on" else "off" :: String) (100 * share :: Double) :: String) dat)
   -- The truth, a half second at a time: the block rows summed over
   -- windows, the true error weighted by how many symbols each block
   -- had a prediction for.
@@ -595,7 +613,7 @@ runReplay ro = do
   B.hPut stdout (B.pack (rrBytes r))
   case roMint ro of
     Nothing -> return ()
-    Just name -> mint ro r name (round fs) trimmed
+    Just name -> mint ro r name (round fs) trimmed (fmap (VS.take (VS.length trimmed)) sent)
 
 -- | Block rows of the truth trace summed into windows of @w@ seconds:
 -- the nearest-point error averaged over the blocks, the true error over
@@ -638,6 +656,7 @@ replaySpec ro = emptyCallSpec
   , csModes   = roModes ro
   , csV8      = roV8 ro
   , csMnp     = roMnp ro
+  , csTrn     = roTrn ro
   }
 
 -- | Write the three files a corpus fixture is made of: the recording
@@ -645,10 +664,14 @@ replaySpec ro = emptyCallSpec
 -- spec saying how to replay it.  The spec's @expect:@ line is left for a
 -- human, because what the far end really sent is not something a decode
 -- can assert about itself.
-mint :: ReplayOpts -> ReplayResult -> String -> Int -> Signal -> IO ()
-mint ro r name rate trimmed = do
+mint :: ReplayOpts -> ReplayResult -> String -> Int -> Signal -> Maybe Signal -> IO ()
+mint ro r name rate trimmed sent = do
   createDirectoryIfMissing True dir
   writeWav16Mono (dir </> name ++ ".wav") rate trimmed
+  -- With --tx the fixture carries what was sent as well, lined up with
+  -- what was received and cut to the same length; a WAV, named so that
+  -- nothing takes it for a fixture of its own.
+  forM_ sent $ \tx -> writeWav16Mono (dir </> name ++ ".sent") rate tx
   B.writeFile (dir </> name ++ ".txt") (B.pack (rrBytes r))
   writeFile (dir </> name ++ ".call") (renderCallSpec spec)
   hPutStrLn stderr ("minted " ++ dir </> name ++ ".{wav,txt,call} -- now write its expect: line by hand")

@@ -18,11 +18,17 @@
 # its LAPM frames.  Byte for byte, from a recording nothing at this end
 # produced -- see the other file for what the empty reference this used
 # to carry was really pinning.  Retrains: 0, for the reasons there.
+#
+# Stopped at 31 s, as its twin is and for the same reason: the file's
+# last half second is a pattern repeating every six bits, the fourteen
+# bytes it used to contribute came and went with changes that altered
+# nothing else, and every byte before them is as it was.
 source:    recordings/third-party/banksia-mymodem144-call.wav
-seconds:   32.0
+seconds:   31.0
 role:      answer
 modes:     v32bis
 v8:        no
+trn:       1400
 connect:   V32bis 14400
 retrains:  0
 tolerance: 0

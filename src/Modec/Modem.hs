@@ -26,6 +26,7 @@ module Modec.Modem
   , modemV32Rx
   , modemV32DataBits
   , modemEchoErle
+  , modemSetEchoRef
   , modemEchoData
   , modemEchoDelay
   , modemPhase
@@ -46,7 +47,7 @@ module Modec.Modem
 
 import Numeric (showFFloat)
 import qualified Data.Vector.Storable as VS
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word8)
 
 import Modec.Link
@@ -86,6 +87,7 @@ data ModemConfig = ModemConfig
   , mcProbe    :: Bool     -- ^ measure an echo path instead of placing a call
   , mcAnsReversals :: Bool -- ^ V.25 phase reversals on the answer tone; see 'v32AnsReversals'
   , mcAidB1     :: Bool    -- ^ train the V.32 receiver on B1's known symbols ('aidB1').  Off: it predicts B1 exactly and does not reliably help; see the measurement in docs/reference-modem.md
+  , mcV32Trn    :: Int     -- ^ symbol intervals of TRN in each V.32 conditioning signal we send; see 'v32Trn'
   , mcMaxEvm    :: Double        -- ^ stop handing bytes to the DTE above this decision error
   , mcV32Diag   :: V32Diag       -- ^ measurement switches on the V.32 data pump, all off for a real call
   } deriving (Show)
@@ -123,6 +125,7 @@ defaultModemConfig fs role modes = ModemConfig
   , mcProbe = False
   , mcAnsReversals = True
   , mcAidB1 = False
+  , mcV32Trn = trnLength
   , mcMaxEvm = 1.0
   , mcV32Diag = defaultV32Diag
   }
@@ -227,6 +230,9 @@ data ModemState = ModemState
   , msStatus  :: HsStatus
   , msDte     :: [Word8]     -- ^ terminal bytes the protocol layer has not taken yet
   , msMnp     :: Maybe MnpState
+  , msEchoRef :: Maybe Signal
+    -- ^ what really went out on this block, when that is not what this
+    -- step will generate: see 'modemSetEchoRef'
   }
 
 modemInit :: ModemConfig -> ModemState
@@ -259,7 +265,7 @@ modemInit cfg
     fs = mcRate cfg
     base = ModemState Handshaking (toneBank fs (hcBank hs)) (initialHandshake hs) txInit TxSilence
              (Just (listenChannel (hcRole hs), v22RxInit fs)) (hcRole hs) Nothing (ansamInit fs) R1200
-             echo0 listen0 0 0 0 0 0 HsBusy [] Nothing
+             echo0 listen0 0 0 0 0 0 HsBusy [] Nothing Nothing
     -- Only V.32 shares a band with the far end, so only V.32 needs its
     -- own signal taken back out of what returns.
     echo0 = if any isV32 (hcModes hs) then Just (echoInit (mcEcho cfg)) else Nothing
@@ -332,7 +338,7 @@ armFramer mnp armed trust acquired onesRun bits framer
 -- answer as the first start-up -- 'v32StartInit' turns B1 training on
 -- by itself, and the retrain path used to keep it.
 startFlags :: ModemConfig -> V32Start -> V32Start
-startFlags cfg = v32AidB1 (mcAidB1 cfg) . v32AnsReversals (mcAnsReversals cfg)
+startFlags cfg = v32Trn (mcV32Trn cfg) . v32AidB1 (mcAidB1 cfg) . v32AnsReversals (mcAnsReversals cfg)
 
 v32Offer :: ModemConfig -> RateSeq
 v32Offer cfg = case mcV32Rates cfg of
@@ -433,6 +439,19 @@ modemEchoDelay st = msEcho st >>= echoDelay
 
 modemEchoErle :: ModemState -> Maybe Double
 modemEchoErle = fmap echoErle . msEcho
+
+-- | Give the echo canceller the block that was really transmitted, in
+-- place of the one the next step generates.
+--
+-- For a replay.  A modem run over a recording regenerates its transmit
+-- from its own state, which is the recorded call's only until the first
+-- byte of payload: after that the scrambler has diverged and what the
+-- replay "sends" is not what the echo in the recording is an echo of.
+-- With the recorded transmit as the reference the canceller meets the
+-- call that happened, block for block.  Set before every step; a live
+-- modem never sets it.
+modemSetEchoRef :: Maybe Signal -> ModemState -> ModemState
+modemSetEchoRef ref st = st { msEchoRef = ref }
 
 -- | The data-mode canceller's state: on or off, and the share of the
 -- line its filter predicts.  Nothing until it has aimed.
@@ -1032,24 +1051,43 @@ modemStep cfg st0 rxBlock newBytes =
         -- tone's V.25 reversals told it to.  'v32AnsReversals' is the
         -- fix, and it took 12000 from nothing to clean.
         -- See docs/reference-modem.md.
+        --
+        -- And not at all where the far search runs.  That one covers
+        -- the same lags and four hundred milliseconds more, with the
+        -- far end silent it scores a reflection as plainly as this
+        -- does, and it is three transforms a quarter second where this
+        -- is four thousand dot products a block: eleven milliseconds of
+        -- every twenty for as long as the conditioning signal lasts, on
+        -- an idle machine, and thirty on a busy one -- where a caller's
+        -- loop fell a second behind its own TRN and the answering modem
+        -- never trained on it.
         aimed e
           | not adapt = e
+          | ecFarSearch (mcEcho cfg) > 0 = e
           | Just _ <- echoDelay e = e
           | Just (l, _) <- echoSearch (mcEcho cfg) e = echoAim (mcEcho cfg) l e
           | otherwise = e
 
-    -- The late reflection is looked for before data mode, too, in the
-    -- start-up's last phases: both ends are talking by then, our own
-    -- signal is the scrambled rate signal and E, and the search needs
-    -- seconds it would otherwise spend in data.  See 'echoScanStep'.
-    -- Three slices a block, because the start-up is not also running the
-    -- trellis pump: on a 14400 call modec placed through the bench that
-    -- aimed the canceller half a second before the first data symbol
-    -- instead of two and a half seconds after it, and the receiver
-    -- opened at 21 dB rather than 19.5.
+    -- The late reflection is looked for before data mode, too, from the
+    -- first conditioning signal on.  See 'echoScanStep'.
+    --
+    -- That first conditioning signal is where it stands alone.  Figure 4
+    -- has the far end silent while we send it, so that a canceller can
+    -- train, and through the bench's ATA what comes back then is our own
+    -- TRN three quarters of a second late and nothing else: the search
+    -- scores it at 0.6 against a floor of 0.02, where in data mode it is
+    -- 0.08 against 0.04 under the far end's signal.  The search used to
+    -- start in the last phases only -- late enough for a caller, which
+    -- has been sending for four seconds by then, and not for an
+    -- answerer, which has been silent since its own first conditioning
+    -- signal and starts the second 2.7 s before data.  Measured on the
+    -- bench: an answering 14400 call whose echo the ATA had not taken
+    -- out opened at 16 dB, the search had one sighting when the retrain
+    -- timer ran out three seconds later, and the retrain went the same
+    -- way.
     scanLate s32 (echo', rxClean)
-      | v32Phase s32 `elem` [OR2, OB1, ACond2, AR3, AE] =
-          (fmap (\e -> iterate (echoScanStep (mcEcho cfg)) e !! 3) echo', rxClean)
+      | v32Phase s32 `elem` [OCond, OR2, OB1, ACond, AR1, AWaitMT, ATrainR2, ACond2, AR3, AE] =
+          (fmap (echoScanStep (mcEcho cfg) (v32EchoAdapt s32)) echo', rxClean)
       | otherwise = (echo', rxClean)
 
     -- Data mode: the far end is talking for the rest of the call, and
@@ -1060,7 +1098,7 @@ modemStep cfg st0 rxBlock newBytes =
       Just e -> let (e', clean) = echoBlockData (mcEcho cfg) blk e
                 in (Just e', if n' == 0 then blk else clean)
 
-    pushEcho audio = fmap (echoPush (mcEcho cfg) audio)
+    pushEcho audio = fmap (echoPush (mcEcho cfg) (fromMaybe audio (msEchoRef st0)))
 
     -- 'echoSetFar' is deliberately not called from here, and the round
     -- trip the start-up measures is not what aims the filter.  The

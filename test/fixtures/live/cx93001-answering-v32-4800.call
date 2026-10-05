@@ -21,6 +21,7 @@ seconds:   40.0
 role:      originate
 modes:     v32
 v8:        no
+trn:       1400
 connect:   V32 4800
 retrains:  0
 expect:    B0007 pack my box with five dozen liquor jugs 9876543210

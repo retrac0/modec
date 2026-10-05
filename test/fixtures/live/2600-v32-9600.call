@@ -13,6 +13,7 @@ seconds:   30
 role:      originate
 modes:     v32,v22bis,v22,v21
 v8:        yes
+trn:       1400
 connect:   V32 9600
 expect:    https://2600.network - Patton 3120 #1
 expect:    uSerNaME:

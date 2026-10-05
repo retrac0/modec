@@ -1,0 +1,48 @@
+# 20261005T050643-1001.wav
+#
+# A 14400 call modec answered on the bench, on a machine with nothing
+# else to do, and the one call of twenty in that run that failed.
+#
+# At 20.95 s the far end's level doubles, and 80 ms later -- four
+# packets -- it halves again.  Nothing else changes: the symbol clock
+# runs straight through, and the same recording with those 641 samples
+# multiplied by a half reads through them at the error it had before.
+# It is the bench's ATA, which has been stepping levels by 6 dB since
+# the first V.22bis call through it; this time it stepped back.
+#
+# What it did: a gain that takes a fifth of a second to move followed
+# the hit up by 3 dB while it lasted and took half a second to come
+# back down, and for all of that every point of a hundred and twenty
+# eight landed on another.  A decision is always near some point at
+# 14400, so nothing that guards the loops saw anything wrong; they
+# trained on the wrong answers, and when the gain was right again the
+# receiver was not.  It asked for a retrain two seconds later, at a
+# pinned rate that has none to offer, and the reference's eight lines,
+# which were on the line by then, were never read.
+#
+# V.22bis at 2400 has had a rule for exactly this since the second
+# bench pass ('Modec.QAM.qrAgcStep': hold the loops when the last dozen
+# symbols' power leaves the run before them, take the new level outright
+# once it has lasted).  The V.32 rates with a slow gain now have it too,
+# and the receiver is reading again a quarter of a second after the
+# hit, with all eight lines.
+#
+# The bytes before the first line are what the hit itself decodes to,
+# hence the tolerance; the lines are what must not move.  The recording
+# stops at 23.4 s because the far end retrains at 23.7, answering the
+# request the live call made.
+seconds:   23.4
+role:      answer
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+expect:    B0000 pack my box with five dozen liquor jugs 9876543210
+expect:    B0001 pack my box with five dozen liquor jugs 9876543210
+expect:    B0002 pack my box with five dozen liquor jugs 9876543210
+expect:    B0003 pack my box with five dozen liquor jugs 9876543210
+expect:    B0004 pack my box with five dozen liquor jugs 9876543210
+expect:    B0005 pack my box with five dozen liquor jugs 9876543210
+expect:    B0006 pack my box with five dozen liquor jugs 9876543210
+expect:    B0007 pack my box with five dozen liquor jugs 9876543210
+tolerance: 64

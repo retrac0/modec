@@ -1,0 +1,38 @@
+# 20261005T013747-1001-192-168-30-104-26668.wav
+#
+# A 14400 call modec placed through the bench, with one RTP packet lost
+# in the middle of it: 20 ms of exact zeros at 23.34 s, five seconds
+# before the reference sends its eight lines.
+#
+# The first fixture with a .sent beside it -- what modec transmitted on
+# the call, lined up with what it received -- because nothing about
+# this call can be replayed without it.  Our own echo is on this line
+# half a second late and 18 dB under the far end, and a replay that
+# regenerates its transmit has no reference to cancel it with.
+#
+# What the lost packet did: for those 20 ms the line held nothing but
+# the canceller's prediction of the echo, subtracted from zeros -- a
+# clean V.32 signal twenty decibels down -- and the equaliser, whose
+# step is divided by the power in its window, trained on it.  The line
+# was the same line afterwards; the equaliser was not, the receiver
+# read 18 dB where it had read 30, and one line of the eight arrived.
+# Held through the hole ('Modec.QAM.qrFadeHold'), all eight do.
+#
+# The bytes before the first line are what the hole itself decodes to,
+# which is why this one has a tolerance; the lines are what must not
+# move.
+seconds:   36.0
+role:      originate
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+expect:    B0000 pack my box with five dozen liquor jugs 9876543210
+expect:    B0001 pack my box with five dozen liquor jugs 9876543210
+expect:    B0002 pack my box with five dozen liquor jugs 9876543210
+expect:    B0003 pack my box with five dozen liquor jugs 9876543210
+expect:    B0004 pack my box with five dozen liquor jugs 9876543210
+expect:    B0005 pack my box with five dozen liquor jugs 9876543210
+expect:    B0006 pack my box with five dozen liquor jugs 9876543210
+expect:    B0007 pack my box with five dozen liquor jugs 9876543210
+tolerance: 24

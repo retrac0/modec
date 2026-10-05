@@ -19,6 +19,7 @@ import Modec.Reversal
 import Modec.V32Pump
 import Modec.V32Start
 import Modec.Echo
+import Modec.Xcorr (xcorrValid)
 import qualified Modec.V32 as V32
 import Data.Bits (testBit)
 
@@ -488,10 +489,9 @@ echoTests = testGroup "echo cancellation"
           far = lineNoise 12 n 0.06
           echo = VS.generate n (\i -> if i >= d then 0.02 * VS.unsafeIndex tx (i - d) else 0)
           rx = VS.zipWith (+) far echo
-          -- the shipped window and step, a bigger slice so the test
-          -- runs in seconds, and a reach that stops short of the test's
-          -- own silence
-          cfg = defaultEchoConfig { ecFarSlice = 96, ecFarSearch = 6400 }
+          -- the shipped window and step, and a reach that stops short
+          -- of the test's own silence
+          cfg = defaultEchoConfig { ecFarSearch = 6400 }
           (out, st) = runEchoData cfg 160 tx rx
           tail_ k v = VS.drop (VS.length v - k) v
           lastS = 4 * 8000
@@ -511,10 +511,85 @@ echoTests = testGroup "echo cancellation"
       let n = 8000 * 12
           tx = lineNoise 21 n 0.3
           far = lineNoise 22 n 0.3
-          cfg = defaultEchoConfig { ecFarSlice = 96, ecFarSearch = 6400 }
+          cfg = defaultEchoConfig { ecFarSearch = 6400 }
           (out, st) = runEchoData cfg 160 tx far
       assertEqual "aimed at something on a line with no echo" Nothing (echoDelay st)
       assertBool "changed the line" (out == far)
+
+  , testCase "every lag at once is the same sum as a lag at a time" $ do
+      let x = gaussianNoise 31 1000 1
+          y = gaussianNoise 32 5000 1
+          c = xcorrValid x y
+          brute o = sum [ VS.unsafeIndex x i * VS.unsafeIndex y (o + i) | i <- [0 .. VS.length x - 1] ]
+      assertEqual "offsets" (VS.length y - VS.length x + 1) (VS.length c)
+      forM_ [0, 1, 17, 2048, 3999, 4000] $ \o ->
+        assertBool ("offset " ++ show o ++ ": " ++ show (c VS.! o) ++ " against " ++ show (brute o))
+                   (abs (c VS.! o - brute o) < 1e-9)
+
+  , testCase "the first scan after a silence of our own aims at nothing" $ do
+      -- An answering modem is silent for three seconds between its two
+      -- conditioning signals.  A scan taken as the second begins holds a
+      -- reference that is empty but for the first few samples of it; the
+      -- scores at the lags that reach them were nothing much, and stood
+      -- alone, because every other lag scored nought -- so the search was
+      -- sure, aimed there, and read taps off the leading edge of a pulse.
+      -- Whatever the scan catches of the onset, the line has no echo on
+      -- it and must come back untouched.
+      let n = 8000 * 9
+          far = lineNoise 42 n 0.06
+          sending onset i = i < 3 * 8000 || i >= onset
+          cfg = defaultEchoConfig { ecFarSearch = 6400 }
+      forM_ [0, 8, 16, 40, 100, 160, 200, 400, 1000, 4000] $ \early -> do
+        let onset = 6 * 8000 - early
+            tx = VS.imap (\i v -> if sending onset i then v else 0) (lineNoise 41 n 0.3)
+            (out, st) = runEchoData cfg 160 tx far
+        assertEqual ("aimed, our signal resuming " ++ show early ++ " samples before a scan") Nothing (echoDelay st)
+        assertBool ("changed the line, " ++ show early ++ "; " ++ echoDebug st) (out == far)
+
+  , testCase "a reflection that goes away is no longer subtracted" $ do
+      -- The bench's ATA has a canceller of its own, which takes half a
+      -- second to settle on a new signal: the reflection is there, the
+      -- search finds it, and then it is gone.  A filter switched on by
+      -- how much it predicts goes on predicting.
+      let n = 8000 * 14
+          d = 5152
+          gone = 7 * 8000
+          tx = lineNoise 51 n 0.3
+          far = lineNoise 52 n 0.06
+          echo = VS.generate n (\i -> if i >= d && i < gone then 0.02 * VS.unsafeIndex tx (i - d) else 0)
+          rx = VS.zipWith (+) far echo
+          cfg = defaultEchoConfig { ecFarSearch = 6400 }
+          (out, st) = runEchoData cfg 160 tx rx
+          lastS = 4 * 8000
+          tail_ v = VS.drop (VS.length v - lastS) v
+      assertBool ("never found it; " ++ echoDebug st) (echoDelay st /= Nothing)
+      assertBool ("still subtracting three seconds after it went; " ++ echoDebug st) (tail_ out == tail_ rx)
+
+  , testCase "with the far end silent, a late reflection is found at once and trained on" $ do
+      -- Figure 4's first conditioning signal goes out into a silent far
+      -- end.  Through the bench the reflection of it comes back 750 ms
+      -- later and alone, which is the one time a canceller's full step
+      -- can be used on it.
+      let n = 8000 * 3
+          d = 6000
+          tx = lineNoise 61 n 0.3
+          rx = VS.generate n (\i -> if i >= d then 0.02 * VS.unsafeIndex tx (i - d) else 0)
+          cfg = defaultEchoConfig
+          go i st acc
+            | i >= n = (VS.concat (reverse acc), st)
+            | otherwise =
+                let (st1, clean) = echoBlock cfg True (VS.slice i 160 rx) st
+                    st2 = echoScanStep cfg True st1
+                in go (i + 160) (echoPush cfg (VS.slice i 160 tx) st2) (clean : acc)
+          (out, st) = go 0 (echoInit cfg) []
+          lastS = 4000
+          pw v = VS.sum (VS.map (\x -> x * x) v) / fromIntegral (VS.length v)
+          tail_ v = VS.drop (VS.length v - lastS) v
+          gain = 10 * logBase 10 (pw (tail_ rx) / pw (tail_ out))
+      case echoDelay st of
+        Nothing -> assertFailure ("the scan found nothing; " ++ echoDebug st)
+        Just l -> assertBool ("aimed at " ++ show l ++ ", not " ++ show d) (abs (l - d) <= 6)
+      assertBool ("took the echo down by only " ++ show gain ++ " dB; " ++ echoDebug st) (gain >= 20)
 
   ,   testCase "the echo is found where a VoIP leg actually puts it" $ do
       -- 116 ms is not a guess: it is where dialling the voip.ms echo

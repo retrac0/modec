@@ -22,6 +22,7 @@ role:      originate
 modes:     v32bis,v32,v22bis
 v8:        no
 mnp:       4
+trn:       1400
 connect:   V32bis 9600
 expect:    https://2600.network - Patton 3120 #1
 expect:    uSerNaME:

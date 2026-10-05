@@ -39,11 +39,15 @@ data ReplayConfig = ReplayConfig
   , rcLimit :: Maybe Double  -- ^ stop after this many seconds of recording
   , rcEvery :: Maybe Double  -- ^ sample the receiver this often, for 'rrLine'
   , rcSyms  :: Bool          -- ^ keep every decided V.32 symbol, for 'rrSyms'
+  , rcTx    :: Maybe Signal
+    -- ^ the call's own transmit recording.  With it the echo canceller
+    -- is given what was really sent and runs as it did on the call,
+    -- data mode included; without it data-mode cancelling is off.
   }
 
 -- | Twenty millisecond blocks, the whole file, no line trace.
 defaultReplayConfig :: ModemConfig -> ReplayConfig
-defaultReplayConfig cfg = ReplayConfig cfg 0.02 Nothing Nothing False
+defaultReplayConfig cfg = ReplayConfig cfg 0.02 Nothing Nothing False Nothing
 
 data ReplayResult = ReplayResult
   { rrBytes  :: [Word8]                  -- ^ what the DTE would have seen
@@ -54,9 +58,11 @@ data ReplayResult = ReplayResult
     -- whenever 'rcEvery' asks and there is a receiver to ask.  Whichever
     -- receiver is carrying the call: the V.22 one, or the V.32 data pump
     -- once the start-up has handed over to it.
-  , rrEcho   :: [(Double, Maybe Int, Double)]
-    -- ^ time, the delay the echo canceller is aimed at, and its return
-    -- loss, on the same cadence, whenever there is a canceller
+  , rrEcho   :: [(Double, Maybe Int, Double, Maybe (Bool, Double))]
+    -- ^ time, the delay the echo canceller is aimed at, its return
+    -- loss, and -- once aimed -- whether it is subtracting and the
+    -- share of the line it predicts, on the same cadence, whenever
+    -- there is a canceller
   , rrTruth  :: [(Double, Double, Double, Int, Int, Bool, Int, Int)]
     -- ^ every block of V.32 data mode, with 'mcV32Diag' asking for the
     -- truth: time, mean nearest-point error, mean true error, symbols
@@ -83,9 +89,18 @@ replay rc x = go (modemInit cfg) 0 [] [] [] [] [] [] [] [] [] (-1)
     -- sent only until the first payload byte diverges them; the echo in
     -- the recording is of the original.  The search would aim at
     -- nothing, or at noise, and a fixture's bytes would depend on it.
-    -- To measure the canceller on a recorded call, drive it over the
-    -- recorded transmit as well: scripts/diag/echoscan.hs.
-    cfg = let c = rcModem rc in c { mcEcho = (mcEcho c) { ecFarSearch = 0 } }
+    -- To measure the canceller on a recorded call, give the replay the
+    -- recorded transmit as well ('rcTx'): then the reference is what
+    -- went out, and the canceller is left as the call had it.
+    cfg = case rcTx rc of
+      Just _ -> rcModem rc
+      Nothing -> let c = rcModem rc in c { mcEcho = (mcEcho c) { ecFarSearch = 0 } }
+    -- the block that was transmitted in answer to received block i
+    -- (silence past the end of the transmit recording)
+    sentAt i n = fmap (sentFrom i n) (rcTx rc)
+    sentFrom i n tx =
+      let have = max 0 (min n (VS.length tx - i * blk))
+      in VS.slice (min (VS.length tx) (i * blk)) have tx VS.++ VS.replicate (n - have) 0
     fs = mcRate cfg
     blk = max 1 (round (fs * rcBlock rc)) :: Int
     limit = maybe (VS.length x) (\s -> min (VS.length x) (round (s * fs))) (rcLimit rc)
@@ -97,7 +112,7 @@ replay rc x = go (modemInit cfg) 0 [] [] [] [] [] [] [] [] [] (-1)
                        (reverse truth) (reverse syms) (reverse taps) (reverse power)
       | otherwise =
           let n = min blk (limit - i * blk)
-              (st', _, bs, es) = modemStep cfg st (VS.slice (i * blk) n x) []
+              (st', _, bs, es) = modemStep cfg (modemSetEchoRef (sentAt i n) st) (VS.slice (i * blk) n x) []
               t = secs i
               phs' = if modemPhase st' /= modemPhase st then (t, modemPhase st') : phs else phs
               evs' = [ (t, e) | e <- reverse es ] ++ evs
@@ -115,7 +130,7 @@ replay rc x = go (modemInit cfg) 0 [] [] [] [] [] [] [] [] [] (-1)
                 _ -> line
               echo' = case every of
                 Just k | i `mod` k == 0, Just _ <- modemEchoErle st' ->
-                  (t, modemEchoDelay st', maybe 0 id (modemEchoErle st')) : echo
+                  (t, modemEchoDelay st', maybe 0 id (modemEchoErle st'), modemEchoData st') : echo
                 _ -> echo
               -- Every block that had a prediction, and the first that
               -- did not after one that did -- so the drop shows.

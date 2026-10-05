@@ -2,9 +2,12 @@
 
 Calls trimmed to the window that carries the answer and replayed through
 the whole modem by `Corpus.liveTests`. Every one of them had a real modem
-at the far end: twelve placed over the voip.ms trunk in September 2026,
-and two that are the same V.32bis call at 14400 recorded by somebody
-else -- see `recordings/third-party/README.md` -- one direction each.
+at the far end. Sixteen connected over the voip.ms trunk, nine are
+the bench's CX93001 -- two of them 14400 calls kept for what went wrong
+on them -- and two are the same V.32bis call at 14400 recorded
+by somebody else -- see `recordings/third-party/README.md` -- one
+direction each. The last two must not connect at all: `netcomm-2400sa-bell202`,
+placed over that trunk, and `no-v32-answerer`.
 
 Each fixture is three files with one name:
 
@@ -13,6 +16,14 @@ Each fixture is three files with one name:
 | `NAME.wav` | the audio as received, 8 kHz 16-bit mono, trimmed |
 | `NAME.txt` | the reference: what it decoded to on the day it was minted |
 | `NAME.call` | how to replay it, and what is known about it |
+| `NAME.sent` | what this modem transmitted on the call, where the call cannot be replayed without it |
+
+`NAME.sent` is a WAV under another name, lined up with `NAME.wav` sample
+for sample. A V.32 call through the bench has our own echo on it, 18 dB
+under the far end; a replay regenerates its transmit, which stops being
+what the echo is an echo of at the first byte of payload, so the
+canceller is given the real one. `replay --mint` writes it when it is
+given `--tx`.
 
 ## The spec
 
@@ -38,6 +49,15 @@ Where it appears it is doing work `connect:` cannot: a rate that
 negotiates and then cannot hold the line connects exactly like one that
 works, and at 14400 that was the whole of the difference for months.
 
+`trn:` is the length, in symbol intervals, of the TRN this modem sent on
+the call, for a V.32 recording made when that was not what it sends
+now. A replay regenerates its own transmit, and the far end in the
+recording is answering the one that was sent on the day: with a TRN a
+second longer the replay is still sending its conditioning signal when
+the recorded far end has moved on, trains on what is left, and reads
+the call worse than the call was. Every V.32 fixture recorded before
+the TRN went from 1400 to 4096 says `trn: 1400`.
+
 `tolerance:` is weaker and does different work. The reference is not
 truth, it is a record of one decode, junk included; the tolerance says
 how many bytes of edit distance the decode may drift from it. At 0 it
@@ -47,7 +67,7 @@ A deliberate improvement that moves a reference is accepted by minting
 the fixture again, from the same source and window the spec names:
 
     cabal run modec -- replay --mint NAME --mode M --seconds N \
-      [--v8] [--mnp] recordings/SOURCE.wav
+      [--v8] [--mnp] [--v32-trn SYMBOLS] recordings/SOURCE.wav
 
 ## Why the whole modem
 
@@ -65,20 +85,19 @@ cannot do is ask how the far end would have answered something else.
 
 ## The oracle
 
-Five of the twelve are the same far end. 2600.network on +1 564 244 2600
+Eight of them are the same far end. 2600.network on +1 564 244 2600
 is a Patton 3120 access server that answers every call with the same two
-lines, and six of modec's modulations have connected to it. Five are
-here -- Bell 103 is not, because that call ran out before the banner
-finished -- and each carries the identical fifty-one bytes at 300, 1200,
-1200/75, 2400 and 9600 bit/s. A fixed string from a machine that never
-varies is a better oracle than any BBS banner, because there is nothing
-to argue about when it comes back wrong.
+lines. The suite has that banner at 300, 1200/75, 2400, 9600 and 12000
+bit/s, including 9600 and 2400 with MNP. A fixed string from a machine
+that never varies is a better oracle than any BBS banner, because there
+is nothing to argue about when it comes back wrong.
 
-The rest are boards, for the variety the oracle cannot give: a
-Synchronet banner and a far end that hangs up mid-sentence, a 2400 bit/s
-link negotiated through V.8, ASCII art at 1200, a FidoNet mailer's
-checksummed EMSI, ANSI escapes at 300 bit/s, a WILDCAT! registration
-line, and one call that must not connect at all.
+The rest are boards, the bench, and the third-party 14400 call, for the
+variety the oracle cannot give: a Synchronet banner and a far end that
+hangs up mid-sentence, a 2400 bit/s link negotiated through V.8, ASCII
+art at 1200, a FidoNet mailer's checksummed EMSI, ANSI escapes at 300
+bit/s, a WILDCAT! registration line, and two calls that must not connect
+at all.
 
 None of this reaches the network. The audio is on disk and the tests
 read it; see the note on the test-suite stanza in `modec.cabal`.

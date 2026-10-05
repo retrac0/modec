@@ -48,6 +48,7 @@ data CallSpec = CallSpec
   , csModes     :: [Standard]      -- ^ modes to negotiate, best first
   , csV8        :: Bool            -- ^ V.8 was in use on the call
   , csMnp       :: Maybe Int       -- ^ MNP class offered, if any
+  , csTrn       :: Maybe Int       -- ^ the V.32 TRN this modem sent on the call, in symbols, if not today's
   , csStandard  :: Maybe String    -- ^ the other kind of fixture: one modulation, no call
   , csConnect   :: String          -- ^ what the call must reach, or @"none"@
   , csRetrains  :: [Int]           -- ^ ceilings on 5.5 retrains
@@ -58,7 +59,7 @@ data CallSpec = CallSpec
 emptyCallSpec :: CallSpec
 emptyCallSpec = CallSpec
   { csComment = [], csSource = Nothing, csSeconds = Nothing
-  , csRole = Originate, csModes = allStandards, csV8 = False, csMnp = Nothing
+  , csRole = Originate, csModes = allStandards, csV8 = False, csMnp = Nothing, csTrn = Nothing
   , csStandard = Nothing, csConnect = "none", csRetrains = []
   , csExpect = [], csTolerance = 0 }
 
@@ -82,6 +83,7 @@ parseCallSpec src = do
       , csModes     = modes
       , csV8        = flag "v8"
       , csMnp       = fmap read (key "mnp")
+      , csTrn       = fmap read (key "trn")
       , csStandard  = key "standard"
       , csConnect   = fromMaybe "none" (key "connect")
       , csRetrains  = map read (keys "retrains")
@@ -122,6 +124,7 @@ renderCallSpec cs
        , "modes:     " ++ intercalate "," (map standardName (csModes cs))
        , "v8:        " ++ (if csV8 cs then "yes" else "no") ]
     ++ [ "mnp:       " ++ show c | Just c <- [csMnp cs] ]
+    ++ [ "trn:       " ++ show n | Just n <- [csTrn cs] ]
     ++ [ "connect:   " ++ csConnect cs ]
     ++ [ "retrains:  " ++ show n | n <- csRetrains cs ]
     ++ [ "expect:    " ++ e | e <- expects ]
@@ -139,6 +142,7 @@ callSpecConfig fs cs = cfg0
   { mcHandshake = (mcHandshake cfg0) { hcV8 = csV8 cs }
   , mcMnp = fmap (\c -> (defaultMnpConfig 2400 (csRole cs == Originate)) { mnClass = c })
                  (csMnp cs)
+  , mcV32Trn = fromMaybe (mcV32Trn cfg0) (csTrn cs)
   }
   where cfg0 = defaultModemConfig fs (csRole cs) (csModes cs)
 

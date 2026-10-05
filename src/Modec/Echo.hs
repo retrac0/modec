@@ -51,6 +51,8 @@ module Modec.Echo
 import qualified Data.Vector.Storable as VS
 
 import Modec.DSP
+import qualified Data.Vector.Unboxed as VU
+import Modec.Xcorr (Spectrum, correlationFrom, crossSpectrum, prefixSums, transformReal, transformSize)
 
 data EchoConfig = EchoConfig
   { ecTaps  :: !Int      -- ^ filter length, samples
@@ -64,9 +66,8 @@ data EchoConfig = EchoConfig
     -- The data-mode search and adaptation: see 'echoBlockData'.
   , ecFarSearch :: !Int  -- ^ how far back the data-mode scan reaches, samples; 0 turns data mode off
   , ecFarWindow :: !Int  -- ^ the scan's correlation window, samples
-  , ecFarSlice  :: !Int  -- ^ lags the scan scores per block
+  , ecFarEvery  :: !Int  -- ^ samples from one scan to the next
   , ecDataMu    :: !Double -- ^ normalised LMS step while the far end talks; 0 leaves the taps to the scan's estimate
-  , ecDataOn    :: !Double -- ^ predicted echo over received power worth subtracting, with the far end talking
   } deriving (Eq, Show)
 
 -- | The configuration for a sample rate.  32 ms of taps is far wider
@@ -91,15 +92,17 @@ echoConfigAt fs = EchoConfig
   -- A two-second window is what lets a reflection 22 dB under the far
   -- end's signal clear the rival test -- the correlation's noise floor
   -- goes down with the square root of the window, and at one second a
-  -- -22 dB echo was a coin toss against it.  Ninety-six lags a block
-  -- is a scan every second and a half at a cost the block can afford.
+  -- -22 dB echo was a coin toss against it.
   --
-  -- Forty-eight, not ninety-six: measured, the scan at ninety-six cost
-  -- six milliseconds of a twenty-millisecond block, on top of a 12000
-  -- bit/s pump, and the first live call under it had the reference
-  -- asking for a retrain with ten kilobytes of junk read -- which is
-  -- what a starved transmit loop sounds like from the far end.
-  , ecFarSearch = ms 900, ecFarWindow = round (2 * fs), ecFarSlice = 48
+  -- A scan a second.  It used to be a few dozen lags a block, a dot
+  -- product each, because seven thousand of them in one block starved
+  -- the loop -- and so a scan took three seconds of a call, and two had
+  -- to agree before the filter was aimed.  All the lags at once through
+  -- a transform ('Modec.Xcorr') is five milliseconds in the block that
+  -- asks, so the cadence is set by what the votes want instead: windows
+  -- that overlap by half, so that a noise peak in one is not simply the
+  -- same peak again in the next.
+  , ecFarSearch = ms 900, ecFarWindow = round (2 * fs), ecFarEvery = round fs
   -- With the far end talking, its signal is noise to the update, and
   -- the residual the filter leaves is that noise times the step over
   -- two: 0.003 puts it 28 dB under the far end, which 12000 bit/s can
@@ -111,14 +114,7 @@ echoConfigAt fs = EchoConfig
   -- Then 'estimate' made the update's speed beside the point: the taps
   -- come from the scan and the step only has to hold them, so it is a
   -- third of what it was, for a floor 33 dB under the far end.
-  --
-  -- 0.0005, not 0.002.  On a recorded call the filter's prediction was
-  -- 0.11 % of the line at one scan and 0.26 % at the next, against an
-  -- echo that is 1 % of it: the estimate is about half the echo, and
-  -- 0.2 % was a coin toss.  A filter switched on by a noise estimate
-  -- predicts nothing and subtracts nothing, so the threshold can sit a
-  -- decade under the echo it is waiting for.
-  , ecDataMu = 0.001, ecDataOn = 0.0005 }
+  , ecDataMu = 0.001 }
   where
     ms t = round (t * fs / 1000)
 
@@ -142,9 +138,9 @@ data EchoState = EchoState
   , esOn     :: !Bool     -- ^ whether subtracting is worth doing
   , esRxHist :: !Signal   -- ^ recent received audio, for the delay search
   , esFound  :: !(Maybe Int)  -- ^ the delay the search settled on
-  , esScan   :: !(Maybe Scan) -- ^ a data-mode search in progress
+  , esScanAt :: !Int          -- ^ the received sample the next far scan is due at
+  , esScan   :: !(Maybe ScanJob) -- ^ a far scan under way
   , esVote   :: !(Maybe Int)  -- ^ what the last completed scan found
-  , esEst    :: !(Maybe Est)  -- ^ an estimate of the taps in progress
   , esLast   :: !(Int, Double, Double, Double)  -- ^ the last finished scan: lag, best, mean, rival
   , esVotes  :: [Int]         -- ^ the best lags of the last few scans, newest first
   , esRefBp  :: [Signal]      -- ^ the reference, band-limited, for the scan: blocks, newest first
@@ -154,6 +150,12 @@ data EchoState = EchoState
   , esRefFir :: !Signal       -- ^ the band-pass's history on the reference
   , esRxFir  :: !Signal       -- ^ and on the line
   , esEstimated :: !Bool      -- ^ an estimate has been taken since the filter was last aimed
+    -- Whether subtracting what the filter predicts makes the line
+    -- quieter, measured: see 'echoRun'.
+  , esCorYD  :: !Double       -- ^ the prediction against the line, summed with a slow leak
+  , esCorYY  :: !Double       -- ^ the prediction against itself, likewise
+  , esCorN   :: !Int          -- ^ samples those sums have seen since the taps were last replaced
+  , esTrained :: !Bool        -- ^ the taps were adapted against the echo alone, and took it down
   }
 
 -- | The scan and the estimate read band-limited copies of both
@@ -169,38 +171,37 @@ data EchoState = EchoState
 scanBand :: Double -> Signal
 scanBand fs = VS.reverse (firBandpass fs 600 3000 65)
 
--- | The taps being read off a finished scan, a few per block.
+-- | One look for the reflection: two seconds of the line against
+-- everything we sent that could have come back in them.
 --
--- Done in the one block the scan finished in, the estimate was four
--- million multiplies on top of a pump already using half the block --
--- and the first live calls under it had the far end reading junk and
--- asking for a retrain, with the decision error spiking at the moment
--- a scan would first have finished.  A real-time loop is judged by its
--- worst block, not its average, and the replay's average of half real
--- time said nothing about that block.
-data Est = Est
-  { etScan :: !Scan          -- ^ the frozen windows the taps are read from
-  , etTodo :: [Int]          -- ^ taps still to compute
-  , etDone :: [(Int, Double)]
-  }
-
--- | A search spread across blocks.  The whole-window search of
--- 'echoSearch' scores four thousand lags in one block, which is fine for
--- half a second of reach and a thousand-sample window and three times
--- too slow for the reach and the window a late reflection needs -- a
--- full-resolution search to 1.5 s starved the real-time loop and lost
--- three start-ups in a row.  So the windows are taken once, frozen, and
--- a slice of lags is scored each block until the range is done.
+-- The windows are taken once, frozen, and correlated at every lag
+-- together ('Modec.Xcorr').  What is kept is what judging the scan and
+-- reading the taps off it both need: the raw correlation at every
+-- offset, and the running sums of the reference to scale it by.
 data Scan = Scan
   { scRxC     :: !Signal   -- ^ the received window, centred
   , scRxNorm  :: !Double
+  , scRxSum   :: !Double   -- ^ what centring left of its sum
   , scRxFrom  :: !Int      -- ^ global index of its first sample
   , scRef     :: !Signal   -- ^ what we had transmitted, frozen
   , scRefFrom :: !Int      -- ^ global index of its first sample
   , scLo      :: !Int      -- ^ the smallest lag the range allowed
-  , scLags    :: [Int]     -- ^ still to score
-  , scScores  :: [(Double, Int)]
+  , scHi      :: !Int      -- ^ and the largest it scores
+  , scLags    :: [Int]     -- ^ the lags worth scoring
+  , scSums    :: !Signal   -- ^ running sums of the reference
+  , scSq      :: !Signal   -- ^ and of its square
+  , scEnough  :: !Double   -- ^ the least reference energy under the window worth dividing by
+  , scXc      :: Signal    -- ^ the window against the reference, by offset into it
   }
+
+-- | A scan under way.  It is three transforms, and they are taken a
+-- block apart: one transform of this size is two milliseconds on an
+-- idle machine and seven on a busy one, and a real-time loop is judged
+-- by its worst block.
+data ScanJob
+  = ScanHeard !Scan !Spectrum            -- ^ the line's window is transformed
+  | ScanSent !Scan !Spectrum !Spectrum   -- ^ and the reference
+  | ScanDone !Scan                       -- ^ and the two are correlated: to be judged
 
 echoInit :: EchoConfig -> EchoState
 echoInit cfg = EchoState
@@ -208,9 +209,10 @@ echoInit cfg = EchoState
   , esDelay = ecDelay cfg
   , esTaps = VS.replicate (ecTaps cfg) 0
   , esEchoP = 0, esResP = 0, esEchoY = 0, esOn = False
-  , esRxHist = VS.empty, esFound = Nothing, esScan = Nothing, esVote = Nothing, esEst = Nothing, esLast = (0, 0, 0, 0)
+  , esRxHist = VS.empty, esFound = Nothing, esScanAt = 0, esScan = Nothing, esVote = Nothing, esLast = (0, 0, 0, 0)
   , esVotes = [], esRefBp = [], esRefBpN = 0, esRxBp = [], esRxBpN = 0
-  , esRefFir = VS.replicate 64 0, esRxFir = VS.replicate 64 0, esEstimated = False }
+  , esRefFir = VS.replicate 64 0, esRxFir = VS.replicate 64 0, esEstimated = False
+  , esCorYD = 0, esCorYY = 0, esCorN = 0, esTrained = False }
 
 -- | Remember a block we have just transmitted.  Called at the end of a
 -- modem step, with the audio that step produced.
@@ -312,37 +314,45 @@ echoBlock cfg adapt = echoRun cfg (if adapt then EchoQuiet else EchoHold)
 -- it, nothing adapted, and every V.32 rate needing more than 20 dB of
 -- slicer was under a floor no signal-to-noise ratio could lift.
 --
--- So, in data mode: an incremental search ('Scan') finds the reflection
--- against the talking far end -- a long window is what makes that
--- possible -- and the filter is aimed only when two scans in a row agree
--- on where it is.  Then it adapts with a step small enough that the far
--- end's signal, which is noise to the update, leaves a residual well
--- under the echo it removes.  And it switches on by its own rule: the
--- one above compares residual against received power and cannot
--- trigger while the far end is most of what is received, so here the
--- filter's own prediction is weighed against the line, with a runaway
--- guard above it.
+-- So, in data mode: a search ('Scan') finds the reflection against the
+-- talking far end -- a long window is what makes that possible -- and
+-- the filter is aimed only when scans agree on where it is.  Then it
+-- adapts with a step small enough that the far end's signal, which is
+-- noise to the update, leaves a residual well under the echo it
+-- removes.  And it switches on by its own rule: the one above compares
+-- residual against received power and cannot trigger while the far end
+-- is most of what is received, so here the filter's prediction is
+-- correlated with the line -- which says whether taking it out makes
+-- the line quieter -- with a runaway guard above it.
 echoBlockData :: EchoConfig -> Signal -> EchoState -> (EchoState, Signal)
 echoBlockData cfg rx st0
   | ecFarSearch cfg <= 0 = echoRun cfg EchoHold rx st0
-  | otherwise = let (st1, out) = echoRun cfg EchoData rx st0 in (stepScan cfg st1, out)
+  | otherwise = let (st1, out) = echoRun cfg EchoData rx st0 in (stepScan cfg 1 st1, out)
 
--- | Go on looking for a late reflection while the start-up is still
--- running, without adapting to it: one block of the data-mode search.
+-- | Look for a late reflection while the start-up is still running:
+-- the far search, with nothing else of data mode.
 --
--- The search needs seconds -- a two-second window and a scan of every
--- lag to 900 ms -- and in data mode it started from nothing when the
--- data did.  On a 14400 call modec placed through the bench that was
--- six seconds of data with our own echo 20 dB under the far end's
--- signal, which is the receiver's whole margin at that rate.  The last
--- phases of the start-up already carry both ends talking and our own
--- signal aperiodic (the rate signal and E are scrambled), which is all
--- the search asks for.  Call it after 'echoBlock', which keeps the
--- histories it reads.
-echoScanStep :: EchoConfig -> EchoState -> EchoState
-echoScanStep cfg st
+-- In data mode the search started from nothing when the data did, and a
+-- 14400 receiver spent its first seconds with our own echo 20 dB under
+-- the far end's signal, which is its whole margin.  The start-up has
+-- better to offer than that.  Its conditioning signals are aperiodic,
+-- which is all the search asks of what we send; and the first of them
+-- is sent into a far end that Figure 4 keeps silent, so the reflection
+-- comes back alone and the search cannot miss it.  Call it after
+-- 'echoBlock', which keeps the histories it reads.
+--
+-- @quiet@ is the start-up saying the far end is silent.  Then there is
+-- no far signal for a long window to average away, and a long window is
+-- a liability: it still holds whatever the far end was sending before
+-- it stopped, at a hundred times the echo's power, and the reflection
+-- has to fill most of two seconds before it shows over that.  A quarter
+-- of the window sees it half a second after it arrives -- which leaves
+-- the rest of the conditioning signal for the filter to train on it.
+echoScanStep :: EchoConfig -> Bool -> EchoState -> EchoState
+echoScanStep cfg quiet st
   | ecFarSearch cfg <= 0 = st
-  | otherwise = stepScan cfg st
+  | quiet = stepScan cfg 4 st
+  | otherwise = stepScan cfg 1 st
 
 data EchoMode = EchoQuiet | EchoHold | EchoData deriving (Eq)
 
@@ -361,27 +371,76 @@ echoRun cfg mode rx st0 = (st', out)
     ref = esRef st0
     refLen = VS.length ref
     -- ref[0] is the transmitted sample with global index
-    -- esRefEnd - refLen, so the sample d before received sample i is:
-    refAt i d =
-      let k = (esRxAt st0 + i - d) - (esRefEnd st0 - refLen)
-      in if k < 0 || k >= refLen then 0 else VS.unsafeIndex ref k
+    -- esRefEnd - refLen, so tap k of received sample i reads
+    -- ref[x0 + i - k], or nothing where that is off either end.
+    --
+    -- Read where it lies.  This used to copy the filter's window out of
+    -- the reference for every sample -- a vector of 'ecTaps', then two
+    -- more for the product and the squares -- which is the same sums
+    -- and three allocations a sample, a megabyte a block, in a loop
+    -- that runs for every block of every V.32 call whether or not the
+    -- filter is doing anything.
+    x0 = (esRxAt st0 - esDelay st0) - (esRefEnd st0 - refLen)
+    xAt !j = if j < 0 || j >= refLen then 0 else VS.unsafeIndex ref j
+    nTaps = min taps (VS.length (esTaps st0))
+    dotRef !w !j0 = sumTo 0 0
+      where
+        sumTo !k !acc
+          | k >= nTaps = acc
+          | otherwise = sumTo (k + 1) (acc + VS.unsafeIndex w k * xAt (j0 - k))
+    sumSqRef !j0 = sumTo 0 0
+      where
+        sumTo :: Int -> Double -> Double
+        sumTo !k !acc
+          | k >= taps = acc
+          | otherwise = let v = xAt (j0 - k) in sumTo (k + 1) (acc + v * v)
 
-    go !i !w !ep !rp !yp !on acc
-      | i >= n = (w, ep, rp, yp, on, reverse acc)
+    -- Whether subtracting the prediction makes the line quieter.
+    --
+    -- With the far end talking the residual says nothing -- a perfect
+    -- echo 20 dB under the far signal comes out as one part in a
+    -- hundred of the power -- but the prediction's correlation with the
+    -- line says it exactly: taking y out of d lowers the power when
+    -- twice their product exceeds y squared, and that ratio is one for
+    -- an echo the taps have right and nought for an echo that is not
+    -- there.  Summed over half a second it is steady to a tenth with
+    -- the far end twenty decibels over the echo.
+    --
+    -- It answers what the filter's own output could not.  Through the
+    -- bench's ATA a canceller of its own usually takes our echo out,
+    -- but takes half a second to settle on a new signal, so the far
+    -- search can find a reflection that is gone a moment later; and a
+    -- filter read off a noise peak predicts something just the same.
+    -- Either was switched on by how much it predicted and went on
+    -- subtracting what was not there.
+    corSpan = max 1 (ecFarWindow cfg `div` 4)
+    corKeep = 1 - 1 / fromIntegral corSpan
+    corWarm = max 1 (ecFarWindow cfg `div` 8)
+    far = ecFarSearch cfg > 0
+
+    go !i !w !ep !rp !yp !on !cyd !cyy !cn acc
+      | i >= n = (w, ep, rp, yp, on, cyd, cyy, cn, reverse acc)
       | otherwise =
-          let xs = VS.generate taps (\k -> refAt i (esDelay st0 + k))
-              y = VS.sum (VS.zipWith (*) w xs)
+          let j0 = x0 + i
+              y = dotRef w j0
               d = VS.unsafeIndex rx i
               e = d - y
-              nrm = VS.sum (VS.map (\v -> v * v) xs)
+              nrm = sumSqRef j0
               g = if adapting && nrm > 1e-12 then mu * e / nrm else 0
               lk = 1 - ecLeak cfg
               w' = if adapting
-                     then VS.zipWith (\wk xk -> lk * wk + g * xk) w xs
+                     then VS.imap (\k wk -> lk * wk + g * xAt (j0 - k)) w
                      else w
               ep' = 0.99 * ep + 0.01 * (d * d)
               rp' = 0.99 * rp + 0.01 * (e * e)
               yp' = 0.99 * yp + 0.01 * (y * y)
+              cyd' = corKeep * cyd + y * d
+              cyy' = corKeep * cyy + y * y
+              cn' = if cn >= corWarm then cn else cn + 1
+              helps | cn' < corWarm = Nothing
+                    | cyd' > 0.5 * cyy' = Just True
+                    | cyd' < 0.25 * cyy' = Just False
+                    | otherwise = Nothing
               -- Whether to subtract is decided only while the far end is
               -- silent, and held the rest of the time.
               --
@@ -429,22 +488,26 @@ echoRun cfg mode rx st0 = (st', out)
                   | mode == EchoData = dataOn
                   | adapt, rp' < 0.5 * ep' = True
                   | adapt, rp' > 0.9 * ep' = False
+                  -- measured, where there is a far search to have aimed it
+                  | far, aimed, Just h <- helps = h
                   | aimed, yp' > ecOnRatio cfg * ep' = True
                   | aimed, yp' < 0.25 * ecOnRatio cfg * ep' = False
                   | not aimed = False
                   | otherwise = on
-              -- With the far end talking, what the filter predicts is
-              -- the only measure there is of what it is removing.  Off
-              -- until aimed; off again if it ever claims a quarter of
-              -- the line, which is a filter that has run away.
+              -- With the far end talking: off until aimed; off if it
+              -- ever claims a quarter of the line, which is a filter
+              -- that has run away; and otherwise on while taking its
+              -- prediction out is measured to make the line quieter.
+              -- Taps just read off a scan are trusted for the quarter
+              -- second the measurement needs.
               dataOn | not aimed = False
                      | yp' > 0.25 * ep' = False
-                     | yp' > ecDataOn cfg * ep' = True
-                     | yp' < 0.25 * ecDataOn cfg * ep' = False
+                     | Just h <- helps = h
                      | otherwise = on
-          in go (i + 1) w' ep' rp' yp' on' ((if on' then e else d) : acc)
+          in go (i + 1) w' ep' rp' yp' on' cyd' cyy' cn' ((if on' then e else d) : acc)
 
-    (w1, ep1, rp1, yp1, on1, outs) = go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esEchoY st0) (esOn st0) []
+    (w1, ep1, rp1, yp1, on1, cyd1, cyy1, cn1, outs) =
+      go 0 (esTaps st0) (esEchoP st0) (esResP st0) (esEchoY st0) (esOn st0) (esCorYD st0) (esCorYY st0) (esCorN st0) []
     out = VS.fromList outs
     -- a filter that ran away in data mode starts its taps again
     runaway = mode == EchoData && ep1 > 1e-18 && yp1 > 0.25 * ep1
@@ -452,73 +515,138 @@ echoRun cfg mode rx st0 = (st', out)
     (rxBp', rxBpN') = if ecFarSearch cfg > 0
                         then trimBlocks (ecFarWindow cfg + 1024) (rxBp : esRxBp st0) (esRxBpN st0 + VS.length rxBp)
                         else ([], 0)
+    stoppedHelping = mode /= EchoQuiet && esOn st0 && not on1
     st' = st0 { esTaps = if runaway then VS.map (const 0) w1 else w1
               , esEchoP = ep1, esResP = rp1, esEchoY = yp1, esOn = on1 && not runaway
+              , esCorYD = cyd1, esCorYY = cyy1, esCorN = cn1
+              -- Taps that the full step has fitted to the echo standing
+              -- alone are better than anything a scan can read off with
+              -- the far end talking, and are kept from it: see
+              -- 'finishScan'.  Six decibels taken out is the mark, and a
+              -- filter later measured not to be helping loses it.
+              , esTrained = (esTrained st0 || (quiet && ep1 > 1e-18 && rp1 < 0.25 * ep1))
+                            && not stoppedHelping
+              -- ...and the next scan's reading of the taps replaces them
+              -- outright rather than being averaged into what was wrong.
+              , esEstimated = esEstimated st0 && not stoppedHelping
               , esRxAt = esRxAt st0 + n
               , esRxHist = keepTail (ecSearch cfg `div` 2) (esRxHist st0 VS.++ rx)
               , esRxBp = rxBp', esRxBpN = rxBpN', esRxFir = rxFir' }
 
--- | One block's worth of the data-mode search: start one if none is
--- running, score the next slice of lags, and when the range is done
--- judge it exactly as 'echoSearch' judges its own.  Aim only when two
--- scans in a row agree, and only when the answer has moved -- aiming
--- drops the taps, and a filter that is converging must not be reset
--- for being told what it already knew.
-stepScan :: EchoConfig -> EchoState -> EchoState
-stepScan cfg st = case esEst st of
-  Just est -> stepEst cfg st est
-  Nothing -> case esScan st of
-   Nothing -> st { esScan = startScan cfg st }
-   Just sc ->
-    let (now, rest) = splitAt (ecFarSlice cfg) (scLags sc)
-        scored = [ (scoreLag (scRef sc) (scRefFrom sc) (scRxC sc) (scRxNorm sc) (scRxFrom sc) l, l) | l <- now ]
-        sc' = sc { scLags = rest, scScores = scored ++ scScores sc }
-    -- Forced here, in this block.  Consed onto a list that nothing
-    -- reads until the scan is judged, every score was a thunk, and all
-    -- seven thousand of them -- two hundred million multiplies -- were
-    -- evaluated in the one block where the scan finished.  Measured in
-    -- the live loop: blocks of 336 to 370 ms against a budget of 20,
-    -- seventeen blocks of audio gone each time, which the far end read
-    -- as junk and answered with a retrain.  With the canceller off the
-    -- worst block was 39 ms.
-    in forceScores scored `seq` (if null rest then finishScan cfg st sc' else st { esScan = Just sc' })
+-- | The far search: when one is due, take the windows; then a
+-- transform a block until every lag is scored; then judge the result
+-- exactly as 'echoSearch' judges its own.  Aim only when scans agree,
+-- and only when the answer has moved -- aiming drops the taps, and a
+-- filter that is converging must not be reset for being told what it
+-- already knew.
+--
+-- @short@ divides the window and the wait between scans: one with the
+-- far end talking, more when it is known to be silent.
+stepScan :: EchoConfig -> Int -> EchoState -> EchoState
+stepScan cfg short0 st = case esScan st of
+  Just (ScanHeard sc heard) ->
+    let sent = transformReal (VU.length (fst heard)) (scRef sc)
+    in ready sent `seq` st { esScan = Just (ScanSent sc heard sent) }
+  Just (ScanSent sc heard sent) ->
+    let xc = correlationFrom (VS.length (scRef sc) - VS.length (scRxC sc) + 1) (crossSpectrum heard sent)
+    in xc `seq` st { esScan = Just (ScanDone sc { scXc = xc }) }
+  Just (ScanDone sc) -> (finishScan cfg st sc) { esScan = Nothing }
+  Nothing
+    | esRxAt st < esScanAt st -> st
+    | otherwise -> case startScan cfg (ecFarWindow cfg `div` short) st of
+        -- not enough heard, or nothing sent to look for: ask again soon
+        Nothing -> st { esScanAt = esRxAt st + ecFarEvery cfg `div` 8 }
+        Just sc ->
+          let heard = transformReal (transformSize (VS.length (scRef sc))) (scRxC sc)
+          in ready heard `seq` st { esScan = Just (ScanHeard sc heard)
+                                 , esScanAt = esRxAt st + ecFarEvery cfg `div` short }
+  where
+    ready (re, im) = re `seq` im `seq` ()
+    -- Often and short only until the reflection is found: after that
+    -- the filter is adapting to it and the search has nothing to add
+    -- that is worth four transforms a quarter second, in the stretch of
+    -- the start-up where a late block is a hole in our own TRN.
+    short = if esFound st == Nothing then short0 else 1
 
--- | Evaluate every score now.
-forceScores :: [(Double, Int)] -> ()
-forceScores = foldr (\(c, l) r -> c `seq` l `seq` r) ()
-
--- | A dozen taps a block, then the scale and the average in the block
--- after the last.
-stepEst :: EchoConfig -> EchoState -> Est -> EchoState
-stepEst cfg st est = case splitAt 12 (etTodo est) of
-  ([], _) -> (finishEst cfg (etScan est) (etDone est) st) { esEst = Nothing }
-  (now, rest) ->
-    let sc = etScan est
-        fresh = [ (k, tapOf sc (esDelay st) k) | k <- now ]
-        done = fresh ++ etDone est
-    -- forced now, for the same reason 'forceScores' exists
-    in foldr (\(k, v) r -> k `seq` v `seq` r) () fresh `seq` st { esEst = Just est { etTodo = rest, etDone = done } }
-
-startScan :: EchoConfig -> EchoState -> Maybe Scan
-startScan cfg st
-  | esRxBpN st < ecFarWindow cfg = Nothing
+startScan :: EchoConfig -> Int -> EchoState -> Maybe Scan
+startScan cfg window st
+  | esRxBpN st - behind < window = Nothing
   | length lags < 512 = Nothing
   | otherwise = Just Scan
-      { scRxC = rxC, scRxNorm = rxNorm, scRxFrom = rxFrom
-      , scRef = ref, scRefFrom = refFrom, scLo = lo, scLags = lags, scScores = [] }
+      { scRxC = rxC, scRxNorm = rxNorm, scRxSum = VS.sum rxC, scRxFrom = rxFrom
+      , scRef = ref, scRefFrom = refFrom, scLo = lo, scHi = maximum lags, scLags = lags
+      , scSums = prefixSums ref, scSq = sq, scEnough = enough, scXc = VS.empty }
   where
+    -- The window stops where the reference does.  This is asked after
+    -- a block has been heard and before what it is answered with has
+    -- been sent, so the newest block of the line has no reference under
+    -- its nearest lags yet.  Leaving it out lets the lags start at
+    -- nought, as 'echoSearch' has them -- and that is what lets the edge
+    -- rule below pass a hybrid 25 ms away, which is inside the span the
+    -- filter starts with and was being refused as the edge of a range
+    -- that began a block late.
+    behind = max 0 (esRxAt st - esRefEnd st)
     -- joined once, here, from blocks appended for nothing
-    rxW = keepTail (ecFarWindow cfg) (VS.concat (reverse (esRxBp st)))
+    heard = VS.concat (reverse (esRxBp st))
+    rxW = keepTail window (VS.take (VS.length heard - behind) heard)
     w = VS.length rxW
     rxMean = VS.sum rxW / fromIntegral w
     rxC = VS.map (subtract rxMean) rxW
     rxNorm = sqrt (VS.sum (VS.map (\v -> v * v) rxC))
-    rxFrom = esRxAt st - w
-    ref = VS.concat (reverse (esRefBp st))
+    rxFrom = esRxAt st - behind - w
+    -- No more of the reference than the lags can reach: the transforms
+    -- are as long as this is, and with a short window that is half the
+    -- work.
+    ref = keepTail (w + ecFarSearch cfg) (VS.concat (reverse (esRefBp st)))
     refFrom = esRefEnd st - VS.length ref
-    lo = max 0 (esRxAt st - esRefEnd st)
-    lags = [ l | l <- [lo .. ecFarSearch cfg]
-               , let o = (rxFrom - l) - refFrom, o >= 0, o + w <= VS.length ref ]
+    lo = 0
+    inRange = [ l | l <- [lo .. ecFarSearch cfg]
+                  , let o = (rxFrom - l) - refFrom, o >= 0, o + w <= VS.length ref ]
+    -- Only where we were sending.  A lag whose two seconds of reference
+    -- are mostly silence has nothing to be correlated with, and counting
+    -- it anyway is how a filter came to be aimed at nothing: the first
+    -- scan after an answering modem's silence found the reference empty
+    -- at nine lags in ten, so the mean score was nearly nought and the
+    -- rival was nought, and a score of nothing much at 38 ms -- sixteen
+    -- samples of our own signal's first rise against the line -- stood
+    -- nine times over the one and infinitely over the other.  The taps
+    -- were then read off the same sixteen samples, each a correlation
+    -- divided by the energy of a pulse's leading edge, and the filter
+    -- predicted an echo ten to the twentieth times the line (bench call
+    -- 20261004T230127).  So a lag is scored only where the reference
+    -- under it holds at least half what the fullest window does, and a
+    -- scan with too few such lags is no scan.
+    sq = prefixSums (VS.map (\v -> v * v) ref)
+    energy l = let o = (rxFrom - l) - refFrom in VS.unsafeIndex sq (o + w) - VS.unsafeIndex sq o
+    fullest = maximum (0 : map energy inRange)
+    enough = max (0.5 * fullest) (scanFloor * fromIntegral w)
+    lags = [ l | l <- inRange, energy l >= enough ]
+
+-- | Every scored lag's normalised correlation.
+--
+-- 'scoreLag', with its sums read off instead of added up: the
+-- reference's mean and energy under the window from running sums, and
+-- the window against the reference from the transforms.  The same
+-- number to a part in a million million, which is all a search that
+-- votes on its answer needs of it.
+scanScores :: Scan -> [(Double, Int)]
+scanScores sc = [ (score l, l) | l <- scLags sc ]
+  where
+    w = VS.length (scRxC sc)
+    score l =
+      let o = (scRxFrom sc - l) - scRefFrom sc
+          s1 = VS.unsafeIndex (scSums sc) (o + w) - VS.unsafeIndex (scSums sc) o
+          s2 = VS.unsafeIndex (scSq sc) (o + w) - VS.unsafeIndex (scSq sc) o
+          m = s1 / fromIntegral w
+          nsq = s2 - s1 * m
+          dt = VS.unsafeIndex (scXc sc) o - m * scRxSum sc
+      in if nsq <= scanFloor * fromIntegral w || scRxNorm sc <= 0 then 0 else abs dt / (sqrt nsq * scRxNorm sc)
+
+-- | A reference quieter than this, mean square, is silence, whatever
+-- fraction of it a window holds.  Ninety decibels under full scale:
+-- what we send is at minus nine.
+scanFloor :: Double
+scanFloor = 1e-9
 
 finishScan :: EchoConfig -> EchoState -> Scan -> EchoState
 finishScan cfg st sc
@@ -529,8 +657,13 @@ finishScan cfg st sc
   -- samples, and the scan that aims showing the peak itself -- above
   -- the mean by 'ecPeak', and above the best of everywhere else by a
   -- margin -- is what a noise peak cannot supply.
-  | agreed, showing, moved = (estimateFrom (echoAim cfg bestLag st1)) { esVote = Just bestLag }
-  | agreed, showing = (estimateFrom st1) { esVote = Just bestLag }
+  | agreed, showing, moved =
+      let st2 = echoAim cfg bestLag st1
+      in (if esTrained st2 then st2 else estimateFrom st2) { esVote = Just bestLag }
+  -- the same place again: refine the taps, unless they were trained
+  -- against the echo alone, which no scan's reading of them improves
+  | agreed, showing, not (esTrained st1) = (estimateFrom st1) { esVote = Just bestLag }
+  | agreed, showing = st1 { esVote = Just bestLag }
   | otherwise = st1
   where
     votes = take 4 (bestLag : esVotes st)
@@ -551,13 +684,12 @@ finishScan cfg st sc
     -- under 1.5 times their rival.
     unmistakable = best > 8 * avg && best > 1.7 * rival
     showing = best > ecPeak cfg * avg && avg > 0 && best > 1.25 * rival
-              && bestLag > scLo sc + edge && bestLag < ecFarSearch cfg - edge
+              && bestLag > scLo sc + edge && bestLag < min (ecFarSearch cfg) (scHi sc) - edge
     moved = maybe True (\f -> abs (f - bestLag) > 4) (esFound st1)
-    -- only around where the aim put the peak -- 'ecPre' in from the
-    -- start -- and read off a few per block: see 'Est'
-    estimateFrom s = s { esEst = Just (Est sc [ k | k <- [0 .. ecTaps cfg - 1], abs (k - ecPre cfg) <= 48 ] []) }
-    st1 = st { esScan = Nothing, esLast = (bestLag, best, avg, rival), esVotes = votes }
-    scores = scScores sc
+    -- only around where the aim put the peak -- 'ecPre' in from the start
+    estimateFrom s = finishEst cfg sc [ (k, tapOf sc (esDelay s) k) | k <- [0 .. ecTaps cfg - 1], abs (k - ecPre cfg) <= 48 ] s
+    st1 = st { esLast = (bestLag, best, avg, rival), esVotes = votes }
+    scores = scanScores sc
     best = maximum (map fst scores)
     bestLag = snd (head [ p | p <- scores, fst p == best ])
     avg = sum (map fst scores) / fromIntegral (length scores)
@@ -583,19 +715,16 @@ finishScan cfg st sc
 tapOf :: Scan -> Int -> Int -> Double
 tapOf sc d0 k =
   let w = VS.length (scRxC sc)
-      ref = scRef sc
       o = (scRxFrom sc - (d0 + k)) - scRefFrom sc
-  in if o < 0 || o + w > VS.length ref then 0
-     else let e = VS.slice o w ref
-              go !i !dt !nsq
-                | i >= w = (dt, nsq)
-                | otherwise = go (i + 1) (dt + VS.unsafeIndex (scRxC sc) i * VS.unsafeIndex e i)
-                                         (nsq + VS.unsafeIndex e i * VS.unsafeIndex e i)
-              (dt', nsq') = go 0 0 0
-          in if nsq' <= 0 then 0 else dt' / nsq'
+  in if o < 0 || o + w > VS.length (scRef sc) then 0
+     else let nsq = VS.unsafeIndex (scSq sc) (o + w) - VS.unsafeIndex (scSq sc) o
+          in if nsq < scEnough sc then 0 else VS.unsafeIndex (scXc sc) o / nsq
 
 finishEst :: EchoConfig -> Scan -> [(Int, Double)] -> EchoState -> EchoState
-finishEst cfg sc done st = st { esTaps = taps', esEstimated = True }
+finishEst cfg sc done st
+  -- taps that are new have earned nothing yet: see 'echoRun'
+  | not (esEstimated st) = st { esTaps = taps', esEstimated = True, esOn = True, esCorYD = 0, esCorYY = 0, esCorN = 0 }
+  | otherwise = st { esTaps = taps', esEstimated = True }
   where
     w = VS.length (scRxC sc)
     d0 = esDelay st
@@ -766,11 +895,23 @@ echoSearch cfg st
 
 -- | Point the filter at a delay the search found, reaching 'ecPre' in
 -- front of it so the leading edge of the reflection is inside the span.
+--
+-- The taps describe the stretch of line the filter was looking at, so
+-- they go when it looks somewhere else -- and stay when it does not.  A
+-- reflection inside the span the filter starts with has been adapted to
+-- since the far end went quiet, by the time any search has enough of it
+-- to find; being told where it is must not cost what was learned there.
+-- It used to: a hybrid 25 ms away and 10 dB down was trained on for half
+-- a second, found, and the taps dropped with the quiet window nearly
+-- over.
 echoAim :: EchoConfig -> Int -> EchoState -> EchoState
-echoAim cfg l st = st
-  { esDelay = max (ecDelay cfg) (l - ecPre cfg)
-  , esTaps = VS.map (const 0) (esTaps st)
-  , esFound = Just l, esEstimated = False }
+echoAim cfg l st
+  | delay == esDelay st = st { esFound = Just l }
+  | otherwise = st
+      { esDelay = delay
+      , esTaps = VS.map (const 0) (esTaps st)
+      , esFound = Just l, esEstimated = False, esTrained = False }
+  where delay = max (ecDelay cfg) (l - ecPre cfg)
 
 -- | The delay the search settled on, for tracing.
 echoDelay :: EchoState -> Maybe Int
@@ -796,7 +937,7 @@ echoDebug st =
   in "delay " ++ show (esDelay st) ++ " found " ++ show (esFound st) ++ " vote " ++ show (esVote st)
      ++ " on " ++ show (esOn st) ++ " peak tap " ++ show k ++ " = " ++ show (VS.unsafeIndex t k)
      ++ " echoP " ++ show (esEchoP st) ++ " predP " ++ show (esEchoY st) ++ " resP " ++ show (esResP st)
-     ++ " scanning " ++ show (maybe False (const True) (esScan st))
+     ++ " line/prediction " ++ show (if esCorYY st <= 0 then 0 else esCorYD st / esCorYY st) ++ " over " ++ show (esCorN st)
      ++ " last scan " ++ show (esLast st) ++ " votes " ++ show (esVotes st)
 
 echoErle :: EchoState -> Double

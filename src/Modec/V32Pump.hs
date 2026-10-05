@@ -113,7 +113,11 @@ v32RxCfg r
                          , qrThKi = if denseGrid r then 0 else qrThKi base }
   | otherwise = base
   where
+    -- Half a second of waiting through a quiet line ('qrFadeHold'): a
+    -- lost packet is 20 ms, and a far end that has gone for half a
+    -- second has gone.
     base = narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (constellation r)))
+             { qrFadeHold = Just (16, 1200) }
     -- The equaliser's freeze, in the constellation's own units.
     --
     -- 'defaultRxCfg' freezes adaptation at a decision error power of
@@ -297,10 +301,20 @@ v32AcqCfg r = tune (narrowTiming r (settledAgc r (defaultRxCfg (slicePoint r) (c
 -- to stop chasing its own data.  The four-point receiver that runs the
 -- start-up keeps the fast estimate throughout, because on one amplitude
 -- it costs nothing.
+--
+-- A slow gain needs the step rule with it ('qrAgcStep'), for the reason
+-- V.22bis at 2400 does.  The bench's ATA doubled the far end's level
+-- for 80 ms in the middle of a 14400 call (20261005T050643) and halved
+-- it again.  This gain went 3 dB after it and took half a second to
+-- come back, a hundred and twenty-eight points landed on each other's
+-- places for all of that, and since a decision at 14400 is never far
+-- from some point, the loops trained on every one of them.  The
+-- thresholds are V.22bis's: the spread of a symbol's power about its
+-- mean is 0.57 on sixteen points and 0.63 on a square full of them.
 settledAgc :: V32Rate -> QamRxCfg -> QamRxCfg
 settledAgc r c
   | r == V32R4800 = c
-  | otherwise = c { qrAgcSettled = 0.002 }
+  | otherwise = c { qrAgcSettled = 0.002, qrAgcStep = Just (3.5, 4) }
 
 -- | The timing loop's own noise, taken out once the loop no longer
 -- needs the bandwidth it was acquiring with.
@@ -393,8 +407,13 @@ narrowed c = c { qrKpTrack = 0.25 * qrKp c, qrKiTrack = 0.25 * qrKi c }
 -- that settles on 4800 holds that line for as long as the session
 -- lasts, through whatever the line does to its delay, and 4800's margin
 -- can afford every bit of the noise the bandwidth costs.
+--
+-- And it waits three seconds through a quiet line ('qrFadeHold') where
+-- the data pump waits half of one: Figure 4's silences are as long as
+-- the other end's conditioning signal, and what the start-up has
+-- learned by then is what it is there to hand over.
 v32StartCfg :: QamRxCfg
-v32StartCfg = narrowed (v32RxCfg V32R4800)
+v32StartCfg = (narrowed (v32RxCfg V32R4800)) { qrFadeHold = Just (16, 7200) }
 
 -- | How long that lasts.  §5.4.2's B1 is 128 symbol intervals of
 -- scrambled ones between E and the data, put there so a receiver can

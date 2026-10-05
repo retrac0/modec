@@ -40,7 +40,7 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Char (isSpace)
 import Data.List (isInfixOf, isSuffixOf, sort)
 import Data.Maybe (fromMaybe, mapMaybe)
-import System.Directory (listDirectory)
+import System.Directory (doesFileExist, listDirectory)
 import System.FilePath (dropExtension, replaceExtension, (</>))
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -112,7 +112,7 @@ specTests = do
       files <- sort . filter (".call" `isSuffixOf`) <$> listDirectory dir
       mapM (\f -> (,) f <$> readFile (dir </> f)) files
 
-corpusGroup :: String -> FilePath -> (FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion)
+corpusGroup :: String -> FilePath -> (FilePath -> CallSpec -> B.ByteString -> Wav -> Maybe Signal -> Assertion)
             -> IO TestTree
 corpusGroup label dir run = do
   files <- sort . filter (".wav" `isSuffixOf`) <$> listDirectory dir
@@ -122,11 +122,16 @@ corpusGroup label dir run = do
     return $ testCase (dropExtension f) $ do
       w <- readWav (dir </> f)
       expected <- B.readFile (dir </> replaceExtension f "txt")
-      run f sp expected w
+      -- what this modem sent on the call, where the call was recorded
+      -- with it: the echo canceller's reference
+      let sentFile = dir </> replaceExtension f "sent"
+      have <- doesFileExist sentFile
+      sent <- if have then Just . wavSamples <$> readWav sentFile else return Nothing
+      run f sp expected w sent
   return (testGroup label cases)
 
-fskCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion
-fskCase f sp expected w = do
+fskCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Maybe Signal -> Assertion
+fskCase f sp expected w _ = do
   let spec = specOf (fromMaybe (error (f ++ ": no standard:")) (csStandard sp))
       fs = fromIntegral (wavRate w)
       got = B.pack (demodulate fs spec framing8N1 defaultDemodParams (wavSamples w))
@@ -139,11 +144,11 @@ fskCase f sp expected w = do
       "v21-ch2"           -> v21Channel2
       _                   -> error (f ++ ": unknown standard " ++ n)
 
-replayCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Assertion
-replayCase _ sp expected w = do
+replayCase :: FilePath -> CallSpec -> B.ByteString -> Wav -> Maybe Signal -> Assertion
+replayCase _ sp expected w sent = do
   let fs = fromIntegral (wavRate w) :: Double
       cfg = callSpecConfig fs sp
-      r = replay (defaultReplayConfig cfg) (wavSamples w :: Signal)
+      r = replay (defaultReplayConfig cfg) { rcTx = sent } (wavSamples w :: Signal)
       got = rrBytes r
       text = map (toEnum . fromIntegral) got :: String
       connected = connectLine (rrEvents r)

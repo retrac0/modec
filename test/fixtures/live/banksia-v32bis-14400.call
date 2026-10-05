@@ -41,11 +41,25 @@
 # now goes at 7.92 s on the real AC.  The EC pattern and the LAPM frames
 # are byte for byte what they were; the last 88 bytes, which nothing reads
 # (decision error through data mode 0.01968 before, 0.01966 after), moved.
+#
+# Stopped at 31 s, where it ran to the end of the file at 31.66.  All of
+# the EC pattern and the frames is in the first third of a second of
+# data; nothing frames as characters for the fourteen seconds after it;
+# and in the file's last half second the far end sends a pattern that
+# repeats every six bits, which is not data and does not decode to one
+# thing.  Three hundred of this reference's bytes were that half second.
+# Measured: two replays whose only difference was 0.08 Hz in the carrier
+# frequency handed to the data pump -- a third of a degree of phase --
+# put out the same 206886 bits, to the bit, up to that point, and
+# 011111 against 100101 after it.  A reference that pinned those bytes
+# failed on a change that altered nothing a receiver is for.  What is
+# left is every byte the old reference had before them, unchanged.
 source:    recordings/third-party/banksia-mymodem144-answer.wav
-seconds:   32.0
+seconds:   31.0
 role:      originate
 modes:     v32bis
 v8:        no
+trn:       1400
 connect:   V32bis 14400
 retrains:  0
 tolerance: 0

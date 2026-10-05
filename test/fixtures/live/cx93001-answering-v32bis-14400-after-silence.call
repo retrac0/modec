@@ -1,0 +1,31 @@
+# 20261005T015516-1001-192-168-30-104-26668.wav
+#
+# The start-up of a 14400 call modec placed through the bench, to five
+# seconds past CONNECT, with what modec sent beside it (.sent).
+#
+# For the silence in the middle of it.  Figure 4 has the answering
+# modem stop while the caller sends its conditioning signal, and with
+# our own echo cancelled -- it is trained on to 28 dB in this call, in
+# that very window -- the line carries nothing for two seconds.  A
+# receiver that follows the line down has its gain up sixty decibels by
+# the end of them; when the far end's second conditioning signal
+# arrives, the timing detector, which divides by the level being
+# tracked, puts out its limit until the gain comes back, and the symbol
+# rate estimate is left 3700 ppm out.  On the call this recording is
+# of, the second TRN was read at an error of 0.2, E was missed, and the
+# data pump opened on a line it could not read and asked for a retrain
+# three seconds later -- which is the retrain this fixture's ceiling of
+# none is here to catch.  Held through the silence
+# ('Modec.QAM.qrFadeHold'), the receiver reads 27 to 31 dB from the
+# first data symbol.
+#
+# No bytes: the far end idles for the whole of what is kept.  It
+# retrains at 23.7 s, answering the request the live call made, and the
+# recording stops short of that.
+seconds:   23.4
+role:      originate
+modes:     v32bis
+v8:        no
+connect:   V32bis 14400
+retrains:  0
+tolerance: 0

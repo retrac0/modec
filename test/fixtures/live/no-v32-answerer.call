@@ -12,5 +12,6 @@ seconds:   22
 role:      originate
 modes:     v32,v22bis,v22,v21
 v8:        yes
+trn:       1400
 connect:   none
 tolerance: 0

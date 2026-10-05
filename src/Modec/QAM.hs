@@ -234,6 +234,49 @@ data QamRxCfg = QamRxCfg
     -- 'qrEvmFreeze'.  A measurement switch: the oracle of
     -- 'Modec.V32Pump.v32DemodulateAided' on a real call.  Off, the truth
     -- queue is read and never steers anything.
+  , qrFadeHold :: !(Maybe (Double, Int))
+    -- ^ wait through a line that has gone quiet: (how many times under
+    -- the level being tracked four symbols in a row must average, for
+    -- how many symbols at most).  While they do, the gain is held where
+    -- it was and nothing adapts -- not the equaliser, the carrier loop,
+    -- the timing loop or the error -- and the equaliser and the carrier
+    -- stay still for as long again as it takes what came back to fill
+    -- the equaliser.  'Nothing' is a receiver that follows the line
+    -- down.
+    --
+    -- A receiver that follows it down reads whatever is left there.
+    -- Two cases, both measured on the bench.
+    --
+    -- An RTP packet lost in the middle of a 14400 call is 20 ms of
+    -- exact zeros (call 20261005T013747).  What is left is our own echo,
+    -- or the canceller's prediction of it subtracted from nothing --
+    -- a clean V.32 signal twenty decibels down -- and the equaliser's
+    -- step is divided by the power in its window, so it trained on that
+    -- at full speed for the forty symbols the hole lasted.  The line
+    -- was the same line after as before, to the last tap; the equaliser
+    -- was not, the receiver read 18 dB where it had read 30, and that
+    -- is over the freeze, so it could not adapt its way back and the
+    -- call was lost from there on.
+    --
+    -- And Figure 4 has the answering modem stop for as long as the
+    -- caller's conditioning signal lasts.  With our own echo taken out
+    -- that is two seconds of nothing, and the gain went up sixty
+    -- decibels after it.  When the far end came back the timing
+    -- detector, which divides by the level being tracked, put out its
+    -- limit for as long as the gain took to come down, and the symbol
+    -- rate estimate was left 3700 ppm out -- from which the narrowed
+    -- loop did not return: the receiver read the second TRN at an error
+    -- of 0.2 where it reads 0.002, missed E, and handed the data pump a
+    -- line it had never trained on (call 20261005T015516).  While the
+    -- echo was still on the line the gain had that to hold on to, and
+    -- rose 23 dB instead of 54; the same kick, smaller, is what "dead
+    -- from the first data symbol" was all along.
+    --
+    -- Only a receiver that has read the line can lose it: nothing is
+    -- held until the timing loop has latched, and 'qamRxReset' -- the
+    -- start-up saying a new signal is due -- lets go.  And only for so
+    -- long: a level that stays down is a new level, and the gain goes
+    -- and finds it.
   }
 
 -- | What 'qrRestartOn' is shown, per symbol.
@@ -279,7 +322,7 @@ defaultRxCfg slice point = QamRxCfg
   , qrFreqFf = 0, qrFreqFfRun = maxBound
   , qrEvmBad = Nothing, qrRestartOn = const False, qrResetLine = True
   , qrGateAtOnce = False, qrPhaseCross = False, qrTrainTruth = False
-  , qrAgcStep = Nothing }
+  , qrAgcStep = Nothing, qrFadeHold = Nothing }
 
 -- | Transmitter state.  Symbols are held on a fractional clock and the
 -- pulse is evaluated per output sample, so no sample rate divides the
@@ -424,6 +467,8 @@ data QamRxState = QamRxState
   , rxEqPowHist :: [Double] -- ^ ...and the equaliser's output powers, which show the constellation's rings
   , rxLoopHist :: [(Double, Double)] -- ^ the carrier loop's (phase, frequency) over the last symbols, newest first
   , rxStepping :: !Bool     -- ^ 'qrAgcStep' held the loops on the last symbol
+  , rxFadeRun :: !Int       -- ^ 'qrFadeHold': symbols the line has been quiet for
+  , rxSinceFade :: !Int     -- ^ and symbols since it last was
   , rxSinceHold :: !Int     -- ^ symbols since it last did
   , rxTheta   :: !Double
   , rxFreq    :: !Double
@@ -482,6 +527,7 @@ qamRxInitWith p cfg seed = QamRxState
   , rxPrevRe = VS.replicate carry 0, rxPrevIm = VS.replicate carry 0
   , rxTau = fromIntegral carry + srTau0 seed, rxSps = sps
   , rxPrevSym = srPrev0 seed, rxPower_ = srPower0 seed, rxPowHist = [], rxEqPowHist = [], rxLoopHist = [], rxStepping = False, rxSinceHold = maxBound `div` 2
+  , rxFadeRun = 0, rxSinceFade = maxBound `div` 2
   , rxTheta = 0, rxFreq = 0
   , rxEqRe = centreTap, rxEqIm = VS.replicate taps 0
   , rxLineRe = VS.replicate taps 0, rxLineIm = VS.replicate taps 0
@@ -508,7 +554,7 @@ qamRxReset _ cfg st = st
   , rxLineRe = if qrResetLine cfg then VS.replicate taps 0 else rxLineRe st
   , rxLineIm = if qrResetLine cfg then VS.replicate taps 0 else rxLineIm st
   , rxEvm_ = srEvm0 (rxSeed st), rxBad = 0, rxRecent = [], rxLocked = False, rxSyms = 0
-  , rxTiming = False }
+  , rxTiming = False, rxFadeRun = 0, rxSinceFade = maxBound `div` 2 }
   where taps = qrEqTaps cfg
 
 -- | Forget that the receiver has ever locked, keeping everything it has
@@ -690,7 +736,23 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- gets down to where a lock would be declared, because the
               -- fast estimate is most of the error.
               pwA = if rxSyms st >= agcSettleSyms then qrAgcSettled cfg else qrAgcRate cfg
-              pw0 = (1 - pwA) * rxPower_ st + pwA * (yr * yr + yi * yi)
+              -- 'qrFadeHold'.  Judged on four symbols: one inner point
+              -- of a hundred and twenty-eight is thirty times under the
+              -- mean and means nothing, four in a row sixteen times
+              -- under it is a line with nothing on it -- and four is
+              -- soon enough, where the equaliser's own window would
+              -- have been fifteen symbols finding out, adapting all the
+              -- while at a step that grows as the window empties.
+              recent4 = let xs = take 4 ((yr * yr + yi * yi) : rxPowHist st)
+                        in sum xs / fromIntegral (length xs)
+              fadedNow = case qrFadeHold cfg of
+                Just (k, limit) -> rxTiming st && recent4 * k < rxPower_ st && rxFadeRun st < limit
+                Nothing -> False
+              -- ...and what came back has to fill the equaliser before
+              -- its decisions are worth anything again
+              waiting = fadedNow || rxSinceFade st <= taps `div` 2 + 1
+              pw0 | fadedNow = rxPower_ st
+                  | otherwise = (1 - pwA) * rxPower_ st + pwA * (yr * yr + yi * yi)
               -- Kept whether or not this configuration watches it, so a
               -- receiver whose configuration changes -- V.22 moving from
               -- four-way to sixteen-way training, say -- has a history
@@ -760,7 +822,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                                 silent = any (< m b / 16) [m (take 4 hh), m (take 4 (drop 4 hh))]
                             in length b >= 48 && length eh >= 48 && sp < 0.2 && d >= 2 && d < 10 && not silent
               eRaw = ((yr - pr) * hr + (yi - pim) * hi) / max 1e-9 pw
-              e = if pw < 1e-5 then 0 else max (negate (qrClamp cfg)) (min (qrClamp cfg) eRaw)
+              e = if pw < 1e-5 || fadedNow then 0 else max (negate (qrClamp cfg)) (min (qrClamp cfg) eRaw)
               -- Acquiring and tracking, at two bandwidths.
               --
               -- The Gardner detector's output is not zero at the right
@@ -859,7 +921,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- same question it was before.  Only the training is aided.
               dErrR = px - ur; dErrI = py - ui
               err2 = dErrR * dErrR + dErrI * dErrI
-              evm = 0.98 * rxEvm_ st + 0.02 * err2
+              evm = if waiting then rxEvm_ st else 0.98 * rxEvm_ st + 0.02 * err2
               locked = pw > 1e-5
               -- 'qrTrack' holds the carrier loop where 'qrAdapt' holds
               -- the equaliser.  They were one flag, which meant they
@@ -894,7 +956,7 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
               -- those would never converge at all.  So the lock has to
               -- mean converged -- 'qrLockAt', not 'qrEvmFreeze' -- and
               -- not merely "still adapting".
-              good = not stepping && ((not (rxLocked st) && not (qrGateAtOnce cfg)) || err2 < qrLoopGate cfg)
+              good = not stepping && not waiting && ((not (rxLocked st) && not (qrGateAtOnce cfg)) || err2 < qrLoopGate cfg)
               -- Guarded on the weight rather than multiplied by it, so
               -- a receiver with none is bit for bit what it was.
               freqFf | qrFreqFf cfg > 0 && locked && stepRun < qrFreqFfRun cfg
@@ -989,6 +1051,10 @@ qamRxBlock p cfg chunk st0 = (st', symsOut)
                        , rxPrevSym = (yr, yi), rxPower_ = pw, rxPowHist = powHist, rxEqPowHist = take 48 ((ur * ur + ui * ui) : rxEqPowHist st)
                        , rxLoopHist = take stepRewind ((theta', freq') : rxLoopHist st), rxStepping = stepping
                        , rxSinceHold = if stepping then 0 else min (maxBound `div` 2) (rxSinceHold st + 1)
+                       , rxFadeRun = if fadedNow then rxFadeRun st + 1
+                                     else if recent4 * maybe 1 fst (qrFadeHold cfg) < rxPower_ st then rxFadeRun st
+                                     else 0
+                       , rxSinceFade = if fadedNow then 0 else min (maxBound `div` 2) (rxSinceFade st + 1)
                        , rxTheta = theta', rxFreq = freq'
                        , rxEqRe = eqRe', rxEqIm = eqIm'
                        , rxLineRe = lineRe, rxLineIm = lineIm
