@@ -211,7 +211,21 @@ shows exactly how far the handshake got.
 Confirmed working against voip.ms from this repository: registration on
 `toronto.voip.ms` (30 ms round trip, 2.8 ms jitter, no loss), PCMU
 negotiated both ways, and a **V.22bis connection at 2400 bit/s to a real
-answering modem**, whose banner and prompts decoded perfectly.
+answering modem**, whose banner and prompts decoded perfectly. Since
+2026-10-05 also **V.32bis at 14400 bit/s with MNP class 4**, to
+2600.network's Patton 3120 on +1 760 330 2600 (`modec dial --mode
+v32bis,v22bis,v21 --v8 NUMBER`): connect 21 s after the far end
+answers, a decision error of 0.0003 for a hundred seconds, no retrain,
+and no echo to speak of on the path. That call is a fixture.
+
+`MODEC_MNP_TRACE=1` puts every error-control frame taken off the line
+and put on it in the call's log -- what was sent, what the far end
+acknowledged, what was sent again. A session that stalls after
+connecting is read off that: on the call above, a carriage return went
+out as one frame, was acknowledged 0.7 s later along with the prompt it
+asked for, and the two ends then exchanged an acknowledgement every
+three seconds for as long as nothing was typed, which is all an idle
+link does.
 
 Four things had to be fixed to get there, all of them worth knowing:
 

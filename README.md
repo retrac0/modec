@@ -46,9 +46,10 @@ The first six are what `--mode` offers by default, and what automode
 negotiates. Naming `v32` or `v32bis` adds them. `v32` offers 4800 and
 both 9600s; `v32bis` adds 7200, 12000 and 14400, or `--v32-rate` pins
 one. 12000 has carried a real session, MNP included. 14400 holds on
-recorded calls and now on calls through the bench; what made it
-unreliable there has been found, and most of it was not the receiver:
-see the limits. 7200 is in the suite and has never been recorded off a
+recorded calls, on calls through the bench, and since 2026-10-05 over
+a telephone line to 2600.network with MNP class 4; what made it
+unreliable on the bench has been found, and most of it was not the
+receiver: see the limits. 7200 is in the suite and has never been recorded off a
 line. They stay out of the default offer because announcing V.32bis
 means offering 14400, and a rate that connects and then damages the
 session is worse than one that was never offered. The text telephone
@@ -100,11 +101,11 @@ in the payload wrong, not a bit error rate.
 | Call progress | 3 dB SNR, and 30 dB below full scale | 221 recorded calls: 36 ringings, 159 answer tones, no false busy |
 | Call classifier (modem, fax, voice, busy, congestion, SIT, no answer) | babble as voice to 10 dB SNR | 309 recorded calls: every logged connection and congestion agrees; 22 "no answer" calls found to be modems |
 
-Thirty recorded calls are also in the suite, replayed through the
+Thirty-one recorded calls are also in the suite, replayed through the
 whole modem and checked against what the far end really sent: see
-[test/fixtures/live/](test/fixtures/live/). Eight of them are
+[test/fixtures/live/](test/fixtures/live/). Nine of them are
 2600.network, a Patton 3120, and carry its banner, at 300, 1200/75,
-2400, 9600 and 12000 bit/s. Two are one third-party V.32bis call at
+2400, 9600, 12000 and 14400 bit/s. Two are one third-party V.32bis call at
 14400, split by direction. Three are 14400 calls through the bench,
 with what this modem sent beside what it heard, kept for a lost packet,
 for a silence, and for 80 ms at twice the level. Two must not connect

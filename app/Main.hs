@@ -19,6 +19,8 @@ import qualified Modec.Channel as Ch
 import Modec.Link
 import Modec.Echo (EchoConfig (..))
 import Modec.Modem
+import Modec.Mnp (MnpConfig (..))
+import System.Environment (lookupEnv)
 import Modec.Replay
 import Modec.QAM (QamSym (..))
 import Modec.V32Pump (V32Diag (..))
@@ -572,7 +574,10 @@ runReplay ro = do
     -- block i of one is what was sent on hearing block i of the other.
     let lead = VS.length tx - VS.length samples
     return (if lead > 0 && lead <= round (0.04 * fs) then VS.drop lead tx else tx)
-  let rc = (defaultReplayConfig cfg)
+  -- MODEC_MNP_TRACE, as on a live call: every error-control frame the
+  -- far end sent, and every one this replay sends back, in the timeline
+  mnpTraced <- (/= Nothing) <$> lookupEnv "MODEC_MNP_TRACE"
+  let rc = (defaultReplayConfig cfg { mcMnp = fmap (\m -> m { mnTrace = mnpTraced }) (mcMnp cfg) })
              { rcEvery = if roLine ro then Just (roLineEvery ro) else Nothing
              , rcSyms = isJust (roDumpSyms ro)
              , rcTx = sent }

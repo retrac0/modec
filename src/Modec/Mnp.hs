@@ -91,6 +91,7 @@ data MnpConfig = MnpConfig
   , mnDataDetect :: !Bool     -- ^ fall through as soon as the far end sends plain data
   , mnAdaptive   :: !Bool     -- ^ class 4 adaptive packet assembly: shrink frames on loss, grow back
   , mnTrt        :: !Double   -- ^ round trip allowed for in the retransmission timer, seconds
+  , mnTrace      :: !Bool     -- ^ report every frame taken off the line and put on it ('MnpTrace')
   } deriving (Show)
 
 -- | Offer everything: class 4, eight outstanding frames, the 256-octet
@@ -117,6 +118,7 @@ defaultMnpConfig bitRate syncable = MnpConfig
   , mnDataDetect = True
   , mnAdaptive = True
   , mnTrt = 0.5
+  , mnTrace = False
   }
 
 -- | The link request this configuration offers.  A station whose data
@@ -165,6 +167,7 @@ data MnpEvent
   = MnpUp !Int !Word8 !Int    -- ^ data phase open: class, k, N401
   | MnpTransparentFallback    -- ^ no protocol at the far end; no error correction on this call
   | MnpDown String            -- ^ disconnected, with the reason
+  | MnpTrace String           -- ^ a frame in or out, when 'mnTrace' asks: for reading a real call
   deriving (Eq, Show)
 
 -- | What the receiver produced this block, in whichever framing is in
@@ -337,7 +340,10 @@ mnpStep c st0 inp =
              st3 = st2 { msSawBad = msSawBad st2 || bad }
              st3' = st3 { msSawFrame = msSawFrame st3 || any evidence frames
                         , msLastFrameAt = if bad || not (null frames) then t else msLastFrameAt st3 }
-             (st4, evs0) = foldl (handleFrame c) (st3', []) frames
+             (st4, evs0') = foldl (handleFrame c) (st3', []) frames
+             evs0 = [ MnpTrace ("rx " ++ briefFrame f) | mnTrace c, f <- frames ]
+                    ++ [ MnpTrace "rx damaged frame" | mnTrace c, bad ]
+                    ++ evs0'
              (st5, evs1) = timers c st4 plain
          in if msPhase st5 == MnpTransparent || msPhase st5 == MnpClosed
               then let (st6, out) = if msPhase st5 == MnpTransparent
@@ -763,7 +769,22 @@ emit c st inp =
         , msT404At = if ackNow then msT st + t404 c else msT404At st
         , msLastNk = if ackNow then credit else msLastNk st
         }
-  in (st', MnpOut lineOut toDte [] (length unacked' >= window))
+      sent = [ MnpTrace ("tx " ++ briefFrame f ++ "  unacked " ++ show (length unacked')
+                         ++ " retries " ++ show (msRetries st))
+             | mnTrace c, f <- frames ]
+  in (st', MnpOut lineOut toDte sent (length unacked' >= window))
+
+-- | A frame in a few words, for 'MnpTrace'.
+briefFrame :: MnpFrame -> String
+briefFrame f = case f of
+  FrLR _ -> "LR"
+  FrLD reason _ -> "LD reason " ++ show reason
+  FrLT ns info -> "LT " ++ show ns ++ " " ++ show (map (toEnum . fromIntegral) (take 40 info) :: String)
+                  ++ (if length info > 40 then " and " ++ show (length info - 40) ++ " more" else "")
+  FrLA nr nk -> "LA " ++ show nr ++ " credit " ++ show nk
+  FrLN nsa t -> "LN " ++ show nsa ++ " type " ++ show t
+  FrLNA nra -> "LNA " ++ show nra
+  FrOther t body -> "type " ++ show t ++ ", " ++ show (length body) ++ " octets"
 
 encodeAll :: MnpFraming -> Bool -> [MnpFrame] -> MnpLineOut
 encodeAll FramingOctet dpo fs = OutOctets (concatMap (mode2Encode . encodeFrame dpo) fs)

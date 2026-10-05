@@ -1,0 +1,30 @@
+# V.32bis at 14400 bit/s over a real telephone line, 5 Oct 2026, the
+# afternoon it first held on one; the call eleven minutes before this
+# was the first.  Until then the rate had only ever been held on a bench
+# or on someone else's recording.
+#
+# 2600.network's other line, +1 760 330 2600, through voip.ms.  V.8,
+# then a start-up that offered every rate and settled on 14400 by the
+# rate signals; MNP class 4 negotiated over it; the Patton's banner and
+# its prompt.  One carriage return was typed at 29.5 s and nothing
+# else, and the second prompt in the reference is the Patton's answer
+# to it.  A replay types nothing, and the far end's answer is in the
+# recording all the same -- its frames 3 and 4 follow 1 and 2 whether
+# or not ours went out.
+#
+# The call ran a hundred seconds at a decision error of 0.0002 to
+# 0.0003, with no retrain, no top-up of the transmit cushion and a
+# capture clock that did not move, and was hung up from this end.
+# There is no echo to speak of on this path, so unlike the bench's
+# 14400 fixtures it needs nothing beside it to be replayed.
+source:    recordings/20261005T152713-+17603302600.wav
+seconds:   40.0
+role:      originate
+modes:     v32bis,v22bis,v21
+v8:        yes
+mnp:       4
+connect:   V32bis 14400
+retrains:  0
+expect:    https://2600.network - Patton 3120 #1
+expect:    uSerNaME:
+tolerance: 0

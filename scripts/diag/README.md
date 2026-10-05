@@ -15,6 +15,11 @@ it with that as the reference:
 Without `--tx` a replay regenerates its transmit, which stops matching
 at the first payload byte, and leaves data-mode cancelling off.
 
+`MODEC_MNP_TRACE=1`, on a replay or a live call, lists every MNP frame
+taken off the line and every one put on it: type, sequence number,
+credit, and for an information frame its text. On a live call it goes
+in the call's log, so mind what was typed.
+
 What follows are standalone tools for taking the signal apart below that
 level. Build any of them against the library:
 

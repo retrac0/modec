@@ -219,6 +219,10 @@ runModem o = do
   -- processes are orphaned and recordings are left unterminated
   mainTid <- myThreadId
   _ <- installHandler sigTERM (Catch (throwTo mainTid ExitSuccess)) Nothing
+  -- MODEC_MNP_TRACE: every error-control frame taken off the line and
+  -- put on it, in the call's log.  What was sent, what was acknowledged
+  -- and what was sent again is otherwise invisible from both ends.
+  mnpTraced <- (/= Nothing) <$> lookupEnv "MODEC_MNP_TRACE"
   hSetBinaryMode stdin True
   hSetBinaryMode stdout True
   -- Line-buffered, so that a log line written from a reader thread goes
@@ -248,7 +252,8 @@ runModem o = do
       -- Modec.Modem to fill in once the call is established.
       mnpCfg oo = fmap (\cls -> (defaultMnpConfig 1200 True)
                        { mnClass = cls, mnTrt = moMnpTrt oo
-                       , mnLrTries = max 1 (moMnpProbes oo), mnT401Lr = moMnpProbeGap oo })
+                       , mnLrTries = max 1 (moMnpProbes oo), mnT401Lr = moMnpProbeGap oo
+                       , mnTrace = mnpTraced })
                     (moMnp oo)
       -- A Hayes session's call is the command line's, with whatever the
       -- DTE has changed since: the modes and rates (+MS, B, N), error
@@ -582,6 +587,7 @@ runModem o = do
               say "no error correction: the far end did not answer"
               sendBanner "none (the far end did not answer)"
             EvMnp (MnpDown why) -> say ("MNP link down: " ++ why)
+            EvMnp (MnpTrace what) -> say ("mnp " ++ what)
             -- 5.5 is invisible from the terminal by design -- nothing has
             -- ended and the DTE is not told -- so the call log is the
             -- only place it shows up at all.
