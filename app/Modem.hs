@@ -23,9 +23,11 @@ import Data.IORef
 import qualified Data.Vector.Storable as VS
 import Network.Socket
 import qualified Network.Socket.ByteString as NB
+import System.Directory (findExecutable)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import Text.Printf (printf)
+import Text.Read (readMaybe)
 import Data.List (intercalate)
 import Data.Time (defaultTimeLocale, formatTime, getCurrentTime)
 import Data.Version (showVersion)
@@ -285,9 +287,11 @@ runModem o = do
       -- Output leads input.  One block was enough for two modems joined
       -- by pipes, which would otherwise each wait for the other's first
       -- block, and one block is not enough for PipeWire.  Both pw-cat
-      -- streams run on a 100 ms quantum: capture hands over 100 ms at a
-      -- time, and playback asks for 100 ms at a time, on two clocks that
-      -- have no reason to agree.  Feeding playback exactly what capture
+      -- streams ask for a 100 ms quantum: playback asks for up to 100 ms
+      -- at a time, and capture hands over what the graph gave it (a cycle
+      -- at a time now that its output is unbuffered; see 'withPwCatPair'),
+      -- on two clocks that have no reason to agree.  Feeding playback
+      -- exactly what capture
       -- delivered leaves it one block ahead on a good cycle and short on
       -- a bad one, and every short cycle is an xrun: pw-top counted one a
       -- second on modec-tx, and each one is a hole in our carrier that the
@@ -396,6 +400,18 @@ runModem o = do
       -- stalls, as a long read.
       cushionRef <- newIORef (Nothing :: Maybe Cushion)
       ioStats <- (/= Nothing) <$> lookupEnv "MODEC_IO_STATS"
+      -- MODEC_IO_TRACE=FILE: one line per block, for taking the audio
+      -- clock apart afterwards -- when the read began and returned, when
+      -- the write that answered it returned, and any silence the cushion
+      -- keeper added, all in monotonic seconds.  Whether a hole in a
+      -- call was capture arriving late, the loop running behind it, or
+      -- the keeper inventing a loss is in the spacing of these and
+      -- nowhere else.
+      ioTrace <- lookupEnv "MODEC_IO_TRACE" >>= mapM (\f -> do
+        h <- openFile f WriteMode
+        hSetBuffering h LineBuffering
+        return h)
+      traceRd <- newIORef (0 :: Double, 0 :: Double, 0 :: Int)
       ioRef <- newIORef (0 :: Int, 0 :: Double, 0 :: Double, 0 :: Double)
       ioT0 <- getMonotonicTime
       ioLast <- newIORef ioT0
@@ -433,6 +449,7 @@ runModem o = do
             began <- getMonotonicTime
             x0 <- timed (\d (c, r, w, ws) -> (c, max r d, w, ws)) (aiRead ai blockN)
             returned <- getMonotonicTime
+            writeIORef traceRd (began, returned, 0)
             ioReport (VS.length x0)
             p <- readIORef primed
             unless p $ do
@@ -444,6 +461,7 @@ runModem o = do
               forM_ mcu $ \cu -> do
                 let (extra, cu') = cushionStep defaultCushionParams fs began returned (VS.length x0) cu
                 writeIORef cushionRef (Just cu')
+                modifyIORef' traceRd (\(a, b, _) -> (a, b, extra))
                 when (extra > 0) $ do
                   aiWrite ai (VS.replicate extra 0)
                   say (printf "transmit cushion: capture came up %.0f ms short; the same again in silence went to playback"
@@ -462,6 +480,10 @@ runModem o = do
             mc <- readIORef callRef
             mapM_ (\c -> callRecWriteTx c x) mc
             timed (\d (c, r, w, ws) -> (c, r, max w d, ws + d)) (aiWrite ai x)
+            forM_ ioTrace $ \h -> do
+              (began, returned, extra) <- readIORef traceRd
+              wrote <- getMonotonicTime
+              hPutStrLn h (printf "%.6f %.6f %.6f %d %d" began returned wrote (VS.length x) extra)
           closeRecordings = endCall >> mapM_ closeWav recRx >> mapM_ closeWav recTx
           -- The capture stream stopped (device unplugged, pw-cat killed,
           -- the peer closed a FIFO).  Try to put it back a few times
@@ -959,8 +981,25 @@ type ProcResult = (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 withPwCatPair :: SampleFormat -> [String] -> [String] -> (AudioIf -> IO a) -> IO a
 withPwCatPair fmt recArgs playArgs body = do
   ref <- newIORef Nothing
+  -- pw-cat writes raw audio to its standard output through a C stream,
+  -- and a stream into a pipe is block buffered: nothing comes out until
+  -- 4096 bytes have gone in.  At 8 kHz that is 256 ms -- capture arrived
+  -- in lumps of thirteen blocks whatever quantum the graph ran at, a
+  -- quarter of a second late, and the loop then had to work through all
+  -- thirteen and write thirteen back before playback next looked, with
+  -- nothing in hand but the cushion for a block that ran long.  Measured
+  -- on a busy machine: one block of 57 ms in the middle of a burst left
+  -- playback a block short, 20 ms of silence went into a 14400 carrier,
+  -- and our own echo came back 20 ms later than the canceller's taps.
+  -- stdbuf takes the buffer away, and capture arrives a graph cycle at a
+  -- time.  (It was not always so: this file used to say capture came 100
+  -- ms at a time, and with pw-cat 1.6 it no longer did.)
+  stdbuf <- findExecutable "stdbuf"
+  let capture = case stdbuf of
+        Just sb -> proc sb (["-o0", "pw-cat"] ++ recArgs)
+        Nothing -> proc "pw-cat" recArgs
   let spawn = do
-        r <- try (createProcess (proc "pw-cat" recArgs) { std_out = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
+        r <- try (createProcess capture { std_out = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
         p <- try (createProcess (proc "pw-cat" playArgs) { std_in = CreatePipe, std_err = Inherit }) :: IO (Either IOException ProcResult)
         case (r, p) of
           (Right (_, Just hin, _, rph), Right (Just hout, _, _, pph)) -> do
@@ -968,6 +1007,8 @@ withPwCatPair fmt recArgs playArgs body = do
             hSetBinaryMode hout True
             hSetBuffering hout NoBuffering
             writeIORef ref (Just (PwPair hin hout rph pph))
+            realtimeFor "capture" rph
+            realtimeFor "playback" pph
             return True
           _ -> do
             logMsg ("could not start pw-cat" ++ hint r)
@@ -1017,6 +1058,56 @@ withPwCatPair fmt recArgs playArgs body = do
   unless started exitFailure
   body (sampleIf fmt rd wr restart) `finally` stop
 
+-- | Ask for pw-cat's one working thread to be scheduled real-time.
+--
+-- Every other client in the graph does its work in a real-time thread:
+-- PipeWire's library starts one and asks rtkit for it.  pw-cat (1.6) is
+-- the exception.  It has no such thread, and copies each cycle's audio
+-- in its main one, at whatever priority it was started with -- and the
+-- graph does not wait: a client that has not finished a cycle when the
+-- next begins has lost that cycle's audio.  Measured with no modem in
+-- it, a loopback and the two pw-cats on a machine other work kept at a
+-- load of ten: 166 ms of capture gone in 45 s, a cycle to five cycles at
+-- a time, and none once the thread was real-time.  On a nearly idle
+-- machine the same thing took 43 ms out of the middle of a 14400 call.
+--
+-- rtkit does this for a thread of any process its caller owns, once the
+-- process has put a limit on its own real-time running.  pw-cat does
+-- that when PipeWire's library loads, a moment after it starts; hence
+-- the tries.  Where rtkit will not, chrt is asked, which works wherever
+-- the user is allowed real-time outright.
+realtimeFor :: String -> ProcessHandle -> IO ()
+realtimeFor what ph = void $ forkIO $ do
+  mpid <- getPid ph
+  forM_ mpid $ \pid -> do
+    most <- rtkitMost
+    let prio = show (maybe 20 (min 20) most)
+        viaRtkit = ran "busctl" (["call", "--system"] ++ rtkit ++ ["MakeThreadRealtimeWithPID", "ttu", show pid, show pid, prio])
+        viaChrt = ran "chrt" ["--rr", "-p", prio, show pid]
+        go :: Int -> IO Bool
+        go 0 = viaChrt
+        go n = do
+          ok <- viaRtkit
+          if ok then return True else threadDelay 100000 >> go (n - 1)
+    ok <- go 20
+    unless ok $ logMsg ("warning: pw-cat (" ++ what ++ ") is not real-time (rtkit and chrt both refused); "
+                        ++ "on a busy machine it will miss graph cycles and the line will lose audio")
+  where
+    rtkit = ["org.freedesktop.RealtimeKit1", "/org/freedesktop/RealtimeKit1", "org.freedesktop.RealtimeKit1"]
+    rtkitMost :: IO (Maybe Int)
+    rtkitMost = do
+      r <- try (readProcessWithExitCode "busctl" (["get-property", "--system"] ++ rtkit ++ ["MaxRealtimePriority"]) "")
+             :: IO (Either IOException (ExitCode, String, String))
+      return $ case r of
+        Right (ExitSuccess, out, _) | ["i", n] <- words out -> readMaybe n
+        _ -> Nothing
+    ran :: String -> [String] -> IO Bool
+    ran cmd args = do
+      r <- try (readProcessWithExitCode cmd args "") :: IO (Either IOException (ExitCode, String, String))
+      return $ case r of
+        Right (ExitSuccess, _, _) -> True
+        _ -> False
+
 -- | Name a resolved device for the log.
 nodeLabel :: Maybe PwNode -> String
 nodeLabel Nothing = "PipeWire default"
@@ -1037,7 +1128,10 @@ resolveOpt (Just spec) want = do
 
 -- | Open the audio interface.
 withAudio :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> IO a
-withAudio aio fmt rate role body = lookupEnv "MODEC_PW_LATENCY" >>= \pwLatencyEnv -> withAudio' aio fmt rate role body pwLatencyEnv
+withAudio aio fmt rate role body = do
+  pwLatencyEnv <- lookupEnv "MODEC_PW_LATENCY"
+  pwQuantumEnv <- lookupEnv "MODEC_PW_QUANTUM"
+  withAudio' aio fmt rate role body pwLatencyEnv pwQuantumEnv
 
 -- | The name pw-cat gives a format, for the ones it has.  PipeWire
 -- converts whatever the device does to what a stream asks for, so a
@@ -1047,8 +1141,8 @@ pwCatFormat f = case f of
   U8 -> Just "u8"; S8 -> Just "s8"; S16 -> Just "s16"; S32 -> Just "s32"; F32 -> Just "f32"
   _ -> Nothing
 
-withAudio' :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> IO a
-withAudio' aio fmt rate role body pwLatencyEnv = case aio of
+withAudio' :: AudioIO -> SampleFormat -> Int -> Role -> (AudioIf -> IO a) -> Maybe String -> Maybe String -> IO a
+withAudio' aio fmt rate role body pwLatencyEnv pwQuantumEnv = case aio of
   AudioStdio -> body (handleIf fmt stdin stdout)
   AudioSerial dev -> withSerial dev fmt rate role logMsg $ \rd wr ->
     body (sampleIf fmt rd wr (return False))
@@ -1076,8 +1170,8 @@ withAudio' aio fmt rate role body pwLatencyEnv = case aio of
     -- what baresip's PipeWire module accepts.
     let lb name sink src = proc "pw-loopback"
           [ "-n", name
-          , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" " ++ noRestore ++ " }"
-          , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" " ++ noRestore ++ " }" ]
+          , "--capture-props", "{ media.class = Audio/Sink node.name = " ++ sink ++ " node.description = \"" ++ sink ++ "\" " ++ noRestore ++ " " ++ ownDriver ++ " }"
+          , "--playback-props", "{ media.class = Audio/Source node.name = " ++ src ++ " node.description = \"" ++ src ++ "\" " ++ noRestore ++ " " ++ ownDriver ++ " }" ]
         toSip = prefix ++ "-to-sip"; lineSrc = prefix ++ "-line"
         fromSip = "sip-to-" ++ prefix; sipSrc = prefix ++ "-sip-line"
     bracket (createProcess (lb (prefix ++ "-lb1") toSip lineSrc)) cleanupProc $ \_ ->
@@ -1090,8 +1184,8 @@ withAudio' aio fmt rate role body pwLatencyEnv = case aio of
           exitFailure
         logMsg ("PipeWire loopbacks: " ++ toSip ++ " -> " ++ lineSrc ++ " (softphone source), " ++ fromSip ++ " -> " ++ sipSrc)
         withPwCatPair fmt
-          (["--record", "--target", sipSrc, "-P", streamProps (prefix ++ "-rx")] ++ common ++ ["-"])
-          (["--playback", "--target", toSip, "-P", streamProps (prefix ++ "-tx")] ++ common ++ ["-"])
+          (["--record", "--target", sipSrc, "-P", streamPropsWith (prefix ++ "-rx") ownGraph] ++ common ++ ["-"])
+          (["--playback", "--target", toSip, "-P", streamPropsWith (prefix ++ "-tx") ownGraph] ++ common ++ ["-"])
           (withGainCheck [prefix ++ "-rx", prefix ++ "-tx"] body)
   AudioPipewire inSpec outSpec monitor0 -> do
     requirePwFormat
@@ -1126,6 +1220,32 @@ withAudio' aio fmt rate role body pwLatencyEnv = case aio of
     -- The quantum both pw-cat streams run on.  Overridable while the
     -- right figure is being found: MODEC_PW_LATENCY=50ms.
     pwLatency = maybe "100ms" id pwLatencyEnv
+    -- The softphone path is a graph of our own -- two loopbacks, two
+    -- pw-cats, the softphone's two streams -- wired to no device, and
+    -- PipeWire runs a graph with no device in it on whichever driver is
+    -- going: its dummy one while the machine is silent, the sound card's
+    -- once anything plays or records.  So what the desktop did with
+    -- audio re-timed the call.  Found on the bench with a browser
+    -- playing and a mixer window open: our streams listed under the
+    -- sound card, on its crystal (15 ppm off the machine's clock) and at
+    -- the quantum the mixer's level meters asked for, a quarter of what
+    -- it had been a minute before.  Every change of quantum costs
+    -- capture -- 19 ms measured going from 512 frames to 256, 3 ms from
+    -- 256 to 128, 9 ms in every call when the softphone's streams
+    -- joined -- and a modem carrier does not survive a piece missing.
+    --
+    -- Two properties make the graph ours.  The group is the dummy
+    -- driver's own, which keeps every node in it on that driver, off the
+    -- sound card whatever the card is doing.  The quantum is forced, so
+    -- nothing that links to these nodes can ask for another: 960 frames
+    -- of the graph's 48 kHz is the 20 ms block this loop works in, and
+    -- capture then arrives a block at a time.  With both, the same
+    -- mixer and a meter attached mid-run: 160 samples every arrival and
+    -- nothing lost.  MODEC_PW_QUANTUM=0 leaves the quantum alone.
+    ownDriver = "node.group = pipewire.dummy"
+    ownGraph = ownDriver : case maybe "960" id pwQuantumEnv of
+      "0" -> []
+      q -> ["node.force-quantum = " ++ q]
     -- WirePlumber restores per-application volumes from its
     -- stream-properties state, and every pw-cat stream on the machine
     -- shares the application name "pw-cat".  A single slider drag in a

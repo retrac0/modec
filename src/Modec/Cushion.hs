@@ -18,19 +18,44 @@
 -- Nothing in pw-cat reports how full its buffer is, so the level is
 -- inferred.  Capture samples read, set against the monotonic clock, fall
 -- back by exactly what a hiccup lost; what we have written tracks what
--- we have read, so the same figure is the playback level's.  Reads come
--- in bursts the size of the graph quantum, which makes the instantaneous
--- figure a sawtooth a quarter of a second deep, but its peak over a
--- second or so is steady, provided every block is timed by when its
--- burst arrived and not by when the loop got round to reading it.  The
--- loop runs the modem between reads, and a burst of twelve blocks can
--- take a hundred milliseconds to work through, more with a V.32 call up:
--- stamped as read, the peak wandered by ten milliseconds with the load,
--- and a keeper watching it topped up a carrier mid-call for losses that
--- never happened.  A read that had to wait is the arrival of a burst; a
--- read that did not wait was already there when it arrived.  When the
--- peak falls a step below where it settled, the step is written back as
--- silence.
+-- we have read, so the same figure is the playback level's.
+--
+-- It is only known at one kind of moment.  Capture arrives in bursts the
+-- size of the graph quantum -- 256 ms of it at a time on the bench -- and
+-- the loop works through a burst block by block with the modem running
+-- between reads.  A read that had to wait found the pipe empty: every
+-- sample delivered before it had been read, and the instant it returned
+-- is the instant the next burst landed.  Samples read before such a
+-- read, against the time it returned, is the capture clock exactly, less
+-- whatever part of a block was left waiting -- and that remainder cycles
+-- through a handful of values, so the highest of the last few arrivals
+-- is the clock itself.  When that falls a step below where it settled,
+-- the step is written back as silence.
+--
+-- Nothing else is measured, and two earlier ways of doing it are why.
+-- Stamping every block as it was read let the figure sag by a burst's
+-- processing time whenever the modem's load rose, and the keeper topped
+-- up a carrier mid-call for a loss that never happened.  Stamping every
+-- block of a burst with the burst's arrival fixed that and broke
+-- differently: it is right only while the loop finishes one burst before
+-- the next lands.  At 14400 the pump took thirteen of every twenty
+-- milliseconds, a burst of thirteen blocks took most of its 256 ms, and
+-- when it took all of them no read waited -- so blocks of the next burst
+-- were set against the last arrival the loop had seen, the level read
+-- high by however long that went on, the settled level followed it up,
+-- and when the loop caught up the level "fell" by what it had never
+-- gained.  Measured on the bench (2026-10-04): 12 to 44 ms of silence
+-- written into the middle of a 14400 carrier, four calls in twenty.  The
+-- echo of our own signal then came back that much later than the
+-- canceller's taps were set for, the receiver went from 28 dB to 17, and
+-- the call retrained and died.  The recordings show the echo's delay
+-- stepping by exactly the silence added, which is what no loss at
+-- capture can do.
+--
+-- A figure taken only at arrivals cannot read high: the samples counted
+-- were all delivered by then.  It can only be missing, when the loop is
+-- too busy for any read to wait, and then the keeper does nothing --
+-- which is the right thing to do with no measurement.
 --
 -- Two things move the figure that are not losses.  The graph clock and
 -- the monotonic clock drift apart by some parts per million, which the
@@ -54,30 +79,35 @@ module Modec.Cushion
 -- | How the keeper decides.
 data CushionParams = CushionParams
   { cpSettle    :: !Double  -- ^ seconds after the start before the level is trusted
-  , cpWindow    :: !Double  -- ^ seconds the peak is taken over; longer than a burst
+  , cpWindow    :: !Double  -- ^ seconds the peak is taken over, at the least
   , cpStep      :: !Double  -- ^ seconds short that count as a loss rather than drift
   , cpFollow    :: !Double  -- ^ time constant, in seconds, of following drift
   , cpWaited    :: !Double  -- ^ a read this long had to wait: a burst arrived when it returned
+  , cpEnough    :: !Int     -- ^ arrivals the window must hold before its peak is believed
   }
 
 -- | A 12 ms step.  The losses measured were 16 to 37 ms.
+--
+-- Five arrivals, because the part of a block left waiting in the pipe
+-- when a burst lands takes the level down by up to a block, and with
+-- 2048-sample bursts read 160 at a time it comes round every fifth.
 defaultCushionParams :: CushionParams
 defaultCushionParams = CushionParams
-  { cpSettle = 2.0, cpWindow = 1.5, cpStep = 0.012, cpFollow = 30, cpWaited = 0.002 }
+  { cpSettle = 2.0, cpWindow = 1.5, cpStep = 0.012, cpFollow = 30, cpWaited = 0.002, cpEnough = 5 }
 
 -- | The keeper's state.  Times are the caller's monotonic seconds.
 data Cushion = Cushion
   { cuT0      :: !Double
   , cuRead    :: !Int                    -- ^ samples read since the start
   , cuAdded   :: !Int                    -- ^ samples of silence added since the start
-  , cuPeaks   :: [(Double, Double)]      -- ^ (time, level) inside the window, newest first
+  , cuPeaks   :: [(Double, Double)]      -- ^ (time, level) at the arrivals inside the window, newest first
   , cuBase    :: !(Maybe Double)         -- ^ the settled level, once there is one
-  , cuLastT   :: !Double
-  , cuArrived :: !Double                 -- ^ when the burst being read arrived
+  , cuLastT   :: !Double                 -- ^ when the last burst arrived
+  , cuGap     :: !Double                 -- ^ the shortest time between two arrivals: one burst
   }
 
 cushionInit :: Double -> Cushion
-cushionInit t0 = Cushion t0 0 0 [] Nothing t0 t0
+cushionInit t0 = Cushion t0 0 0 [] Nothing t0 0
 
 -- | The level estimate in seconds, relative to where it settled: zero
 -- when the playback buffer holds what it held then, negative when it
@@ -95,20 +125,34 @@ peak c = case cuPeaks c of
 -- of silence to write to the playback stream now, beyond the block's own,
 -- and the new state.
 cushionStep :: CushionParams -> Double -> Double -> Double -> Int -> Cushion -> (Int, Cushion)
-cushionStep p fs began returned n c0 = (add, c3)
+cushionStep p fs began returned n c0
+  -- it was already there: no burst arrived, and there is nothing to measure
+  | returned - began < cpWaited p = (0, c0 { cuRead = cuRead c0 + n })
+  | otherwise = (add, c3)
   where
-    arrived = if returned - began >= cpWaited p then returned else cuArrived c0
-    rd = cuRead c0 + n
-    level = fromIntegral (rd + cuAdded c0) / fs - (arrived - cuT0 c0)
-    peaks = (returned, level) : takeWhile ((> returned - cpWindow p) . fst) (cuPeaks c0)
-    c1 = c0 { cuRead = rd, cuPeaks = peaks, cuLastT = returned, cuArrived = arrived }
-    pk = peak c1
+    -- what had been delivered before this burst, against when it landed
+    level = fromIntegral (cuRead c0 + cuAdded c0) / fs - (returned - cuT0 c0)
     dt = max 0 (returned - cuLastT c0)
+    -- One burst, as the shortest gap between arrivals: a loop that is
+    -- behind skips arrivals and so only ever makes the gap longer.  It
+    -- is let creep up, so a graph that changes its quantum is followed.
+    -- The window is long enough to hold the arrivals it needs.
+    gap | cuGap c0 <= 0 = dt
+        | dt > 0 = min (1.01 * cuGap c0) dt
+        | otherwise = cuGap c0
+    window = max (cpWindow p) (fromIntegral (cpEnough p + 1) * gap)
+    peaks = (returned, level) : takeWhile ((> returned - window) . fst) (cuPeaks c0)
+    c1 = c0 { cuRead = cuRead c0 + n, cuPeaks = peaks, cuLastT = returned, cuGap = gap }
+    pk = peak c1
+    -- Too few arrivals is a loop too busy to be waiting on its reads,
+    -- and a peak over the ones it did make may be a whole remainder low.
+    enough = length peaks >= cpEnough p
     (add, c3) = case cuBase c1 of
       Nothing
-        | returned - cuT0 c1 >= cpSettle p -> (0, c1 { cuBase = Just pk })
+        | returned - cuT0 c1 >= cpSettle p, enough -> (0, c1 { cuBase = Just pk })
         | otherwise -> (0, c1)
       Just b
+        | not enough -> (0, c1)
         | b - pk >= cpStep p ->
             -- a loss: write it back, and count it in every level the
             -- window still holds, so the same step is not written twice

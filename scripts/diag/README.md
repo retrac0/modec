@@ -5,6 +5,16 @@ subcommand rather than a script:
 
     cabal run modec -- replay --mode v22bis,v22 [--v8] [--seconds N] FILE.wav
 
+A V.32 call's echo canceller only meets the call that happened if it is
+given what was really sent, so replay a call that has a `-tx.wav` beside
+it with that as the reference:
+
+    cabal run modec -- replay --mode v32bis --line --truth \
+      --tx recordings/STAMP-1001-tx.wav recordings/STAMP-1001.wav
+
+Without `--tx` a replay regenerates its transmit, which stops matching
+at the first payload byte, and leaves data-mode cancelling off.
+
 What follows are standalone tools for taking the signal apart below that
 level. Build any of them against the library:
 
@@ -22,3 +32,17 @@ level. Build any of them against the library:
   EVM, per second, to see the far end's clock offset and whether the
   receiver is locked.
 - `ansam.hs FILE.wav...` -- where ANSam was detected in each recording.
+- `echolag.py STEM [FROM TO STEP]` -- where our own echo is in a recorded
+  call, two seconds at a time, from `STEM-tx.wav` against `STEM.wav`. A
+  delay that steps mid-call is silence that went into our transmit, by
+  exactly the step; no lag standing out is no echo.
+- `iotrace.py FILE [FROM TO]` -- a `MODEC_IO_TRACE` taken apart: how
+  capture arrived, the capture clock after each arrival, and whether the
+  loop kept up with it.
+- `pwstall.py SECONDS [rt] [group NAME] [force FRAMES] [meter] [poke]
+  [load N]` -- the softphone path's audio with no modem and no telephone
+  in it: a loopback and two pw-cats, every arrival stamped, pw-mon's
+  events beside them. Says how much capture the graph lost and when,
+  which driver and quantum it ran on, and what the graph was doing at
+  the time. `rt`, `group pipewire.dummy` and `force 960` are what modec
+  does; without them it shows what each is for.

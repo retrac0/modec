@@ -86,10 +86,19 @@ pwLinks = do
     Left _ -> []
     Right out -> parseLinks out
 
--- | Destroy a link by id.
-pwUnlink :: Int -> IO Bool
-pwUnlink lid = do
-  r <- try (readProcessWithExitCode "pw-link" ["-d", show lid] "")
+-- | Destroy a link, named by the two ports it joins.
+--
+-- Not by its own id.  PipeWire hands a freed id to the next object made,
+-- and a softphone's streams are being linked at the moment this runs: a
+-- link listed, removed, and asked to be removed again -- the listing
+-- shows each at both its ends, and this used to ask twice -- took with
+-- it whatever had the number by then.  On the bench, with a mixer open
+-- to give it sixty links to remove, four calls of six lost the link
+-- from the line to the softphone or from the softphone to us, and the
+-- two modems sat in silence.
+pwUnlink :: PwLink -> IO Bool
+pwUnlink l = do
+  r <- try (readProcessWithExitCode "pw-link" ["-d", show (plSrcPort l), show (plDstPort l)] "")
          :: IO (Either IOException (ExitCode, String, String))
   return $ case r of
     Right (ExitSuccess, _, _) -> True
@@ -98,14 +107,12 @@ pwUnlink lid = do
 -- | PipeWire's session manager often links the default capture device
 -- into a softphone's input as well as the node the softphone asked for,
 -- so the far end hears the microphone mixed with the modem.  Remove any
--- link that feeds a node our line source feeds, unless it comes from the
+-- link that feeds a port our line source feeds, unless it comes from the
 -- line source itself.  Returns what was removed.
 pruneCompetingInputs :: String -> IO [PwLink]
 pruneCompetingInputs lineNode = do
-  ls <- pwLinks
-  let fedByUs = [ plDst l | l <- ls, plSrc l == lineNode ]
-      stray = [ l | l <- ls, plDst l `elem` fedByUs, plSrc l /= lineNode ]
-  mapM_ (pwUnlink . plId) stray
+  stray <- competingInputs lineNode <$> pwLinks
+  mapM_ pwUnlink stray
   return stray
 
 -- | 'parseGains' over a live @pw-dump@.

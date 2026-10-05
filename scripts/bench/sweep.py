@@ -27,6 +27,35 @@ BIN = subprocess.run(['cabal','list-bin','modec'], capture_output=True, text=Tru
 PAY_A = b''.join(('A%04d the quick brown fox jumps over the lazy dog 0123456789\r\n' % i).encode() for i in range(8))
 PAY_B = b''.join(('B%04d pack my box with five dozen liquor jugs 9876543210\r\n' % i).encode() for i in range(8))
 
+# The V.32 answer tone modec sends on the calls it answers.  V.25's
+# phase reversals on it stand the ATA's echo canceller down for the call,
+# and the hybrid's reflection is then modec's own canceller's to take
+# out.  The bench answered without them (--ans-plain) for as long as
+# modec's canceller could not reach that reflection, leaving the ATA's in
+# charge -- which usually took it out, and about one call in ten did
+# not, at 14400 a call lost.  With the reversals, twenty-four answered
+# calls of twenty-four on 2026-10-05 (S10's A2).  BENCH_ANS_PLAIN=1 is
+# the old way; either touches nothing but the V.32 answer tone.
+ANS_TONE = ['--ans-plain'] if os.environ.get('BENCH_ANS_PLAIN') else []
+
+def first_in_line(args):
+    """args, to be run ahead of everything else this user has on the CPU.
+
+    The modem's loop has twenty milliseconds for each block of audio and
+    no way to ask for it: this user may not raise a priority.  What it
+    may do is start a systemd scope and give it a CPU weight, which
+    counts against the scope everything else runs in -- an editor's, say,
+    with three other sessions' simulations under it.  Measured with the
+    machine at a load of ten: modec's blocks took up to 450 ms, every
+    start-up failed, and the rows looked like modem results.  In a scope
+    weighted a hundred to one they are what they are on an idle machine.
+    baresip goes in one too, for the timing of its RTP.  BENCH_NO_SCOPE=1
+    runs them plain."""
+    import shutil
+    if os.environ.get('BENCH_NO_SCOPE') or not shutil.which('systemd-run'):
+        return args
+    return ['systemd-run', '--user', '--scope', '-q', '-p', 'CPUWeight=10000', '--'] + args
+
 def rate_of(ms):
     """The bit rate a +MS pin names, for pacing what the reference is fed."""
     import re
@@ -111,18 +140,18 @@ class Stack:
     one() starts and stops a stack per call; call-control tests hold one
     across several calls.  modec is started without a role -- SIP gives
     it one per call, Originate for a call it dialled and Answer for one
-    it took -- but with --ans-plain for the calls it answers (see one())."""
+    it took -- and the answer tone of ANS_TONE for the calls it answers."""
     def __init__(self, tag, mode, extra=None):
         self.tag = tag
         self.rx = f'{SC}/sweep-{tag}-rx.wav'; self.tx = f'{SC}/sweep-{tag}-tx.wav'
         self.log = open(f'{SC}/sweep-{tag}.log','wb')
         self.bl  = open(f'{SC}/sweep-{tag}-baresip.log','wb')
-        self.bare = subprocess.Popen(['baresip','-f',os.path.expanduser('~/.baresip-bench')],
+        self.bare = subprocess.Popen(first_in_line(['baresip','-f',os.path.expanduser('~/.baresip-bench')]),
                                      stdout=self.bl, stderr=subprocess.STDOUT)
         time.sleep(3)
-        args = [BIN,'modem','--ans-plain','--sip','127.0.0.1:4444','--audio-sip-loop','modec',
+        args = [BIN,'modem']+ANS_TONE+['--sip','127.0.0.1:4444','--audio-sip-loop','modec',
                 '--mode',mode,'--hayes','--data-stdio','--record-rx',self.rx,'--record-tx',self.tx]+(extra or [])
-        self.mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
+        self.mo = subprocess.Popen(first_in_line(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log)
         nonblock(self.mo.stdout)
         time.sleep(3)
     def send(self, data):
@@ -241,16 +270,13 @@ def one(tag, mode, ms, extra=None, ref_extra=None, window=16, slow=False,
     rx = f'{SC}/sweep-{tag}-rx.wav'; tx = f'{SC}/sweep-{tag}-tx.wav'
     log = open(f'{SC}/sweep-{tag}.log','wb')
     bl  = open(f'{SC}/sweep-{tag}-baresip.log','wb')
-    bare = subprocess.Popen(['baresip','-f',os.path.expanduser('~/.baresip-bench')],
+    bare = subprocess.Popen(first_in_line(['baresip','-f',os.path.expanduser('~/.baresip-bench')]),
                             stdout=bl, stderr=subprocess.STDOUT)
     time.sleep(3)
-    # --ans-plain always: through the ATA the V.25 reversals on the answer
-    # tone stand its echo canceller down (docs/reference-modem.md); it
-    # touches nothing but the V.32 answer tone
-    role = [] if originate else ['--answer','--ans-plain']
+    role = [] if originate else ['--answer']+ANS_TONE
     args = [BIN,'modem']+role+['--sip','127.0.0.1:4444','--audio-sip-loop','modec',
             '--mode',mode,'--hayes','--data-stdio','--record-rx',rx,'--record-tx',tx]+extra
-    mo = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+    mo = subprocess.Popen(first_in_line(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
     nonblock(mo.stdout)
     time.sleep(3)
     result = {'tag':tag,'mode':mode,'ms':ms,'dir':'originate' if originate else 'answer'}

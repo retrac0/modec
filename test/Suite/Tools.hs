@@ -304,8 +304,43 @@ pipewireTests = testGroup "PipeWire device discovery"
         [ ("modec-tx", 0.421824, False), ("modec-rx", 1.0, False), ("muted-one", 1.0, True) ]
         (parseGains volDump)
       assertEqual "no volume control, no report" [] (parseGains (BC.pack "[]"))
+  , testCase "a microphone linked into the softphone beside our line is a stray; a mixer's meters are not" $ do
+      -- As pw-link -I -l printed it on the bench, a mixer window open:
+      -- the mixer has a meter on our line source, one on the sound card
+      -- and one on a browser, all three nodes by the one name.  The
+      -- microphone into the softphone is the only link to take out, and
+      -- it is listed twice, once at each end.
+      let ls = parseLinks linkDump
+      assertEqual "links, one for each end" 12 (length ls)
+      assertEqual "the microphone, once" [(140, "alsa_input.usb-mic", "baresip", 61, 201)]
+        [ (plId l, plSrc l, plDst l, plSrcPort l, plDstPort l) | l <- competingInputs "modec-line" ls ]
+      assertEqual "nothing of ours linked, nothing to remove" [] (competingInputs "some-other-line" ls)
   ]
   where
+    linkDump = unlines
+      [ "  54 alsa_output.pci-0000_00_1f.3.analog-stereo:monitor_FL"
+      , " 133   |->  310 PulseAudio Volume Control:input_FL"
+      , "  80 Firefox:output_FL"
+      , " 134   |->  320 PulseAudio Volume Control:input_FL"
+      , "  61 alsa_input.usb-mic:capture_FL"
+      , " 140   |->  201 baresip:input_FL"
+      , " 200 modec-line:capture_FL"
+      , " 150   |->  330 PulseAudio Volume Control:input_FL"
+      , " 151   |->  201 baresip:input_FL"
+      , " 310 PulseAudio Volume Control:input_FL"
+      , " 133   |<-   54 alsa_output.pci-0000_00_1f.3.analog-stereo:monitor_FL"
+      , " 320 PulseAudio Volume Control:input_FL"
+      , " 134   |<-   80 Firefox:output_FL"
+      , " 330 PulseAudio Volume Control:input_FL"
+      , " 150   |<-  200 modec-line:capture_FL"
+      , " 201 baresip:input_FL"
+      , " 140   |<-   61 alsa_input.usb-mic:capture_FL"
+      , " 151   |<-  200 modec-line:capture_FL"
+      , " 210 baresip:output_FL"
+      , " 160   |->  220 sip-to-modec:playback_FL"
+      , " 220 sip-to-modec:playback_FL"
+      , " 160   |<-  210 baresip:output_FL"
+      ]
     volDump = BC.pack (concat
       [ "[ {\"id\": 70, \"info\": { \"props\": { \"node.name\": \"modec-tx\" },"
       , " \"params\": { \"Props\": [ { \"volume\": 1.0, \"mute\": false,"

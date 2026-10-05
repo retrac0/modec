@@ -81,6 +81,13 @@ def preflight(verbose=True):
     finally:
         m.close()
     say('reference answers')
+    # Nothing else on the CPU, and no way to enforce it: other sessions on
+    # this machine start jobs when they like.  sweep.first_in_line puts
+    # the modem ahead of them; this says when it had to, so a bad row can
+    # be read against it.
+    load = os.getloadavg()[0]
+    if load > 2:
+        say(f'the machine is busy (load {load:.1f}): modec and baresip run in a weighted scope, but check each row\'s slow blocks')
     host, port = ata_address().rsplit(':', 1)
     if not sip_options(host, int(port)):
         raise BenchFault(f'the ATA does not answer OPTIONS at {host}:{port}')

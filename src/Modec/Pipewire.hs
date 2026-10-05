@@ -23,6 +23,7 @@ module Modec.Pipewire
     -- * Links
   , PwLink (..)
   , parseLinks
+  , competingInputs
     -- * Volumes
   , parseGains
   , attenuated
@@ -79,28 +80,50 @@ matchNode spec nodes
     uniqueOf [n] = Unique n
     uniqueOf ns = Ambiguous ns
 
--- | A link between two ports, named by the nodes at each end.
+-- | A link between two ports, named by the nodes at each end.  A node's
+-- name is not its identity -- a mixer window opens a level meter per
+-- device and stream, and every one of them is called by the mixer's
+-- name -- so the ports' ids are kept too.
 data PwLink = PwLink
   { plId  :: !Int
   , plSrc :: String
   , plDst :: String
+  , plSrcPort :: !Int
+  , plDstPort :: !Int
   } deriving (Eq, Show)
 
 -- | Parse @pw-link -I -l@.  Its output lists each port on an unindented
 -- line and each of that port's links indented with an arrow giving the
 -- direction.
 parseLinks :: String -> [PwLink]
-parseLinks out = go "" (lines out)
+parseLinks out = go (0, "") (lines out)
   where
     go _ [] = []
-    go cur (l : ls) = case words l of
-      (lid : arrow : _ : rest)
-        | arrow == "|->" , Just i <- readMaybeInt lid -> PwLink i cur (nodeOf (unwords rest)) : go cur ls
-        | arrow == "|<-" , Just i <- readMaybeInt lid -> PwLink i (nodeOf (unwords rest)) cur : go cur ls
-      (pid : rest) | Just _ <- readMaybeInt pid, not (null rest) -> go (nodeOf (unwords rest)) ls
+    go cur@(port, node) (l : ls) = case words l of
+      (lid : arrow : peer : rest)
+        | arrow == "|->" , Just i <- readMaybeInt lid, Just p <- readMaybeInt peer ->
+            PwLink i node (nodeOf (unwords rest)) port p : go cur ls
+        | arrow == "|<-" , Just i <- readMaybeInt lid, Just p <- readMaybeInt peer ->
+            PwLink i (nodeOf (unwords rest)) node p port : go cur ls
+      (pid : rest) | Just p <- readMaybeInt pid, not (null rest) -> go (p, nodeOf (unwords rest)) ls
       _ -> go cur ls
     nodeOf s = takeWhile (/= ':') s
     readMaybeInt s = case reads s of { [(i, "")] -> Just (i :: Int); _ -> Nothing }
+
+-- | The links that put something else into a port our line source
+-- feeds: each once, though the listing shows a link at both its ends.
+--
+-- By port and not by node name.  By name, a mixer's meter on the line
+-- source made every meter the mixer had open a node "our line feeds",
+-- and the link into each of them from the sound card, the browser and
+-- everything else a stray to remove: sixty links in one call, none of
+-- them anything to do with the modem.
+competingInputs :: String -> [PwLink] -> [PwLink]
+competingInputs lineNode ls = once [ l | l <- ls, plDstPort l `elem` fedByUs, plSrc l /= lineNode ]
+  where
+    fedByUs = [ plDstPort l | l <- ls, plSrc l == lineNode ]
+    once [] = []
+    once (l : rest) = l : once [ m | m <- rest, plId m /= plId l ]
 
 -- | A human-readable listing, one node per line.
 describeNodes :: [PwNode] -> String

@@ -63,6 +63,35 @@ simulateWith procMs secs losses ppm jitterMs keep = go 0 (cushionInit 0) cushion
               lo' = min lo drawn
           in go (k + 1) cu' drawn lo' (added + extraAdded) carry'
 
+-- | The loop with a clock of its own, which the model above does not
+-- give it: there the first read of every burst waits and the rest never
+-- do, whatever the modem's load, so a loop that falls behind the audio
+-- cannot be put to the keeper at all -- and that is the loop that broke
+-- it.
+--
+-- Capture delivers @q@ samples every @q@ samples of time, less any loss
+-- scheduled then.  The loop reads 160 at a time: a read returns at once
+-- if the samples are there and otherwise when the burst that completes
+-- them lands, and the modem then runs for @proc@ of the time it is --
+-- so a load above twenty milliseconds a block leaves bursts queued, and
+-- no read waits until the loop has worked through them.  Returns the
+-- silence the keeper added.
+loopAdded :: Int -> Double -> [(Double, Int)] -> (Double -> Double) -> Int
+loopAdded q secs losses proc = go 0 0 (cushionInit 0) 0
+  where
+    bursts = round (secs * fs / fromIntegral q) :: Int
+    arrivesAt k = fromIntegral (k * q) / fs
+    sizes = [ q - sum [ n | (t, n) <- losses, t >= arrivesAt k, t < arrivesAt (k + 1) ] | k <- [0 .. bursts - 1] ]
+    -- (when it landed, samples delivered once it had)
+    delivered = zip (map arrivesAt [0 ..]) (drop 1 (scanl (+) 0 sizes))
+    go :: Int -> Double -> Cushion -> Int -> Int
+    go rd t cu added = case dropWhile ((< rd + 160) . snd) delivered of
+      [] -> added
+      ((landed, _) : _) ->
+        let returned = max t landed + 0.00005
+            (extra, cu') = cushionStep defaultCushionParams fs t returned 160 cu
+        in go (rd + 160) (returned + proc returned) cu' (added + extra)
+
 cushionTests :: TestTree
 cushionTests = testGroup "the transmit cushion"
   [ testCase "without the keeper, three 32 ms losses run the playback buffer dry" $ do
@@ -111,4 +140,28 @@ cushionTests = testGroup "the transmit cushion"
           busy = simulateWith 20 300 [] 0 5 True
       assertEqual "silence added" 0 (runAdded r)
       assertEqual "silence added, busier" 0 (runAdded busy)
+  , testCase "a loop that falls behind the audio and catches up has lost nothing" $ do
+      -- The bench's graph: 2048 samples a burst.  Four seconds at 22 ms a
+      -- block is thirteen blocks in 286 ms against a burst every 256, so
+      -- bursts queue and no read waits; then the load drops and the loop
+      -- works its way back.  Levels stamped with the last arrival the
+      -- loop saw read high for as long as that lasted, and the keeper
+      -- wrote silence into a 14400 carrier when they came back down.
+      let busy t = if t >= 10 && t < 14 then 0.022 else 0.004
+      assertEqual "silence added" 0 (loopAdded 2048 60 [] busy)
+      -- and at the edge, where every burst is barely finished in time
+      assertEqual "silence added, at the edge" 0 (loopAdded 2048 60 [] (const 0.019))
+      -- and saturated on and off for the whole of a call
+      let choppy t = if (floor (t / 3) :: Int) `mod` 2 == 1 then 0.024 else 0.006
+      assertEqual "silence added, on and off" 0 (loopAdded 2048 120 [] choppy)
+  , testCase "a loss while the loop is behind is written back once it is not" $ do
+      let busy t = if t >= 10 && t < 14 then 0.022 else 0.004
+          added = loopAdded 2048 60 [(12, 256)] busy
+      assertBool ("silence added " ++ show added) (added >= 256 && added <= 256 + 160)
+  , testCase "the bench's bursts, a loss, and nothing else" $ do
+      -- a sample or two of each loss goes to the settled level following
+      -- the window down while the last of the old arrivals leave it
+      let added = loopAdded 2048 60 [(20, 256), (40, 256)] (const 0.004)
+      assertBool ("silence added " ++ show added) (added >= 2 * 256 - 8 && added <= 2 * (256 + 160))
+      assertEqual "clean" 0 (loopAdded 2048 120 [] (const 0.004))
   ]
